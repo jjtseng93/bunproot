@@ -5,4 +5,6 @@ alias realpath=/system/bin/realpath
 
 sd=$(dirname "$(realpath "$0")")
 
+unset LD_PRELOAD
+
 exec /system/bin/linker64 $(realpath "$sd/../bun-android") --no-orphans "$sd/index.js" "$@"
