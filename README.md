@@ -1,48 +1,83 @@
 # PRoot Bun port
 
-Every `src/**/*.c` and `src/**/*.h` has a matching ESM file named
-`bunsrc/**/*.c.js` or `bunsrc/**/*.h.js`, so C and header files with the same
-basename never collide. Pending modules explicitly export `portStatus` rather
-than pretending to implement the original native behavior.
+This directory contains the Bun/ESM port of PRoot. Each original
+`src/**/*.c` or `src/**/*.h` has a corresponding `bunsrc/**/*.c.js` or
+`bunsrc/**/*.h.js`. The working implementation currently targets ARM64
+Android and must use the Android-native `bun-android`, not a glibc Bun binary.
 
-The first ptrace slice supports `-S ROOTFS`. Android's `linker64` starts a
-disposable shell which stops itself before guest startup. The Bun tracer then
-uses remote syscalls to map the guest ELF and the `PT_INTERP` named by that ELF,
-builds its stack/auxv, jumps to the interpreter entry, and uses
-`PTRACE_SYSCALL` to rewrite arm64 pathname arguments into the selected rootfs:
+## Requirements
 
-```sh
-PATH="$PWD/bunsrc:$PATH" LD_PRELOAD= proot -S ROOTFS /bin/ls /
-```
+- A ptrace-capable Termux environment.
+- Android's 64-bit linker at `/system/bin/linker64`.
+- Android bionic libraries under `/apex/com.android.runtime/lib64/bionic`.
+- The native Bun executable at `../bun-android` relative to this directory.
+- An ARM64 Linux rootfs containing the guest ELF and its `PT_INTERP`.
 
-All native library paths are centralized in `dlpath.json`. `ffi.js` opens the
-Android bionic libraries from `/apex/com.android.runtime/lib64/bionic`; it does
-not fall back to libraries under the guest `/usr` tree.
+Native library paths are defined once in `dlpath.json`. JavaScript modules open
+those Android libraries through `ffi.js`; guest libraries under `ROOTFS/usr`
+are never used as the tracer's libc.
 
-Run this port with the Android-native Bun executable (`../bun-android`). A
-GNU/Linux/glibc Bun cannot safely load bionic as a second libc.
+## Usage
 
-Set `PROOT_BUN_VERBOSE=1` to print every path rewritten at syscall entry.
-
-The remote loader does not execute a hard-coded glibc path. Dynamic executables
-select glibc, musl, or another loader through their own `PT_INTERP`; static ELF
-files have no interpreter mapping. Android-seccomp `SIGSYS` stops are converted
-to `ENOSYS`, allowing the guest libc to use its normal compatibility fallback.
-
-Guest fork, vfork, and clone events are followed. A vfork-style clone is
-reduced to a normal fork before entry so the child has a private address space
-for JS-controlled exec replacement. Guest `execve` is voided and emulated by
-remapping the requested ELF in place:
+Add this directory to `PATH` so the `proot` launcher invokes the Bun port:
 
 ```sh
-PATH="$PWD/bunsrc:$PATH" LD_PRELOAD= proot -S ROOTFS /bin/sh -c 'ls /'
+cd /path/to/prbun
+PATH="$PWD:$PATH" LD_PRELOAD= proot -S ROOTFS COMMAND [ARG ...]
 ```
 
-The launcher enables Bun's `--no-orphans`; ptraced tasks independently use
-`PTRACE_O_EXITKILL` as the kernel-level kill-on-exit guarantee.
-
-Regenerate missing one-to-one placeholders after adding a C/H source file:
+For the Termux `proot-distro` Debian rootfs used during development:
 
 ```sh
-bun run bunsrc/generate-stubs.js
+ROOTFS=/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs
+PATH="$PWD:$PATH" LD_PRELOAD= proot -S "$ROOTFS" /bin/ls /
+PATH="$PWD:$PATH" LD_PRELOAD= proot -S "$ROOTFS" /bin/sh -c 'ls /'
 ```
+
+Shebang handling and nested guest `execve` can be checked with:
+
+```sh
+PATH="$PWD:$PATH" LD_PRELOAD= proot -S "$ROOTFS" \
+  /usr/bin/bun x --no-install cowsay hello
+```
+
+The launcher effectively runs:
+
+```sh
+/system/bin/linker64 ../bun-android --no-orphans ./index.js "$@"
+```
+
+`--no-orphans` covers Bun-owned subprocesses. The tracer also enables
+`PTRACE_O_EXITKILL`, which kills tracees if the tracer exits unexpectedly.
+
+## Debugging
+
+Set `PROOT_BUN_VERBOSE=1` to show ELF loading, process events, signals, guest
+exec replacement, and pathname rewriting:
+
+```sh
+PROOT_BUN_VERBOSE=1 PATH="$PWD:$PATH" LD_PRELOAD= \
+  proot -S "$ROOTFS" /bin/ls /
+```
+
+Tests involving FFI must run in native Termux. Bun inside a glibc PRoot cannot
+safely load Android bionic as a second libc.
+
+## Implementation notes
+
+- The initial Android process is `/system/bin/linker64 /system/bin/sh`, stopped
+  with `SIGSTOP`, then replaced by the JavaScript-controlled ELF loader.
+- The loader reads `PT_INTERP` from the guest ELF, so glibc, musl, and static
+  executables do not depend on a hard-coded guest loader path.
+- ARM64 `PTRACE_SYSCALL` stops rewrite guest pathname arguments into `ROOTFS`.
+- `/proc`, `/dev`, and `/sys` use the Android kernel filesystems.
+- The current vertical slice handles fork, vfork, clone, clone3, execve, and
+  `#!` interpreter chains.
+- Regenerate missing one-to-one placeholders with:
+
+```sh
+../bun-android run generate-stubs.js
+```
+
+This is not yet a drop-in replacement for upstream PRoot. See
+[PORTING.md](./PORTING.md) for implemented coverage and remaining work.
