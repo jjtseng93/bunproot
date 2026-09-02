@@ -29,6 +29,18 @@ select glibc, musl, or another loader through their own `PT_INTERP`; static ELF
 files have no interpreter mapping. Android-seccomp `SIGSYS` stops are converted
 to `ENOSYS`, allowing the guest libc to use its normal compatibility fallback.
 
+Guest fork, vfork, and clone events are followed. A vfork-style clone is
+reduced to a normal fork before entry so the child has a private address space
+for JS-controlled exec replacement. Guest `execve` is voided and emulated by
+remapping the requested ELF in place:
+
+```sh
+PATH="$PWD/bunsrc:$PATH" LD_PRELOAD= proot -S ROOTFS /bin/sh -c 'ls /'
+```
+
+The launcher enables Bun's `--no-orphans`; ptraced tasks independently use
+`PTRACE_O_EXITKILL` as the kernel-level kill-on-exit guarantee.
+
 Regenerate missing one-to-one placeholders after adding a C/H source file:
 
 ```sh

@@ -18,9 +18,19 @@ const memory = {
   poke(pid, address, word) { if (call(PTRACE_POKEDATA, pid, address, word) === -1n) throw new Error("PTRACE_POKEDATA failed"); },
 };
 function wait(pid, options = 0) {
+  return waitResult(pid,options).status;
+}
+function waitResult(pid, options = 0) {
   const bytes = new Uint8Array(4);
-  if (native.waitpid(pid, ptr(bytes), options) < 0) throw new Error("waitpid failed");
-  return new DataView(bytes.buffer).getInt32(0, true);
+  const waited=native.waitpid(pid, ptr(bytes), options);
+  if (waited < 0) throw new Error("waitpid failed");
+  return { pid:waited, status:new DataView(bytes.buffer).getInt32(0, true) };
+}
+
+function eventMessage(pid) {
+  const bytes=new Uint8Array(8);
+  if (call(0x4201,pid,0n,BigInt(ptr(bytes)))<0n) throw new Error("PTRACE_GETEVENTMSG failed");
+  return Number(new DataView(bytes.buffer).getBigUint64(0,true));
 }
 function getRegisters(pid) {
   const regs = makeRegisterSet(), iovec = makeIovec(regs);
@@ -130,6 +140,26 @@ function readAuxv(pid) {
   return entries;
 }
 
+function readPointerArray(pid,address,limit=4096) {
+  const values=[];
+  for (let index=0; index<limit; index++) {
+    const pointer=BigInt.asUintN(64,memory.peek(pid,address+BigInt(index*8)));
+    if (pointer===0n) return values;
+    values.push(readCString(memory,pid,pointer));
+  }
+  throw new Error("unterminated tracee pointer array");
+}
+
+function prepareExecGuest(pid,rootfs,state) {
+  const pathname=readCString(memory,pid,getX(state.regs,0));
+  const argv=readPointerArray(pid,getX(state.regs,1));
+  const executable=pathname.startsWith("/")?`${rootfs}${pathname}`:pathname;
+  const info=readElfLoadInfo(executable);
+  const interpreter=info.interpreter;
+  const loader=interpreter===null?null:`${rootfs}${interpreter}`;
+  return { rootfs, executable, interpreter, loader, argv:argv.length?argv:[pathname] };
+}
+
 function buildGuestStack(pid, trampoline, images, guest) {
   const stackSize=1024n*1024n;
   const stackBase=remoteCall(pid,trampoline,SYS_MMAP,[0n,stackSize,3n,0x22n,-1n,0n]);
@@ -141,7 +171,10 @@ function buildGuestStack(pid, trampoline, images, guest) {
     const bytes=new TextEncoder().encode(`${value}\0`); cursor-=bytes.length; local.set(bytes,cursor);
     return remoteTop-BigInt(capacity-cursor);
   };
-  const envStrings=Object.entries(process.env).filter(([key])=>key!=="LD_PRELOAD").map(([key,value])=>`${key}=${value}`);
+  const guestEnvironment={...process.env,
+    PATH:"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"};
+  delete guestEnvironment.LD_PRELOAD;
+  const envStrings=Object.entries(guestEnvironment).map(([key,value])=>`${key}=${value}`);
   const envPointers=envStrings.map(putString);
   const argvPointers=guest.argv.map(putString);
   const execfn=argvPointers[0];
@@ -180,7 +213,7 @@ export function traceProcess(pid, rootfs, guest = null) {
   wait(pid);
   // TRACESYSGOOD distinguishes syscall stops; EXITKILL prevents a bootstrap
   // loop from surviving if the Bun tracer crashes or is interrupted.
-  if (call(PTRACE_SETOPTIONS, pid, 0n, 0x100001n) < 0n) throw new Error("PTRACE_SETOPTIONS failed");
+  if (call(PTRACE_SETOPTIONS, pid, 0n, 0x10000fn) < 0n) throw new Error("PTRACE_SETOPTIONS failed");
   if (process.env.PROOT_BUN_VERBOSE === "1" && guest !== null)
     console.error(`[ptrace] bootstrap pid=${pid} executable=${guest.executable} interpreter=${guest.interpreter ?? "static"}`);
   const trampoline = initializeRemoteSyscalls(pid);
@@ -191,49 +224,79 @@ export function traceProcess(pid, rootfs, guest = null) {
     console.error(`[ptrace] mapped guest entry=0x${images.main.entry.toString(16)} interpreter entry=${images.interpreter ? `0x${images.interpreter.entry.toString(16)}` : "static"}`);
   const guestSp=startGuest(pid,trampoline,images,guest);
   if (process.env.PROOT_BUN_VERBOSE === "1") console.error(`[ptrace] guest sp=0x${guestSp.toString(16)}`);
-  let entering = true;
-  let pendingSignal = 0n;
-  while (true) {
-    if (call(PTRACE_SYSCALL, pid, 0n, pendingSignal) < 0n) throw new Error("PTRACE_SYSCALL failed");
-    pendingSignal = 0n;
-    const status = wait(pid);
-    if ((status & 0x7f) === 0) return (status >> 8) & 0xff;
-    if ((status & 0x7f) !== 0x7f) return 1;
-    const signal = (status >> 8) & 0xff;
-    if (signal !== 0x85) {
-      const stopped = getRegisters(pid);
-      if (process.env.PROOT_BUN_VERBOSE === "1")
-        console.error(`[ptrace] signal=${signal} pc=0x${getPc(stopped.regs).toString(16)} syscall=${getSyscallNumber(stopped.regs)}`);
-      if (signal === 31) { // SIGSYS from Android's app seccomp policy.
-        setX(stopped.regs,0,BigInt.asUintN(64,-38n)); // expose ENOSYS to glibc
-        putRegisters(pid,stopped);
+  const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null }]]);
+  let rootExit=1;
+  while (tasks.size>0) {
+    for (const [taskPid,task] of tasks) {
+      if (!task.running) {
+        if (call(PTRACE_SYSCALL,taskPid,0n,task.pendingSignal)<0n) throw new Error(`PTRACE_SYSCALL failed for ${taskPid}`);
+        task.pendingSignal=0n; task.running=true;
+      }
+    }
+    const result=waitResult(-1), taskPid=result.pid, status=result.status;
+    const task=tasks.get(taskPid);
+    if (!task) continue;
+    task.running=false;
+    if ((status&0x7f)===0) {
+      if (taskPid===pid) rootExit=(status>>8)&0xff;
+      tasks.delete(taskPid); continue;
+    }
+    if ((status&0x7f)!==0x7f) { tasks.delete(taskPid); continue; }
+    const signal=(status>>8)&0xff, event=status>>>16;
+    if (signal!==0x85) {
+      if (signal===5 && event>=1 && event<=3) {
+        const child=eventMessage(taskPid);
+        tasks.set(child,{ entering:true, pendingSignal:0n, pendingExec:null, running:true });
+        if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] new tracee pid=${child} event=${event}`);
         continue;
       }
-      pendingSignal = BigInt(signal);
+      const stopped=getRegisters(taskPid);
+      if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} signal=${signal} pc=0x${getPc(stopped.regs).toString(16)} syscall=${getSyscallNumber(stopped.regs)}`);
+      if (signal===31) { setX(stopped.regs,0,BigInt.asUintN(64,-38n)); putRegisters(taskPid,stopped); continue; }
+      if (signal===19) continue; // consume ptrace/vfork bootstrap SIGSTOP
+      task.pendingSignal=BigInt(signal); continue;
+    }
+    if (!task.entering) {
+      task.entering=true;
+      if (task.pendingExec!==null) {
+        const next=task.pendingExec; task.pendingExec=null;
+        if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} emulating execve ${next.argv.join(" ")}`);
+        startGuest(taskPid,trampoline,loadGuestImages(taskPid,trampoline,next),next);
+      }
       continue;
     }
-    if (!entering) { entering = true; continue; }
-    entering = false;
-    const state = getRegisters(pid);
-    const argument = PATH_ARGUMENT.get(getSyscallNumber(state.regs));
-    if (argument === undefined) continue;
-    const address = getX(state.regs, argument);
-    if (address === 0n) continue;
-    if (address < 4096n) continue;
-    let guest;
-    try {
-      guest = readCString(memory, pid, address);
-    } catch (error) {
-      if (process.env.PROOT_BUN_VERBOSE === "1")
-        console.error(`[ptrace] skipped syscall ${getSyscallNumber(state.regs)} address 0x${address.toString(16)}: ${error.message}`);
+    task.entering=false;
+    const state=getRegisters(taskPid), syscall=getSyscallNumber(state.regs);
+    if (syscall===221) {
+      if (process.env.PROOT_BUN_VERBOSE==="1")
+        console.error(`[ptrace] pid=${taskPid} execve path=0x${getX(state.regs,0).toString(16)} argv=0x${getX(state.regs,1).toString(16)}`);
+      try { task.pendingExec=prepareExecGuest(taskPid,rootfs,state); }
+      catch (error) {
+        if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} exec capture failed: ${error.message}`);
+        continue;
+      }
+      setX(state.regs,8,BigInt.asUintN(64,-1n)); putRegisters(taskPid,state); continue;
+    }
+    if (syscall===220) {
+      const flags=getX(state.regs,0), unsafe=0x4100n; // CLONE_VM | CLONE_VFORK
+      if ((flags&unsafe)!==0n) {
+        setX(state.regs,0,flags&~unsafe);
+        putRegisters(taskPid,state);
+        if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} clone flags 0x${flags.toString(16)} -> 0x${(flags&~unsafe).toString(16)}`);
+      }
       continue;
     }
-    if (!guest.startsWith("/") || guest === "/dev/null" || guest.startsWith(`${rootfs}/`)) continue;
-    const host = guest === "/" ? rootfs : `${rootfs}${guest}`;
-    if (process.env.PROOT_BUN_VERBOSE === "1") console.error(`[ptrace] ${guest} -> ${host}`);
-    const scratch = trampoline + 512n;
-    writeCString(memory, pid, scratch, host);
-    setX(state.regs, argument, scratch);
-    putRegisters(pid, state);
+    const argument=PATH_ARGUMENT.get(syscall);
+    if (argument===undefined) continue;
+    const address=getX(state.regs,argument);
+    if (address<4096n) continue;
+    let guestPath;
+    try { guestPath=readCString(memory,taskPid,address); }
+    catch (error) { if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] skipped pid=${taskPid} syscall=${syscall}: ${error.message}`); continue; }
+    if (!guestPath.startsWith("/")||guestPath==="/dev/null"||guestPath.startsWith(`${rootfs}/`)) continue;
+    const host=guestPath==="/"?rootfs:`${rootfs}${guestPath}`;
+    if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} ${guestPath} -> ${host}`);
+    writeCString(memory,taskPid,trampoline+512n,host); setX(state.regs,argument,trampoline+512n); putRegisters(taskPid,state);
   }
+  return rootExit;
 }

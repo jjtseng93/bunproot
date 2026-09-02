@@ -44,5 +44,5 @@ export function run(argv) {
     "kill -19 $$; while :; do :; done", "proot-bun",
   ];
   const pid = spawnTracee(childArgv, { ...process.env, LD_PRELOAD: "" });
-  return traceProcess(pid, rootfs, { executable, interpreter, loader, argv: command });
+  return traceProcess(pid, rootfs, { rootfs, executable, interpreter, loader, argv: command });
 }

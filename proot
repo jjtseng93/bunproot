@@ -5,4 +5,4 @@ alias realpath=/system/bin/realpath
 
 sd=$(dirname "$(realpath "$0")")
 
-exec /system/bin/linker64 $(realpath "$sd/../../bun-android") "$sd/index.js" "$@"
+exec /system/bin/linker64 $(realpath "$sd/../../bun-android") --no-orphans "$sd/index.js" "$@"
