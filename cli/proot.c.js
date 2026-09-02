@@ -1,27 +1,48 @@
-import { probeNativePath } from "../ffi.js";
-import { translateArgv } from "../path/path.c.js";
+import { existsSync } from "node:fs";
+import { FFIType, ptr } from "bun:ffi";
+import { cString, openLibrary } from "../ffi.js";
+import { readElfInterpreter } from "../execve/elf.c.js";
+import { traceProcess } from "../ptrace/ptrace.c.js";
 
-export function prepareCommand(argv) {
-  if (argv.length === 0) throw new Error("usage: bun run index.js COMMAND [ARG ...]");
-  const [command, ...args] = argv;
-  return [command, ...translateArgv(args)];
+const { posix_spawn } = openLibrary("libc", {
+  posix_spawn: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+}).symbols;
+
+function pointerVector(strings) {
+  const storage = strings.map(cString);
+  const vector = new Uint8Array((storage.length + 1) * 8);
+  const view = new DataView(vector.buffer);
+  storage.forEach((bytes, index) => view.setBigUint64(index * 8, BigInt(ptr(bytes)), true));
+  return { storage, vector };
 }
 
+function spawnTracee(argv, env) {
+  const path = cString(argv[0]);
+  const args = pointerVector(argv);
+  const environment = pointerVector(Object.entries(env).map(([key, value]) => `${key}=${value}`));
+  const pidBytes = new Uint8Array(4);
+  const status = posix_spawn(ptr(pidBytes), ptr(path), null, null, ptr(args.vector), ptr(environment.vector));
+  if (status !== 0) throw new Error(`posix_spawn failed: ${status}`);
+  return new DataView(pidBytes.buffer).getInt32(0, true);
+}
+export function parseArguments(argv) {
+  if (argv[0] !== "-S" || !argv[1] || !argv[2]) throw new Error("usage: proot -S ROOTFS COMMAND [ARG ...]");
+  return { rootfs: argv[1].replace(/\/+$/, ""), command: argv.slice(2) };
+}
 export function run(argv) {
-  const command = prepareCommand(argv);
-  // Probe the translated path through Android's bionic before execution.
-  const probe = probeNativePath(command[1] ?? "/");
-  if (!probe.available) {
-    throw new Error(`Android bionic FFI unavailable: ${probe.error.message}`);
-  } else if (!probe.accessible) {
-    throw new Error(`translated path is not accessible: ${command[1] ?? "/"}`);
-  }
-  const child = Bun.spawnSync({
-    cmd: command,
-    stdin: "inherit",
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-  if (child.error) throw child.error;
-  return child.exitCode;
+  const { rootfs, command } = parseArguments(argv);
+  const executable = command[0].startsWith("/") ? `${rootfs}${command[0]}` : command[0];
+  if (!existsSync(executable)) throw new Error(`guest executable not found: ${executable}`);
+  const interpreter = readElfInterpreter(executable);
+  const loader = interpreter === null ? null : `${rootfs}${interpreter}`;
+  if (loader !== null && !existsSync(loader)) throw new Error(`ELF interpreter not found: ${interpreter} (${loader})`);
+  // Android only accepts the initial native ELF through its own linker. The
+  // shell is a disposable bootstrap: it stops before any guest is loaded, and
+  // will later be replaced in-place by the JS-controlled remote ELF loader.
+  const childArgv = [
+    "/system/bin/linker64", "/system/bin/sh", "-c",
+    "kill -19 $$; while :; do :; done", "proot-bun",
+  ];
+  const pid = spawnTracee(childArgv, { ...process.env, LD_PRELOAD: "" });
+  return traceProcess(pid, rootfs, { executable, interpreter, loader, argv: command });
 }

@@ -5,10 +5,14 @@ Every `src/**/*.c` and `src/**/*.h` has a matching ESM file named
 basename never collide. Pending modules explicitly export `portStatus` rather
 than pretending to implement the original native behavior.
 
-The first runnable slice maps the exact argument `/` to `/etc`:
+The first ptrace slice supports `-S ROOTFS`. Android's `linker64` starts a
+disposable shell which stops itself before guest startup. The Bun tracer then
+uses remote syscalls to map the guest ELF and the `PT_INTERP` named by that ELF,
+builds its stack/auxv, jumps to the interpreter entry, and uses
+`PTRACE_SYSCALL` to rewrite arm64 pathname arguments into the selected rootfs:
 
 ```sh
-../bun-android run bunsrc/index.js ls /
+PATH="$PWD/bunsrc:$PATH" LD_PRELOAD= proot -S ROOTFS /bin/ls /
 ```
 
 All native library paths are centralized in `dlpath.json`. `ffi.js` opens the
@@ -17,6 +21,13 @@ not fall back to libraries under the guest `/usr` tree.
 
 Run this port with the Android-native Bun executable (`../bun-android`). A
 GNU/Linux/glibc Bun cannot safely load bionic as a second libc.
+
+Set `PROOT_BUN_VERBOSE=1` to print every path rewritten at syscall entry.
+
+The remote loader does not execute a hard-coded glibc path. Dynamic executables
+select glibc, musl, or another loader through their own `PT_INTERP`; static ELF
+files have no interpreter mapping. Android-seccomp `SIGSYS` stops are converted
+to `ENOSYS`, allowing the guest libc to use its normal compatibility fallback.
 
 Regenerate missing one-to-one placeholders after adding a C/H source file:
 
