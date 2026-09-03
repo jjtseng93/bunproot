@@ -17,6 +17,10 @@ Native library paths are defined once in `dlpath.json`. JavaScript modules open
 those Android libraries through `ffi.js`; guest libraries under `ROOTFS/usr`
 are never used as the tracer's libc.
 
+Environment handling is defined once in `env.js`: the tracer's own knobs, the
+environment the Android bootstrap is started with, and the environment a guest
+inherits. Other modules import from it rather than reading `process.env`.
+
 ## Usage
 
 Add this directory to `PATH` so the `proot` launcher invokes the Bun port:
@@ -53,6 +57,14 @@ cd bunsrc
 sh proot -S ../../alpine /bin/sh -c "bun x cowsay hello"
 ```
 
+Node, npm and a second Bun installed through npm are covered by:
+
+```sh
+cd bunsrc
+sh proot -S ../../alpine /bin/sh -c "apk add npm && npm i bun@1.3.14"
+sh proot -S ../../alpine /bin/sh -c "./node_modules/.bin/bun --version"
+```
+
 Git over HTTPS is covered by the Alpine integration test:
 
 ```sh
@@ -72,8 +84,10 @@ The launcher effectively runs:
 
 ## Debugging
 
-Set `PROOT_BUN_VERBOSE=1` to show ELF loading, process events, signals, guest
-exec replacement, and pathname rewriting:
+Set `PROOT_BUN_VERBOSE=1` (read in `env.js`) to show ELF loading, process
+events, signals, guest exec replacement, and pathname rewriting. A memory fault
+additionally reports `si_code`, `si_addr`, and the mappings the faulting address
+and the faulting PC belong to:
 
 ```sh
 PROOT_BUN_VERBOSE=1 PATH="$PWD:$PATH" LD_PRELOAD= \
@@ -104,6 +118,12 @@ safely load Android bionic as a second libc.
 - `/proc/<PID>/{exe,cwd,root}` is answered from tracer state rather than from
   the kernel, which still describes the Android bootstrap process because the
   guest image is mapped in instead of `execve`d.
+- The emulated `execve` resets signal dispositions and the alternate signal
+  stack the way the real one does, so signals -- SIGCHLD in particular -- can be
+  forwarded to the guest. Node's `child_process` depends on it.
+- The initial stack reproduces the kernel's string layout, including the
+  ascending order within the argv and environment blocks that libuv measures
+  `process.title` against.
 - `-S` resolves a relative rootfs before changing cwd and enables the current
   fake-id0 layer (`uid=0`, `gid=0`, root supplementary group, and root ownership
   in common stat results).

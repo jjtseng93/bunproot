@@ -5,6 +5,7 @@ import { cString, openLibrary } from "../ffi.js";
 import { readElfInterpreter } from "../execve/elf.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
 import { traceProcess } from "../ptrace/ptrace.c.js";
+import { bootstrapEnvironment } from "../env.js";
 
 const { posix_spawn } = openLibrary("libc", {
   posix_spawn: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
@@ -51,6 +52,6 @@ export function run(argv) {
     "/system/bin/linker64", "/system/bin/sh", "-c",
     "kill -19 $$; while :; do :; done", "proot-bun",
   ];
-  const pid = spawnTracee(childArgv, { ...process.env, LD_PRELOAD: "" });
+  const pid = spawnTracee(childArgv, bootstrapEnvironment());
   return traceProcess(pid, rootfs, { rootfs, executable, guestPath: guestExecutable, interpreter, loader, argv: command });
 }

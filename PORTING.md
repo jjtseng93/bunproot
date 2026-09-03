@@ -94,10 +94,73 @@ are resolved inside the guest while argv[0] remains the applet name. Common
 fake-id0 calls and stat ownership are translated for `-S`, including uid, gid,
 supplementary groups, and `ls -l` ownership.
 
-SIGCHLD observed by the tracer is not reinjected: child termination is already
-available through guest wait syscalls, while reinjection after the current
-JS-controlled exec replacement can enter a stale signal frame on musl. This
-fixes BusyBox wget's `ssl_client` completion path.
+SIGCHLD is forwarded to the guest like any other signal. It used to be dropped,
+because delivering it killed the tracee; the cause was that the emulated execve
+never reset signal dispositions, so a handler address belonging to the Android
+bootstrap shell stayed registered and the kernel delivered into an address the
+new image does not map. `resetGuestSignals()` now does what execve does --
+every caught signal back to `SIG_DFL` (`SIG_IGN` and `SIG_DFL` survive, as in
+execve) and `sigaltstack(SS_DISABLE)` -- at bootstrap and at every emulated
+exec. Node's `child_process` needs the forwarded SIGCHLD to complete a spawn;
+BusyBox wget's `ssl_client` path, git's helpers and `bun x` all still pass.
+
+The guest's main stack is mapped at `RLIMIT_STACK` rather than 1 MiB. The
+mapping is fixed and the kernel never grows it, so a guest reading back
+`ulimit -s` of 8 MiB and sizing its own guard from it -- V8 does -- would run
+off the end of a 1 MiB mapping.
+
+`fchownat`/`fchown` swap the emulated ids for the real ones before the kernel
+sees them, as in `src/extension/fake_id0/chown.c:handle_chown_enter_end()`.
+Chowning a file to the ids it already carries is allowed without `CAP_CHOWN`,
+while the guest's root ids never are, so without the swap every archive
+extraction reported that it could not preserve ownership: `apk add npm` ended
+in `23 errors`, and `apk fix` now reports `OK`.
+
+`buildGuestStack()` emits the initial strings in the kernel's order. The kernel
+fills the top of a new stack downwards -- AT_RANDOM and AT_PLATFORM, the
+executable name behind AT_EXECFN, the environment strings, then the argument
+strings -- and copies each block from its last entry to its first
+(`fs/exec.c:copy_strings`), so entry 0 lands at the lowest address of its block
+and the block ascends with the index. Emitting them in index order reverses
+each block, which stays invisible until something measures one: libuv takes the
+process-title buffer as `argv[argc-1] + strlen(argv[argc-1]) - argv[0]`, which
+is negative on a reversed stack. `npm` assigns `process.title` on startup, so
+it called `memset()` from `argv[0]` with a length of `(size_t)-42` and died on
+the first page above its stack. That was the whole reason `npm` did not run.
+
+An exec whose `PT_INTERP` is missing is refused during the enter stage, where
+the real `execve` can still run and report `ENOENT` to the guest itself. The
+commit stage has already torn down the address space, so a failure there had
+nowhere to return an errno and took the tracer down with it. Guests do probe
+binaries they cannot run: `npm i bun` installs both the glibc and the musl
+build and tries one of them.
+
+This chain now works end to end in the Alpine rootfs:
+
+```sh
+apk add npm
+npm i bun@1.3.14
+./node_modules/.bin/bun x cowsay hello
+```
+
+A memory fault under `PROOT_BUN_VERBOSE=1` reports `si_code`, `si_addr`, the
+mapping the address belongs to and the mapping the faulting PC belongs to,
+which is what identified the stack layout bug.
+
+`env.js` owns every environment decision: the tracer's knobs, the bootstrap
+environment, and the guest environment. A guest inherits the caller's variables
+-- PRoot is not a container -- except those naming a host path or host-only
+tooling. npm and npx export an `npm_config_*` block describing the host npm, so
+without the filter a guest `npm i -g` installed into `ROOTFS/<host prefix>/bin`,
+`npm root -g` answered with the host's path, and the installed command was on no
+guest PATH.
+
+`fchownat`/`fchown` report success for every id, not only the emulated root
+ids that upstream swaps. This layer already answers every `stat` with uid 0 and
+gid 0, so an ownership the guest cannot observe costs nothing to drop, while
+failing the call makes ordinary archive extraction report that it could not
+preserve ownership -- Alpine's `shadow` and `linux-pam` ship `root:shadow`
+files, and apk counts one error per file.
 
 ## Current priority
 

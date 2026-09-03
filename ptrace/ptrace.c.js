@@ -1,5 +1,5 @@
 import { FFIType, ptr } from "bun:ffi";
-import { constants as fsConstants, copyFileSync, readFileSync, readdirSync, readlinkSync } from "node:fs";
+import { constants as fsConstants, copyFileSync, existsSync, readFileSync, readdirSync, readlinkSync } from "node:fs";
 import { posix } from "node:path";
 import { openLibrary } from "../ffi.js";
 import { getPc, getSp, getSyscallNumber, getX, makeIovec, makeRegisterSet, NT_PRSTATUS, setPc, setX } from "../tracee/reg.c.js";
@@ -7,12 +7,13 @@ import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
 import { readElfLoadInfo, relocateElf } from "../execve/elf.c.js";
 import { expandShebang } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
+import { guestEnvironment, verbose } from "../env.js";
 import { commitEmulatedDirectoryRename, commitEmulatedRename, commitEmulatedUnlink, emulateHardLink, hasEmulatedDirectory, inspectEmulatedAlias, inspectEmulatedObject, isEmulatedAlias } from "../extension/link2symlink/link2symlink.c.js";
 
 const PTRACE_PEEKTEXT=1, PTRACE_PEEKDATA=2, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5;
 const PTRACE_CONT=7, PTRACE_ATTACH=16, PTRACE_SYSCALL=24;
 const PTRACE_GETREGSET=0x4204, PTRACE_SETREGSET=0x4205, PTRACE_SETOPTIONS=0x4200;
-const PTRACE_GET_SYSCALL_INFO=0x420e;
+const PTRACE_GET_SYSCALL_INFO=0x420e, PTRACE_GETSIGINFO=0x4202;
 const native = openLibrary("libc", {
   ptrace: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.u64], returns: FFIType.i64 },
   waitpid: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
@@ -75,6 +76,8 @@ const ARM64_SYSCALL_TRAMPOLINE = 0xd4200000d4000001n; // svc #0; brk #0
 const SYS_GETPID = 172, SYS_MMAP = 222;
 const SYS_GETCWD = 17, SYS_CHDIR = 49, SYS_OPENAT = 56, SYS_CLOSE = 57, SYS_MUNMAP=215;
 const SYS_READLINKAT = 78, SYS_GETDENTS64 = 61;
+const SYS_FCHOWNAT = 54, SYS_FCHOWN = 55;
+const SYS_SIGALTSTACK = 132, SYS_RT_SIGACTION = 134;
 const DT_REG = 8, DT_LNK = 10;
 // Keep this in sync with the original src/syscall/enter.c.  Android commonly
 // rejects namespace creation, while the process/thread creation itself is OK.
@@ -144,7 +147,7 @@ function resetExecAddressSpace(pid,trampoline) {
     // that points into an unmapped range and faults immediately.
     if (line.includes("[heap]") || line.includes("[vvar]") || line.includes("[vdso]")) continue;
     const result=remoteCall(pid,trampoline,SYS_MUNMAP,[start,end-start]);
-    if (result<0n && process.env.PROOT_BUN_VERBOSE==="1")
+    if (result<0n && verbose)
       console.error(`[ptrace] pid=${pid} munmap 0x${start.toString(16)}-0x${end.toString(16)} failed: ${result}`);
   }
 }
@@ -174,6 +177,55 @@ function closeExecDescriptors(pid,trampoline) {
 
 function remoteCall(pid, trampoline, syscall, args=[]) {
   return remoteSyscallAt(pid, trampoline, syscall, args);
+}
+
+// A memory fault says far more with the address it happened at and the mapping
+// that address belongs to: an emulated exec that leaves a stale mapping behind
+// shows up as a write into a region the guest never asked for.
+function describeFault(pid,signal,pc) {
+  if (signal!==4 && signal!==7 && signal!==11) return "";
+  const info=new Uint8Array(128);
+  if (call(PTRACE_GETSIGINFO,pid,0n,BigInt(ptr(info)))<0n) return "";
+  const view=new DataView(info.buffer), address=view.getBigUint64(16,true);
+  let description=` si_code=${view.getInt32(8,true)} si_addr=0x${address.toString(16)}`;
+  let mappings=[];
+  try { mappings=readFileSync(`/proc/${pid}/maps`,"utf8").split("\n"); } catch { return description; }
+  const locate=(value)=>{
+    for (const line of mappings) {
+      const match=/^([0-9a-f]+)-([0-9a-f]+)\s/.exec(line);
+      if (!match) continue;
+      const start=BigInt(`0x${match[1]}`);
+      if (value>=start && value<BigInt(`0x${match[2]}`)) return `${line.trim()} +0x${(value-start).toString(16)}`;
+    }
+    return null;
+  };
+  const faulted=locate(address), executing=locate(pc);
+  if (faulted!==null) description+=` in [${faulted}]`;
+  if (executing!==null) description+=` from [${executing}]`;
+  return description;
+}
+
+// execve(2) resets every caught signal to SIG_DFL and disables the alternate
+// signal stack; SIG_IGN and SIG_DFL dispositions survive.  The guest image is
+// installed by the loader rather than by a real execve, so without this a
+// handler address belonging to the Android bootstrap shell stays registered.
+// The kernel would then deliver a signal straight into an address the new image
+// does not map -- which is why forwarding SIGCHLD used to kill the tracee
+// instead of reaching its handler.
+function resetGuestSignals(pid,trampoline) {
+  const action=trampoline+2048n, previous=trampoline+2112n;
+  writeBytes(memory,pid,action,new Uint8Array(32)); // SIG_DFL, no flags, empty mask
+  for (let signal=1; signal<=64; signal++) {
+    if (signal===9 || signal===19) continue; // SIGKILL and SIGSTOP cannot be changed
+    if (remoteCall(pid,trampoline,SYS_RT_SIGACTION,[BigInt(signal),0n,previous,8n])<0n) continue;
+    const handler=BigInt.asUintN(64,memory.peek(pid,previous));
+    if (handler===0n || handler===1n) continue; // SIG_DFL / SIG_IGN
+    remoteCall(pid,trampoline,SYS_RT_SIGACTION,[BigInt(signal),action,0n,8n]);
+  }
+  const stack=new Uint8Array(24);
+  new DataView(stack.buffer).setUint32(8,2,true); // ss_flags = SS_DISABLE
+  writeBytes(memory,pid,action,stack);
+  remoteCall(pid,trampoline,SYS_SIGALTSTACK,[action,0n]);
 }
 
 function setKernelRootCwd(pid,trampoline,rootfs) {
@@ -264,11 +316,23 @@ function prepareExecGuest(pid,rootfs,task,state,tasks) {
   const info=readElfLoadInfo(executable);
   const interpreter=info.interpreter;
   const loader=interpreter===null?null:`${rootfs}${interpreter}`;
+  // Refuse the exec here, while the caller can still let the real execve run
+  // and report the error itself.  Once the commit stage has torn down the
+  // address space there is nothing left to return an errno to -- and a guest
+  // that probes binaries it cannot run is ordinary: npm installs both the
+  // glibc and the musl build of a package and tries one of them.
+  if (loader!==null && !existsSync(loader))
+    throw Object.assign(new Error(`ELF interpreter not found: ${interpreter}`),{code:"ENOENT"});
   return { rootfs, executable, guestPath, interpreter, loader, argv:argv.length?argv:[pathname], env };
 }
 
 function buildGuestStack(pid, trampoline, images, guest) {
-  const stackSize=1024n*1024n;
+  // A real execve gives the main thread a stack that grows up to RLIMIT_STACK.
+  // This mapping is fixed, so it has to be at least as large as the limit the
+  // guest reads back: V8 sizes its stack guard from RLIMIT_STACK, and a node
+  // program with a deep enough call graph (npm's CommonJS loader) otherwise
+  // runs off the end of a mapping the kernel never grows and takes a SIGSEGV.
+  const stackSize=8n*1024n*1024n;
   const stackBase=remoteCall(pid,trampoline,SYS_MMAP,[0n,stackSize,3n,0x22n,-1n,0n]);
   if (stackBase<0n) throw new Error(`guest stack mmap failed: ${stackBase}`);
   const capacity=65536, local=new Uint8Array(capacity), view=new DataView(local.buffer);
@@ -282,20 +346,31 @@ function buildGuestStack(pid, trampoline, images, guest) {
     cursor-=bytes.length; local.set(bytes,cursor);
     return remoteTop-BigInt(capacity-cursor);
   };
-  const guestEnvironment={...process.env,
-    HOME:"/root", USER:"root", LOGNAME:"root", SHELL:"/bin/sh", PWD:"/",
-    TMPDIR:"/tmp", PATH:"/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"};
-  for (const name of ["LD_PRELOAD","LD_LIBRARY_PATH","PREFIX","TMPPREFIX",
-    "BUN_INSTALL","NPM_CONFIG_PREFIX","OLDPWD"]) delete guestEnvironment[name];
-  const envStrings=guest.env??Object.entries(guestEnvironment).map(([key,value])=>`${key}=${value}`);
-  const envPointers=envStrings.map(putString);
-  const argvPointers=guest.argv.map(putString);
-  const execfn=argvPointers[0];
+  const envStrings=guest.env??guestEnvironment();
+  // The kernel fills the top of a new stack downwards: AT_RANDOM and
+  // AT_PLATFORM, the executable name behind AT_EXECFN, then the environment
+  // strings and finally the argument strings -- and each block is copied from
+  // its last entry to its first (fs/exec.c:copy_strings), so entry 0 ends up at
+  // the lowest address of its block and the whole region ascends with the
+  // index.  Emitting the strings in index order instead reverses each block.
+  // That looks harmless until something measures the block: libuv takes the
+  // process-title buffer as argv[argc-1] + strlen(argv[argc-1]) - argv[0],
+  // which is negative on a reversed stack, so a program that assigns
+  // process.title -- npm does, on startup -- memset()s from argv[0] upwards
+  // until it runs out of address space.
+  const putVector=(values)=>{
+    const pointers=new Array(values.length);
+    for (let index=values.length-1; index>=0; index--) pointers[index]=putString(values[index]);
+    return pointers;
+  };
   // Pointer-valued auxv entries belong to the old Android bootstrap stack and
   // must never be copied verbatim across an emulated execve.
-  const platform=putString("aarch64");
   const randomBytes=new Uint8Array(16); crypto.getRandomValues(randomBytes);
   const random=putBytes(randomBytes);
+  const platform=putString("aarch64");
+  const execfn=putString(guest.argv[0]);
+  const envPointers=putVector(envStrings);
+  const argvPointers=putVector(guest.argv);
   cursor&=~15;
   const replacements=new Map([[3n,images.main.phoff+images.main.mappings[0].address],[4n,BigInt(images.main.phentsize)],
     [5n,BigInt(images.main.phnum)],[7n,images.interpreter?.mappings[0].address??0n],[9n,images.main.entry],
@@ -460,17 +535,18 @@ export function traceProcess(pid, rootfs, guest = null) {
   // TRACESYSGOOD distinguishes syscall stops; EXITKILL prevents a bootstrap
   // loop from surviving if the Bun tracer crashes or is interrupted.
   if (call(PTRACE_SETOPTIONS, pid, 0n, 0x10000fn) < 0n) throw new Error("PTRACE_SETOPTIONS failed");
-  if (process.env.PROOT_BUN_VERBOSE === "1" && guest !== null)
+  if (verbose && guest !== null)
     console.error(`[ptrace] bootstrap pid=${pid} executable=${guest.executable} interpreter=${guest.interpreter ?? "static"}`);
   let trampoline = initializeRemoteSyscalls(pid);
-  if (process.env.PROOT_BUN_VERBOSE === "1")
+  if (verbose)
     console.error(`[ptrace] remote getpid=${pid}; trampoline mmap=0x${trampoline.toString(16)}`);
   const images = loadGuestImages(pid, trampoline, guest);
-  if (process.env.PROOT_BUN_VERBOSE === "1")
+  if (verbose)
     console.error(`[ptrace] mapped guest entry=0x${images.main.entry.toString(16)} interpreter entry=${images.interpreter ? `0x${images.interpreter.entry.toString(16)}` : "static"}`);
+  resetGuestSignals(pid,trampoline);
   setKernelRootCwd(pid,trampoline,rootfs);
   const guestSp=startGuest(pid,trampoline,images,guest);
-  if (process.env.PROOT_BUN_VERBOSE === "1") console.error(`[ptrace] guest sp=0x${guestSp.toString(16)}`);
+  if (verbose) console.error(`[ptrace] guest sp=0x${guestSp.toString(16)}`);
   let nextScratchSlot=1n;
   const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null,
     pendingCwd:null, pendingGetcwd:null, cwd:"/", scratch:trampoline+4096n+512n,
@@ -486,7 +562,7 @@ export function traceProcess(pid, rootfs, guest = null) {
           // wait status but before the tracer restarts it. This is a normal
           // lifecycle race, especially for Git's short-lived helpers.
           tasks.delete(taskPid);
-          if (process.env.PROOT_BUN_VERBOSE==="1")
+          if (verbose)
             console.error(`[ptrace] tracee ${taskPid} disappeared before restart`);
           continue;
         }
@@ -514,18 +590,14 @@ export function traceProcess(pid, rootfs, guest = null) {
           trampoline:task.trampoline,
           borrowPc:task.borrowPc,
           scratch:task.trampoline+(++nextScratchSlot)*4096n+512n, running:false });
-        if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] new tracee pid=${child} event=${event}`);
+        if (verbose) console.error(`[ptrace] new tracee pid=${child} event=${event}`);
         continue;
       }
       const stopped=getRegisters(taskPid);
-      if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} signal=${signal} pc=0x${getPc(stopped.regs).toString(16)} syscall=${getSyscallNumber(stopped.regs)}`);
+      if (verbose)
+        console.error(`[ptrace] pid=${taskPid} signal=${signal} pc=0x${getPc(stopped.regs).toString(16)} syscall=${getSyscallNumber(stopped.regs)}${describeFault(taskPid,signal,getPc(stopped.regs))}`);
       if (signal===31) { setX(stopped.regs,0,BigInt.asUintN(64,-38n)); putRegisters(taskPid,stopped); continue; }
       if (signal===19) continue; // consume ptrace/vfork bootstrap SIGSTOP
-      // Child state remains observable through wait4/waitid. Reinjecting the
-      // ptrace-observed SIGCHLD currently enters a stale Android signal frame
-      // after JS-controlled exec replacement on musl (BusyBox wget), which
-      // crashes on handler return.
-      if (signal===17) continue;
       task.pendingSignal=BigInt(signal); continue;
     }
     const phase=syscallPhase(taskPid);
@@ -614,7 +686,7 @@ export function traceProcess(pid, rootfs, guest = null) {
               const encoded=new TextEncoder().encode(guest);
               writeTraceeBytes(taskPid,buffer,encoded,size);
               setX(exited.regs,0,BigInt(encoded.length)); putRegisters(taskPid,exited);
-              if (process.env.PROOT_BUN_VERBOSE==="1")
+              if (verbose)
                 console.error(`[ptrace] pid=${taskPid} readlink target ${host} -> ${guest}`);
             }
           }
@@ -630,7 +702,7 @@ export function traceProcess(pid, rootfs, guest = null) {
         if (task.pendingL2sUnlink && result===0n) {
           try { commitEmulatedUnlink(rootfs,task.pendingL2sUnlink); }
           catch (error) {
-            if (process.env.PROOT_BUN_VERBOSE==="1")
+            if (verbose)
               console.error(`[ptrace] pid=${taskPid} link2symlink unlink cleanup failed: ${error.message}`);
           }
         }
@@ -639,7 +711,7 @@ export function traceProcess(pid, rootfs, guest = null) {
             const rename=task.pendingL2sRename;
             commitEmulatedRename(rootfs,rename.source,rename.targetHost,rename.targetGuest,rename.replaced);
           } catch (error) {
-            if (process.env.PROOT_BUN_VERBOSE==="1")
+            if (verbose)
               console.error(`[ptrace] pid=${taskPid} link2symlink rename cleanup failed: ${error.message}`);
           }
         }
@@ -648,7 +720,7 @@ export function traceProcess(pid, rootfs, guest = null) {
             const rename=task.pendingL2sDirectoryRename;
             commitEmulatedDirectoryRename(rootfs,rename.sourceGuest,rename.targetGuest);
           } catch (error) {
-            if (process.env.PROOT_BUN_VERBOSE==="1")
+            if (verbose)
               console.error(`[ptrace] pid=${taskPid} link2symlink directory rename cleanup failed: ${error.message}`);
           }
         }
@@ -658,16 +730,16 @@ export function traceProcess(pid, rootfs, guest = null) {
               task.pendingLinkGuestPaths?.[0],task.pendingLinkGuestPaths?.[1]);
             if (!emulated) copyFileSync(task.pendingLinkPaths[0],task.pendingLinkPaths[1],fsConstants.COPYFILE_EXCL);
             setX(exited.regs,0,0n); putRegisters(taskPid,exited); finalResult=0n;
-            if (process.env.PROOT_BUN_VERBOSE==="1")
+            if (verbose)
               console.error(`[ptrace] pid=${taskPid} linkat EACCES -> ${emulated?"link2symlink":"exclusive copy"} fallback`);
           } catch (error) {
             finalResult=BigInt(error.errno??-13);
-            if (process.env.PROOT_BUN_VERBOSE==="1")
+            if (verbose)
               console.error(`[ptrace] pid=${taskPid} linkat fallback failed: ${error.message}; paths=${task.pendingLinkPaths.join(" -> ")}`);
             setX(exited.regs,0,BigInt.asUintN(64,finalResult)); putRegisters(taskPid,exited);
           }
         }
-        if (finalResult<0n && process.env.PROOT_BUN_VERBOSE==="1")
+        if (finalResult<0n && verbose)
           console.error(`[ptrace] pid=${taskPid} syscall=${task.pendingPathSyscall} result=${finalResult}`);
         task.pendingPathSyscall=undefined;
         task.pendingLinkPaths=undefined;
@@ -697,14 +769,15 @@ export function traceProcess(pid, rootfs, guest = null) {
       }
       if (task.pendingExec!==null) {
         const next=task.pendingExec; task.pendingExec=null;
-        if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} emulating execve ${next.argv.join(" ")}`);
+        if (verbose) console.error(`[ptrace] pid=${taskPid} emulating execve ${next.argv.join(" ")}`);
         if (!isMapped(taskPid,task.trampoline)) {
           task.trampoline=allocateRemoteSyscalls(taskPid,task.borrowPc);
           task.scratch=task.trampoline+4096n+512n;
-          if (process.env.PROOT_BUN_VERBOSE==="1")
+          if (verbose)
             console.error(`[ptrace] pid=${taskPid} renewed trampoline=0x${task.trampoline.toString(16)}`);
         }
         closeExecDescriptors(taskPid,task.trampoline);
+        resetGuestSignals(taskPid,task.trampoline);
         resetExecAddressSpace(taskPid,task.trampoline);
         const nextImages=loadGuestImages(taskPid,task.trampoline,next);
         startGuest(taskPid,task.trampoline,nextImages,next);
@@ -764,11 +837,11 @@ export function traceProcess(pid, rootfs, guest = null) {
       continue;
     }
     if (syscall===221) {
-      if (process.env.PROOT_BUN_VERBOSE==="1")
+      if (verbose)
         console.error(`[ptrace] pid=${taskPid} execve path=0x${getX(state.regs,0).toString(16)} argv=0x${getX(state.regs,1).toString(16)}`);
       try { task.pendingExec=prepareExecGuest(taskPid,rootfs,task,state,tasks); }
       catch (error) {
-        if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} exec capture failed phase=${phase}: ${error.message}`);
+        if (verbose) console.error(`[ptrace] pid=${taskPid} exec capture failed phase=${phase}: ${error.message}`);
         continue;
       }
       // Substitute a harmless, universally available syscall. Using -1 as a
@@ -784,7 +857,7 @@ export function traceProcess(pid, rootfs, guest = null) {
       }
       if (translated!==flags) {
         setX(state.regs,0,translated); putRegisters(taskPid,state);
-        if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} clone flags 0x${flags.toString(16)} -> 0x${translated.toString(16)}`);
+        if (verbose) console.error(`[ptrace] pid=${taskPid} clone flags 0x${flags.toString(16)} -> 0x${translated.toString(16)}`);
       }
       continue;
     }
@@ -799,10 +872,28 @@ export function traceProcess(pid, rootfs, guest = null) {
         if ((flags&0x4000n)!==0n) translated&=~0x4100n; // VFORK -> private fork
         if (translated!==flags) {
           memory.poke(taskPid,args,translated);
-          if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} clone3 flags 0x${flags.toString(16)} -> 0x${translated.toString(16)}`);
+          if (verbose) console.error(`[ptrace] pid=${taskPid} clone3 flags 0x${flags.toString(16)} -> 0x${translated.toString(16)}`);
         }
       }
       continue;
+    }
+    if (syscall===SYS_FCHOWNAT || syscall===SYS_FCHOWN) {
+      // Substitute the real ids so the kernel has a chance of accepting the
+      // call; upstream fake_id0 does the same for its own emulated ids
+      // (src/extension/fake_id0/chown.c:handle_chown_enter_end).  Chowning a
+      // file to the ids it already carries is permitted without CAP_CHOWN,
+      // while nothing the guest asks for ever is: it believes it is root, and
+      // it is not.  This layer already answers every stat with uid 0 and gid 0,
+      // so an ownership the guest cannot observe costs nothing to drop, while
+      // failing the call makes an ordinary archive extraction report that it
+      // could not preserve ownership -- Alpine's shadow and linux-pam ship
+      // root:shadow files and apk counts one error per file.  -1 keeps its
+      // "leave this id alone" meaning.
+      const uidArgument=syscall===SYS_FCHOWNAT?2:1;
+      for (const [argument,real] of [[uidArgument,process.getuid()],[uidArgument+1,process.getgid()]])
+        if (BigInt.asUintN(32,getX(state.regs,argument))!==0xffffffffn)
+          setX(state.regs,argument,BigInt(real));
+      putRegisters(taskPid,state);
     }
     if (syscall===SYS_CLOSE) {
       openedAliases.delete(`${taskPid}:${Number(BigInt.asIntN(32,getX(state.regs,0)))}`);
@@ -825,7 +916,7 @@ export function traceProcess(pid, rootfs, guest = null) {
           { pid:descriptor[1]==="self"||descriptor[1]==="thread-self"?taskPid:Number(descriptor[1]),
             fd:Number(descriptor[2]) } };
       if (substitute!==null) {
-        if (process.env.PROOT_BUN_VERBOSE==="1")
+        if (verbose)
           console.error(`[ptrace] pid=${taskPid} readlink ${linkPath} -> ${substitute}`);
         setKernelSyscallNumber(taskPid,state,SYS_GETPID);
         continue;
@@ -845,7 +936,7 @@ export function traceProcess(pid, rootfs, guest = null) {
       if (address<4096n) continue;
       let guestPath;
       try { guestPath=readCString(memory,taskPid,address); }
-      catch (error) { if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] skipped pid=${taskPid} syscall=${syscall}: ${error.message}`); continue; }
+      catch (error) { if (verbose) console.error(`[ptrace] skipped pid=${taskPid} syscall=${syscall}: ${error.message}`); continue; }
       // "/proc/<PID>/{exe,cwd,root}" names a guest object, so open(2), stat(2)
       // and execve(2) have to reach it through the rootfs rather than through
       // the kernel's view of the Android bootstrap process.
@@ -853,7 +944,7 @@ export function traceProcess(pid, rootfs, guest = null) {
       if (procLink!==null) {
         const host=procLink==="/"?rootfs:`${rootfs}${procLink}`;
         hostPaths.push(host); guestPaths.push(procLink);
-        if (process.env.PROOT_BUN_VERBOSE==="1")
+        if (verbose)
           console.error(`[ptrace] pid=${taskPid} ${guestPath} (${procLink}) -> ${host}`);
         writeCString(memory,taskPid,scratch,host); setX(state.regs,spec.path,scratch);
         scratch+=BigInt((new TextEncoder().encode(host).length+8)&~7); changed=true;
@@ -881,7 +972,7 @@ export function traceProcess(pid, rootfs, guest = null) {
         const object=alias?null:inspectEmulatedObject(rootfs,inputGuest==="/"?rootfs:`${rootfs}${inputGuest}`);
         if (alias||object) task.pendingStat.nlink=(alias??object).nlink;
       }
-      if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} ${guestPath} (${absoluteGuest}) -> ${host}`);
+      if (verbose) console.error(`[ptrace] pid=${taskPid} ${guestPath} (${absoluteGuest}) -> ${host}`);
       writeCString(memory,taskPid,scratch,host); setX(state.regs,spec.path,scratch);
       scratch+=BigInt((new TextEncoder().encode(host).length+8)&~7); changed=true;
     }
