@@ -158,3 +158,7 @@ internal symlink chain.
 Directory renames require matching updates to the mirrored subtree under
 `refs` and to affected guest alias targets. Recovery must treat stale ref paths
 as inconsistent state rather than restoring data to an unverified pathname.
+
+## 尚未實做
+目前剩下的主要部分是多 PRoot instance 鎖定、崩潰恢復/
+  fsck，以及還原成原生 hard link 的工具。
