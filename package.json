@@ -1,8 +1,24 @@
 {
   "name": "bunproot",
-  "private": true,
+  "version": "0.1.0",
+  "description": "A port of PRoot to Bun: a userspace chroot, mount --bind and binfmt_misc for Android, with no privileges required",
   "license": "GPL-2.0-or-later",
   "type": "module",
+  "bin": {
+    "bunproot": "./proot.js"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "keywords": [
+    "proot",
+    "chroot",
+    "ptrace",
+    "android",
+    "termux",
+    "rootfs",
+    "bun"
+  ],
   "scripts": {
     "start": "bun run index.js",
     "test": "bun test"
