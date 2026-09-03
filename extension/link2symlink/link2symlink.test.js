@@ -3,12 +3,13 @@ import { mkdtempSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalizeGuestPath } from "../../path/canon.c.js";
+import { createBindings } from "../../path/binding.c.js";
 import { commitEmulatedDirectoryRename, commitEmulatedRename, commitEmulatedUnlink, emulateHardLink, inspectEmulatedAlias } from "./link2symlink.c.js";
 
 const roots=[];
 afterEach(()=>{ for (const root of roots.splice(0)) rmSync(root,{recursive:true,force:true}); });
 const hostPath=(root,guest)=>`${root}${guest}`;
-function resolvedHost(root,guest) { return hostPath(root,canonicalizeGuestPath(root,guest)); }
+function resolvedHost(root,guest) { return hostPath(root,canonicalizeGuestPath(createBindings(root),guest)); }
 
 describe("relocatable link2symlink format",()=>{
   test("content remains shared after the rootfs moves",()=>{

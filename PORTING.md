@@ -58,8 +58,12 @@ required three fixes worth keeping in mind:
    and exit events, signal delivery, and wait status behavior.
 7. **Seccomp.** Replace the broad SIGSYS-to-ENOSYS fallback with syscall-aware
    emulation or translation.
-8. **Extensions and CLI.** Port bindings, fake-id0, link2symlink, ashmem/memfd,
+8. **Extensions and CLI.** Port fake-id0, link2symlink, ashmem/memfd,
    mountinfo, hidden-files, port-switch, SysV IPC, and the remaining options.
+   `-b`/`--bind` is implemented; what is missing from `src/path/binding.c` is
+   the glue filesystem that materialises a mount point the rootfs does not
+   already contain (`src/path/glue.c`), asymmetric `--root-id` handling, and
+   the induced bindings a sub-reconfiguration adds.
 9. **Architectures.** Add ELF32/AArch32 and other ABIs after ARM64 behavior is
    stable.
 
@@ -189,6 +193,30 @@ automatic fallback when the filter cannot be installed.
 Installing the filter requires `PR_SET_NO_NEW_PRIVS`, so a guest cannot gain
 privileges through a setuid binary afterwards. Nothing in a `-S` rootfs could
 anyway -- the fake-id0 layer is the only root there is.
+
+## Bindings
+
+`src/path/binding.c` is ported in `path/binding.c.js` as the mount table every
+pathname goes through. The rootfs is the binding at `/`, so guest-to-host is one
+lookup over a table sorted longest-guest-first rather than a rootfs prefix plus
+exceptions, and host-to-guest -- `getcwd`, `readlink`, `/proc/<PID>/fd/<FD>`,
+dirfd resolution -- is the same table sorted longest-host-first. Canonicalization
+inspects each component through the table, so a symlink inside a binding is
+followed where that binding actually lives.
+
+Upstream's parsing semantics are matched exactly: the *first* colon separates
+host from guest (`src/cli/proot.c:handle_option_b`), a missing guest half means
+the same pathname on both sides, either half may be relative to the caller's
+working directory, and a host path that cannot be sanitized is reported and
+dropped unless `PROOT_IGNORE_MISSING_BINDINGS` is set
+(`src/path/binding.c:new_binding`). `/proc/self/...` is left literal on the host
+side, because "self" has to be resolved by the kernel against the calling tracee
+rather than against the tracer.
+
+A binding whose guest mount point does not exist in the rootfs still resolves --
+canonicalization stops at the missing component and the table maps what is left
+-- but the mount point is not visible to a directory listing. Upstream
+materialises it with the glue filesystem, which is not ported.
 
 `env.js` owns every environment decision: the tracer's knobs, the bootstrap
 environment, and the guest environment. A guest inherits the caller's variables

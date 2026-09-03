@@ -3,7 +3,9 @@ import { resolve } from "node:path";
 import { FFIType, ptr } from "bun:ffi";
 import { cString, openLibrary } from "../ffi.js";
 import { readElfInterpreter } from "../execve/elf.c.js";
+import { expandShebang } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
+import { createBindings } from "../path/binding.c.js";
 import { traceProcess } from "../ptrace/ptrace.c.js";
 import { bootstrapEnvironment } from "../env.js";
 
@@ -28,22 +30,57 @@ function spawnTracee(argv, env) {
   if (status !== 0) throw new Error(`posix_spawn failed: ${status}`);
   return new DataView(pidBytes.buffer).getInt32(0, true);
 }
+const USAGE = "usage: proot [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]";
+
 export function parseArguments(argv) {
-  if (argv[0] !== "-S" || !argv[1] || !argv[2]) throw new Error("usage: proot -S ROOTFS COMMAND [ARG ...]");
-  // Resolve this before the bootstrap changes cwd to the rootfs. Otherwise a
-  // caller-relative rootfs is interpreted again from inside that rootfs and
-  // subsequent host-path translations acquire the wrong prefix.
-  return { rootfs: resolve(argv[1]), command: argv.slice(2) };
+  const bindings = [];
+  let rootfs = null, index = 0;
+  for (; index < argv.length; index++) {
+    const argument = argv[index];
+    if (argument === "-b" || argument === "--bind" || argument === "-m" || argument === "--mount") {
+      if (argv[++index] === undefined) throw new Error(`${argument} needs a binding\n${USAGE}`);
+      bindings.push(argv[index]);
+      continue;
+    }
+    if (argument.startsWith("--bind=") || argument.startsWith("--mount=")) {
+      bindings.push(argument.slice(argument.indexOf("=") + 1));
+      continue;
+    }
+    if (argument === "-S" || argument === "--rootfs") {
+      if (argv[++index] === undefined) throw new Error(`${argument} needs a rootfs\n${USAGE}`);
+      // Resolve this before the bootstrap changes cwd to the rootfs. Otherwise
+      // a caller-relative rootfs is interpreted again from inside that rootfs
+      // and subsequent host-path translations acquire the wrong prefix.
+      rootfs = resolve(argv[index]);
+      continue;
+    }
+    break;
+  }
+  const command = argv.slice(index);
+  if (rootfs === null || command.length === 0) throw new Error(USAGE);
+  return { rootfs, bindings, command };
 }
 export function run(argv) {
-  const { rootfs, command } = parseArguments(argv);
-  const guestExecutable=command[0].startsWith("/")
-    ? canonicalizeGuestPath(rootfs,command[0])
+  const { rootfs, bindings, command } = parseArguments(argv);
+  const mounts = createBindings(rootfs, bindings);
+  let guestExecutable=command[0].startsWith("/")
+    ? canonicalizeGuestPath(mounts,command[0],{preserveInternalFinal:true})
     : command[0];
-  const executable=guestExecutable.startsWith("/")?`${rootfs}${guestExecutable}`:guestExecutable;
+  let executable=guestExecutable.startsWith("/")?mounts.toHost(canonicalizeGuestPath(mounts,guestExecutable)):guestExecutable;
   if (!existsSync(executable)) throw new Error(`guest executable not found: ${executable}`);
+  // The initial command goes through the same `#!` expansion as a nested
+  // execve; without it `proot -S ROOTFS /usr/bin/script` reads the script as
+  // an ELF and reports a truncated one.
+  let guestArgv=command;
+  const script=expandShebang(executable,guestExecutable,guestArgv);
+  if (script!==null) {
+    guestExecutable=canonicalizeGuestPath(mounts,script.guestPath,{preserveInternalFinal:true});
+    executable=mounts.toHost(canonicalizeGuestPath(mounts,guestExecutable));
+    guestArgv=script.argv;
+    if (!existsSync(executable)) throw new Error(`script interpreter not found: ${executable}`);
+  }
   const interpreter = readElfInterpreter(executable);
-  const loader = interpreter === null ? null : `${rootfs}${interpreter}`;
+  const loader = interpreter === null ? null : mounts.toHost(interpreter);
   if (loader !== null && !existsSync(loader)) throw new Error(`ELF interpreter not found: ${interpreter} (${loader})`);
   // Android only accepts the initial native ELF through its own linker. The
   // shell is a disposable bootstrap: it stops before any guest is loaded, and
@@ -53,5 +90,5 @@ export function run(argv) {
     "kill -19 $$; while :; do :; done", "proot-bun",
   ];
   const pid = spawnTracee(childArgv, bootstrapEnvironment());
-  return traceProcess(pid, rootfs, { rootfs, executable, guestPath: guestExecutable, interpreter, loader, argv: command });
+  return traceProcess(pid, mounts, { executable, guestPath: guestExecutable, interpreter, loader, argv: guestArgv });
 }

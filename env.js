@@ -8,6 +8,11 @@ export const verbose = process.env.PROOT_BUN_VERBOSE === "1";
 /** Count and time the tracer's own work, and report it when the guest exits. */
 export const profile = process.env.PROOT_BUN_PROFILE === "1";
 
+/** Do not warn about a `-b` binding whose host path does not exist; the
+ *  binding is dropped either way (src/path/binding.c:new_binding). Upstream's
+ *  variable, tested for presence like the rest of them. */
+export const ignoreMissingBindings = process.env.PROOT_IGNORE_MISSING_BINDINGS !== undefined;
+
 /** Stop on every syscall instead of filtering with seccomp. Upstream's own
  *  knob, down to its semantics: set at all -- to any value -- disables the
  *  filter (src/tracee/event.c:130). The filter is the difference between one

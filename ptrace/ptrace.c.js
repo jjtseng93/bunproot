@@ -312,7 +312,7 @@ function readPointerArray(pid,address,limit=4096) {
   throw new Error("unterminated tracee pointer array");
 }
 
-function prepareExecGuest(pid,rootfs,task,state,tasks) {
+function prepareExecGuest(pid,mounts,task,state,tasks) {
   const pathname=readCString(memory,pid,getX(state.regs,0));
   let argv=readPointerArray(pid,getX(state.regs,1));
   const env=readPointerArray(pid,getX(state.regs,2));
@@ -321,18 +321,18 @@ function prepareExecGuest(pid,rootfs,task,state,tasks) {
   // and /proc/<PID>/exe, and the host pathname the loader actually reads.  They
   // differ for an emulated hard link, and an interpreter that resolves its
   // imports next to argv[1] must never be handed /.proot.l2s/objs/<id>.
-  let guestPath=canonicalizeGuestPath(rootfs,resolveProcLink(pid,tasks,input)??input,
+  let guestPath=canonicalizeGuestPath(mounts,resolveProcLink(pid,tasks,input)??input,
     {preserveInternalFinal:true});
-  let executable=`${rootfs}${canonicalizeGuestPath(rootfs,guestPath)}`;
+  let executable=mounts.toHost(canonicalizeGuestPath(mounts,guestPath));
   const script=expandShebang(executable,guestPath,argv);
   if (script!==null) {
-    guestPath=canonicalizeGuestPath(rootfs,script.guestPath,{preserveInternalFinal:true});
-    executable=`${rootfs}${canonicalizeGuestPath(rootfs,guestPath)}`;
+    guestPath=canonicalizeGuestPath(mounts,script.guestPath,{preserveInternalFinal:true});
+    executable=mounts.toHost(canonicalizeGuestPath(mounts,guestPath));
     argv=script.argv;
   }
   const info=readElfLoadInfo(executable);
   const interpreter=info.interpreter;
-  const loader=interpreter===null?null:`${rootfs}${interpreter}`;
+  const loader=interpreter===null?null:mounts.toHost(interpreter);
   // Refuse the exec here, while the caller can still let the real execve run
   // and report the error itself.  Once the commit stage has torn down the
   // address space there is nothing left to return an errno to -- and a guest
@@ -340,7 +340,7 @@ function prepareExecGuest(pid,rootfs,task,state,tasks) {
   // glibc and the musl build of a package and tries one of them.
   if (loader!==null && !existsSync(loader))
     throw Object.assign(new Error(`ELF interpreter not found: ${interpreter}`),{code:"ENOENT"});
-  return { rootfs, executable, guestPath, interpreter, loader, argv:argv.length?argv:[pathname], env };
+  return { executable, guestPath, interpreter, loader, argv:argv.length?argv:[pathname], env };
 }
 
 function buildGuestStack(pid, trampoline, images, guest) {
@@ -462,24 +462,24 @@ function installSyscallFilter(pid,trampoline) {
     [BigInt(PR_SET_SECCOMP),BigInt(SECCOMP_MODE_FILTER),headerAddress,0n,0n])===0n;
 }
 
-function fdGuestBase(pid,rootfs,task,fd) {
+function fdGuestBase(pid,mounts,task,fd) {
   if (fd===-100) return task.cwd;
   const host=readlinkSync(`/proc/${pid}/fd/${fd}`);
-  if (host===rootfs) return "/";
-  if (host.startsWith(`${rootfs}/`)) return host.slice(rootfs.length);
-  throw new Error(`dirfd ${fd} points outside rootfs: ${host}`);
+  const guest=mounts.toGuest(host);
+  if (guest===null) throw new Error(`dirfd ${fd} points outside the guest namespace: ${host}`);
+  return guest;
 }
 
-function resolveGuestInput(pid,rootfs,task,state,path,spec) {
+function resolveGuestInput(pid,mounts,task,state,path,spec) {
   return path.startsWith("/")?posix.normalize(path):posix.resolve(
-    spec.dirfd===undefined?task.cwd:fdGuestBase(pid,rootfs,task,
+    spec.dirfd===undefined?task.cwd:fdGuestBase(pid,mounts,task,
       Number(BigInt.asIntN(32,getX(state.regs,spec.dirfd)))),path);
 }
-function resolveGuestPath(pid,rootfs,task,state,path,spec) {
-  const absolute=resolveGuestInput(pid,rootfs,task,state,path,spec);
+function resolveGuestPath(pid,mounts,task,state,path,spec) {
+  const absolute=resolveGuestInput(pid,mounts,task,state,path,spec);
   const flagSaysNoFollow=spec.nofollow!==undefined &&
     (getX(state.regs,spec.nofollow.arg)&spec.nofollow.mask)!==0n;
-  return canonicalizeGuestPath(rootfs,absolute,
+  return canonicalizeGuestPath(mounts,absolute,
     {derefFinal:spec.deref!==false&&!flagSaysNoFollow,preserveInternalFinal:spec.preserveL2s===true});
 }
 
@@ -522,12 +522,12 @@ function readTraceeBytes(pid,address,length) {
 const L2S_OBJS="/.proot.l2s/objs/";
 const openedAliases=new Map();
 
-function recallOpenedAlias(rootfs,procFd,objectGuest) {
+function recallOpenedAlias(mounts,procFd,objectGuest) {
   const accept=(alias)=>{
     if (alias===undefined) return null;
     // Descriptor numbers are reused and links are removed, so the remembered
     // name still has to lead to this very object.
-    try { return canonicalizeGuestPath(rootfs,alias)===objectGuest?alias:null; }
+    try { return canonicalizeGuestPath(mounts,alias)===objectGuest?alias:null; }
     catch { return null; }
   };
   if (procFd!==null) {
@@ -544,10 +544,8 @@ function recallOpenedAlias(rootfs,procFd,objectGuest) {
   return null;
 }
 
-function guestPathOf(rootfs,hostPath) {
-  if (hostPath===rootfs) return "/";
-  if (hostPath.startsWith(`${rootfs}/`)) return hostPath.slice(rootfs.length);
-  return hostPath;
+function guestPathOf(mounts,hostPath) {
+  return mounts.toGuest(hostPath)??hostPath;
 }
 
 // Upstream substitutes "/proc/<PID>/{exe,cwd,root}" with tracee->exe,
@@ -557,7 +555,7 @@ function guestPathOf(rootfs,hostPath) {
 // Android bootstrap binary -- /apex/com.android.runtime/bin/linker64 -- as the
 // process executable. Anything that re-executes itself through
 // /proc/self/exe (bun x re-running itself as `node`) would otherwise exec a
-// host path that does not exist inside the rootfs.
+// host path that does not exist inside the guest namespace.
 const PROC_LINK=/^\/proc\/(self|thread-self|\d+)\/(exe|cwd|root)$/;
 const PROC_FD_LINK=/^\/proc\/(self|thread-self|\d+)\/fd\/(\d+)$/;
 function resolveProcLink(taskPid,tasks,guestPath) {
@@ -572,7 +570,7 @@ function resolveProcLink(taskPid,tasks,guestPath) {
   return known.exe??null;
 }
 
-export function traceProcess(pid, rootfs, guest = null) {
+export function traceProcess(pid, mounts, guest = null) {
   const started=performance.now();
   const initial = wait(pid, 2); // WUNTRACED: observe the pre-exec SIGSTOP.
   if ((initial & 0xff) !== 0x7f) throw new Error("tracee did not stop before exec");
@@ -590,7 +588,7 @@ export function traceProcess(pid, rootfs, guest = null) {
   if (verbose)
     console.error(`[ptrace] mapped guest entry=0x${images.main.entry.toString(16)} interpreter entry=${images.interpreter ? `0x${images.interpreter.entry.toString(16)}` : "static"}`);
   resetGuestSignals(pid,trampoline);
-  setKernelRootCwd(pid,trampoline,rootfs);
+  setKernelRootCwd(pid,trampoline,mounts.rootfs);
   const filtering=installSyscallFilter(pid,trampoline);
   // Without a filter every syscall has to be stopped to find the few that
   // matter, which is correct but costs two stops per syscall.
@@ -601,7 +599,7 @@ export function traceProcess(pid, rootfs, guest = null) {
   let nextScratchSlot=1n;
   const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null,
     pendingCwd:null, pendingGetcwd:null, cwd:"/", scratch:trampoline+4096n+512n,
-    exe:guest===null?null:guest.guestPath??guestPathOf(rootfs,guest.executable) }]]);
+    exe:guest===null?null:guest.guestPath??guestPathOf(mounts,guest.executable) }]]);
   tasks.get(pid).trampoline=trampoline;
   tasks.get(pid).borrowPc=images.interpreter?.entry??images.main.entry;
   let rootExit=1;
@@ -696,7 +694,7 @@ export function traceProcess(pid, rootfs, guest = null) {
 const exited=registers(), result=syscallInfoResult();
         let directory=null;
         if (result>0n) { try { directory=readlinkSync(`/proc/${taskPid}/fd/${fd}`); } catch {} }
-        if (directory!==null && (directory===rootfs || directory.startsWith(`${rootfs}/`))) {
+        if (directory!==null && mounts.toGuest(directory)!==null) {
           count("getdents");
           count("getdentsBytes",Number(result));
           const bytes=timed("getdents",()=>readTraceeBytes(taskPid,buffer,Number(result)));
@@ -710,7 +708,7 @@ const exited=registers(), result=syscallInfoResult();
               let end=offset+19;
               while (end<offset+reclen && bytes[end]!==0) end++;
               const name=new TextDecoder().decode(bytes.subarray(offset+19,end));
-              if (timed("getdentsAlias",()=>isEmulatedAlias(rootfs,`${directory}/${name}`))) { bytes[offset+18]=DT_REG; rewritten=true; }
+              if (timed("getdentsAlias",()=>isEmulatedAlias(mounts.rootfs,`${directory}/${name}`))) { bytes[offset+18]=DT_REG; rewritten=true; }
             }
             offset+=reclen;
           }
@@ -739,10 +737,10 @@ const exited=registers(), result=syscallInfoResult();
           const result=BigInt.asIntN(64,getX(exited.regs,0));
           if (result>0n) {
             const host=new TextDecoder().decode(readTraceeBytes(taskPid,buffer,Number(result)));
-            if (host===rootfs || host.startsWith(`${rootfs}/`)) {
-              let guest=guestPathOf(rootfs,host);
+            if (mounts.toGuest(host)!==null) {
+              let guest=guestPathOf(mounts,host);
               if (guest.startsWith(L2S_OBJS))
-                guest=recallOpenedAlias(rootfs,procFd,guest)??guest;
+                guest=recallOpenedAlias(mounts,procFd,guest)??guest;
               const encoded=new TextEncoder().encode(guest);
               writeTraceeBytes(taskPid,buffer,encoded,size);
               setX(exited.regs,0,BigInt(encoded.length)); putRegisters(taskPid,exited);
@@ -760,7 +758,7 @@ const exited=registers(), result=syscallInfoResult();
           task.pendingOpenAlias=undefined;
         }
         if (task.pendingL2sUnlink && result===0n) {
-          try { commitEmulatedUnlink(rootfs,task.pendingL2sUnlink); }
+          try { commitEmulatedUnlink(mounts.rootfs,task.pendingL2sUnlink); }
           catch (error) {
             if (verbose)
               console.error(`[ptrace] pid=${taskPid} link2symlink unlink cleanup failed: ${error.message}`);
@@ -769,7 +767,7 @@ const exited=registers(), result=syscallInfoResult();
         if (task.pendingL2sRename && result===0n) {
           try {
             const rename=task.pendingL2sRename;
-            commitEmulatedRename(rootfs,rename.source,rename.targetHost,rename.targetGuest,rename.replaced);
+            commitEmulatedRename(mounts.rootfs,rename.source,rename.targetHost,rename.targetGuest,rename.replaced);
           } catch (error) {
             if (verbose)
               console.error(`[ptrace] pid=${taskPid} link2symlink rename cleanup failed: ${error.message}`);
@@ -778,7 +776,7 @@ const exited=registers(), result=syscallInfoResult();
         if (task.pendingL2sDirectoryRename && result===0n) {
           try {
             const rename=task.pendingL2sDirectoryRename;
-            commitEmulatedDirectoryRename(rootfs,rename.sourceGuest,rename.targetGuest);
+            commitEmulatedDirectoryRename(mounts.rootfs,rename.sourceGuest,rename.targetGuest);
           } catch (error) {
             if (verbose)
               console.error(`[ptrace] pid=${taskPid} link2symlink directory rename cleanup failed: ${error.message}`);
@@ -786,7 +784,7 @@ const exited=registers(), result=syscallInfoResult();
         }
         if (task.pendingPathSyscall===37 && result===-13n && task.pendingLinkPaths?.length===2) {
           try {
-            const emulated=emulateHardLink(rootfs,task.pendingLinkPaths[0],task.pendingLinkPaths[1],
+            const emulated=emulateHardLink(mounts.rootfs,task.pendingLinkPaths[0],task.pendingLinkPaths[1],
               task.pendingLinkGuestPaths?.[0],task.pendingLinkGuestPaths?.[1]);
             if (!emulated) copyFileSync(task.pendingLinkPaths[0],task.pendingLinkPaths[1],fsConstants.COPYFILE_EXCL);
             setX(exited.regs,0,0n); putRegisters(taskPid,exited); finalResult=0n;
@@ -817,7 +815,7 @@ const exited=registers(), result=syscallInfoResult();
         if (task.pendingGetcwd!==null) {
           if (result>0n) {
             const hostCwd=readCString(memory,taskPid,task.pendingGetcwd.buffer);
-            const guestCwd=hostCwd===rootfs?"/":hostCwd.startsWith(`${rootfs}/`)?hostCwd.slice(rootfs.length):hostCwd;
+            const guestCwd=mounts.toGuest(hostCwd)??hostCwd;
             const encoded=new TextEncoder().encode(`${guestCwd}\0`);
             if (BigInt(encoded.length)<=task.pendingGetcwd.size) {
               writeBytes(memory,taskPid,task.pendingGetcwd.buffer,encoded);
@@ -842,7 +840,7 @@ const exited=registers(), result=syscallInfoResult();
         const nextImages=loadGuestImages(taskPid,task.trampoline,next);
         startGuest(taskPid,task.trampoline,nextImages,next);
         task.borrowPc=nextImages.interpreter?.entry??nextImages.main.entry;
-        task.exe=next.guestPath??guestPathOf(rootfs,next.executable);
+        task.exe=next.guestPath??guestPathOf(mounts,next.executable);
       }
       continue;
     }
@@ -896,7 +894,7 @@ const exited=registers(), result=syscallInfoResult();
     if (syscall===80) {
       task.pendingStat={buffer:getX(state.regs,1),kind:"stat"};
       try {
-        const object=inspectEmulatedObject(rootfs,readlinkSync(`/proc/${taskPid}/fd/${Number(getX(state.regs,0))}`));
+        const object=inspectEmulatedObject(mounts.rootfs,readlinkSync(`/proc/${taskPid}/fd/${Number(getX(state.regs,0))}`));
         if (object) task.pendingStat.nlink=object.nlink;
       } catch {}
     }
@@ -908,7 +906,7 @@ const exited=registers(), result=syscallInfoResult();
     if (syscall===221) {
       if (verbose)
         console.error(`[ptrace] pid=${taskPid} execve path=0x${getX(state.regs,0).toString(16)} argv=0x${getX(state.regs,1).toString(16)}`);
-      try { task.pendingExec=prepareExecGuest(taskPid,rootfs,task,state,tasks); }
+      try { task.pendingExec=prepareExecGuest(taskPid,mounts,task,state,tasks); }
       catch (error) {
         if (verbose) console.error(`[ptrace] pid=${taskPid} exec capture failed phase=${phase}: ${error.message}`);
         continue;
@@ -1007,11 +1005,11 @@ const exited=registers(), result=syscallInfoResult();
       try { guestPath=readCString(memory,taskPid,address); }
       catch (error) { if (verbose) console.error(`[ptrace] skipped pid=${taskPid} syscall=${syscall}: ${error.message}`); continue; }
       // "/proc/<PID>/{exe,cwd,root}" names a guest object, so open(2), stat(2)
-      // and execve(2) have to reach it through the rootfs rather than through
+      // and execve(2) have to reach it through the mount table rather than through
       // the kernel's view of the Android bootstrap process.
       const procLink=guestPath.startsWith("/proc/")?resolveProcLink(taskPid,tasks,guestPath):null;
       if (procLink!==null) {
-        const host=procLink==="/"?rootfs:`${rootfs}${procLink}`;
+        const host=mounts.toHost(procLink);
         hostPaths.push(host); guestPaths.push(procLink);
         if (verbose)
           console.error(`[ptrace] pid=${taskPid} ${guestPath} (${procLink}) -> ${host}`);
@@ -1019,7 +1017,7 @@ const exited=registers(), result=syscallInfoResult();
         scratch+=BigInt((new TextEncoder().encode(host).length+8)&~7); changed=true;
         continue;
       }
-      if (isKernelFilesystem(guestPath)||guestPath.startsWith(`${rootfs}/`)) {
+      if (isKernelFilesystem(guestPath)||guestPath.startsWith(`${mounts.rootfs}/`)) {
         if (syscall===37)
           hostPaths.push(guestPath.replace(/^\/proc\/self(?=\/|$)/,`/proc/${taskPid}`));
         continue;
@@ -1027,19 +1025,19 @@ const exited=registers(), result=syscallInfoResult();
       let inputGuest, absoluteGuest;
       count("paths");
       try {
-        inputGuest=timed("canon",()=>resolveGuestInput(taskPid,rootfs,task,state,guestPath,spec));
-        absoluteGuest=timed("canon",()=>resolveGuestPath(taskPid,rootfs,task,state,guestPath,spec));
+        inputGuest=timed("canon",()=>resolveGuestInput(taskPid,mounts,task,state,guestPath,spec));
+        absoluteGuest=timed("canon",()=>resolveGuestPath(taskPid,mounts,task,state,guestPath,spec));
       }
       catch (error) { throw new Error(`pid ${taskPid} syscall ${syscall}: ${error.message}`); }
       if (syscall===SYS_CHDIR && spec.path===0) task.pendingCwd=absoluteGuest;
       if (syscall===SYS_OPENAT && absoluteGuest.startsWith(L2S_OBJS))
-        task.pendingOpenAlias=canonicalizeGuestPath(rootfs,inputGuest,{preserveInternalFinal:true});
-      const host=absoluteGuest==="/"?rootfs:`${rootfs}${absoluteGuest}`;
+        task.pendingOpenAlias=canonicalizeGuestPath(mounts,inputGuest,{preserveInternalFinal:true});
+      const host=mounts.toHost(absoluteGuest);
       hostPaths.push(host);
       guestPaths.push(absoluteGuest);
       if ((syscall===79 || syscall===291) && task.pendingStat) {
-        const alias=inspectEmulatedAlias(rootfs,inputGuest==="/"?rootfs:`${rootfs}${inputGuest}`);
-        const object=alias?null:inspectEmulatedObject(rootfs,inputGuest==="/"?rootfs:`${rootfs}${inputGuest}`);
+        const alias=inspectEmulatedAlias(mounts.rootfs,mounts.toHost(inputGuest));
+        const object=alias?null:inspectEmulatedObject(mounts.rootfs,mounts.toHost(inputGuest));
         if (alias||object) task.pendingStat.nlink=(alias??object).nlink;
       }
       if (verbose) console.error(`[ptrace] pid=${taskPid} ${guestPath} (${absoluteGuest}) -> ${host}`);
@@ -1048,15 +1046,15 @@ const exited=registers(), result=syscallInfoResult();
     }
     if (syscall===37) { task.pendingLinkPaths=hostPaths; task.pendingLinkGuestPaths=guestPaths; }
     if (syscall===35 && hostPaths.length===1)
-      task.pendingL2sUnlink=inspectEmulatedAlias(rootfs,hostPaths[0]);
+      task.pendingL2sUnlink=inspectEmulatedAlias(mounts.rootfs,hostPaths[0]);
     if ((syscall===38 || syscall===276) && hostPaths.length===2) {
-      const source=inspectEmulatedAlias(rootfs,hostPaths[0]);
-      const replaced=inspectEmulatedAlias(rootfs,hostPaths[1]);
+      const source=inspectEmulatedAlias(mounts.rootfs,hostPaths[0]);
+      const replaced=inspectEmulatedAlias(mounts.rootfs,hostPaths[1]);
       if (source && replaced?.id===source.id) {
         setKernelSyscallNumber(taskPid,state,SYS_GETPID); task.forcedResult=0n;
       } else if (source) {
         task.pendingL2sRename={source,replaced,targetHost:hostPaths[1],targetGuest:guestPaths[1]};
-      } else if (hasEmulatedDirectory(rootfs,guestPaths[0])) {
+      } else if (hasEmulatedDirectory(mounts.rootfs,guestPaths[0])) {
         task.pendingL2sDirectoryRename={sourceGuest:guestPaths[0],targetGuest:guestPaths[1]};
       }
     }

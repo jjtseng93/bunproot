@@ -1,8 +1,10 @@
 import { lstatSync, readlinkSync } from "node:fs";
 import { posix } from "node:path";
 
-/** Resolve guest symlinks without ever allowing a target to escape rootfs. */
-export function canonicalizeGuestPath(rootfs,path,{derefFinal=true,preserveInternalFinal=false,maxSymlinks=40}={}) {
+/** Resolve guest symlinks without ever allowing a target to escape the guest
+ *  namespace. Components are inspected through the mount table, so a symlink
+ *  inside a binding is followed where that binding actually lives. */
+export function canonicalizeGuestPath(mounts,path,{derefFinal=true,preserveInternalFinal=false,maxSymlinks=40}={}) {
   let pending=posix.normalize(path).split("/").filter(Boolean), resolved=[], followed=0;
   while (pending.length) {
     const component=pending.shift();
@@ -11,14 +13,14 @@ export function canonicalizeGuestPath(rootfs,path,{derefFinal=true,preserveInter
     const candidate=`/${[...resolved,component].join("/")}`;
     const isFinal=pending.length===0;
     let stat;
-    try { stat=lstatSync(`${rootfs}${candidate}`); }
+    try { stat=lstatSync(mounts.toHost(candidate)); }
     catch (error) {
       // The tracee syscall must receive filesystem errors itself; inability to
       // inspect a component only means canonicalization stops at this point.
       return posix.normalize(`/${[...resolved,component,...pending].join("/")}`);
     }
     if (!stat.isSymbolicLink()) { resolved.push(component); continue; }
-    const target=readlinkSync(`${rootfs}${candidate}`);
+    const target=readlinkSync(mounts.toHost(candidate));
     // Like upstream link2symlink's TRANSLATED_PATH callback, the storage
     // symlink is an implementation detail and must look like a regular file
     // even to lstat/O_NOFOLLOW callers. Ordinary final symlinks still honor

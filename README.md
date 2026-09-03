@@ -31,11 +31,27 @@ Add this directory to `PATH` so the `proot` launcher invokes the Bun port:
 
 ```sh
 cd /path/to/prbun
-PATH="$PWD:$PATH" LD_PRELOAD= proot -S ROOTFS COMMAND [ARG ...]
+PATH="$PWD:$PATH" LD_PRELOAD= proot [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]
 ```
 
 `ROOTFS` may be relative. It is resolved to an absolute path before the
 bootstrap changes its working directory.
+
+`-b`/`--bind` (`-m`/`--mount`) makes a host path visible inside the guest, and
+may be repeated. `-b HOST` binds it at the same pathname; `-b HOST:GUEST` binds
+it somewhere else. The first colon separates the two halves, and either half
+may be relative to the caller's working directory:
+
+```sh
+proot -S "$ROOTFS" -b /sdcard -b ./sdk:/opt/sdk /bin/sh
+```
+
+The most specific binding wins, so `-b /opt/sdk:/usr/lib/sdk` covers everything
+below `/usr/lib/sdk` and nothing above it; the rootfs is simply the binding at
+`/`. A binding whose host path does not exist is reported and dropped, as
+upstream does; `PROOT_IGNORE_MISSING_BINDINGS` silences the report but still
+drops it. `/proc`, `/dev` and `/sys` reach the host kernel filesystems without
+needing a binding.
 
 For the Termux `proot-distro` Debian rootfs used during development:
 
@@ -142,6 +158,8 @@ safely load Android bionic as a second libc.
 - The initial stack reproduces the kernel's string layout, including the
   ascending order within the argv and environment blocks that libuv measures
   `process.title` against.
+- The initial command goes through the same `#!` expansion as a nested
+  `execve`, so a script can be named directly on the command line.
 - `-S` resolves a relative rootfs before changing cwd and enables the current
   fake-id0 layer (`uid=0`, `gid=0`, root supplementary group, and root ownership
   in common stat results).
