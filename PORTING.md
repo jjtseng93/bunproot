@@ -147,6 +147,49 @@ A memory fault under `PROOT_BUN_VERBOSE=1` reports `si_code`, `si_addr`, the
 mapping the address belongs to and the mapping the faulting PC belongs to,
 which is what identified the stack layout bug.
 
+## Syscall filtering
+
+A tracer that restarts every tracee with `PTRACE_SYSCALL` stops twice for each
+syscall the guest makes, and a guest makes far more syscalls than this port
+translates. `bunx` against a warm cache took **45946 stops to reach 509 that
+mattered**, and 71% of the wall clock was spent in `waitpid`.
+
+`src/syscall/seccomp.c` is ported in `syscall/seccomp.c.js`: a classic-BPF
+program answering `SECCOMP_RET_TRACE` for exactly the syscalls the enter stage
+handles and `SECCOMP_RET_ALLOW` for everything else. It is installed on the
+bootstrap through the remote-syscall trampoline (`PR_SET_NO_NEW_PRIVS` first,
+which an unprivileged filter requires) and is inherited by every fork and
+execve afterwards. `PTRACE_O_TRACESECCOMP` turns a filtered syscall into a
+`PTRACE_EVENT_SECCOMP` stop, which the loop treats as the entry stop; it then
+asks for that one syscall's exit with `PTRACE_SYSCALL` and otherwise restarts
+tracees with `PTRACE_CONT`. The tracer's own remote `munmap`, `chdir` and
+`close` trip the filter, so `remoteSyscallAt()` steps over a seccomp stop the
+way it already steps over the bootstrap's queued `SIGSTOP`.
+
+Two cheaper changes came first. `PTRACE_GET_SYSCALL_INFO` already carries the
+syscall number, its arguments and its return value, so the enter stage reads it
+from there instead of paying a `PTRACE_GETREGSET`, and registers are fetched
+lazily -- once per stop, shared by every exit-stage handler -- and never at all
+for a syscall the port does not translate.
+
+| | before | + lazy registers | + seccomp |
+| --- | --- | --- | --- |
+| `/bin/true` | 211 ms | | 130 ms |
+| `bun --version` | 1195 ms | 733 ms | 147 ms |
+| `node --version` | 321 ms | | 164 ms |
+| `bunx jsmdcui --version` (warm) | 5130 ms | 2790 ms | 501 ms |
+| stops for that `bunx` | 45946 | 45946 | 1030 |
+
+`PROOT_BUN_PROFILE=1` reports the stop count, how many of those stops the port
+handled, how many pathnames it translated, and where the wall clock went.
+Upstream's `PROOT_NO_SECCOMP` restores stopping on every syscall -- set to any
+value, as upstream tests for presence rather than a value -- which is also the
+automatic fallback when the filter cannot be installed.
+
+Installing the filter requires `PR_SET_NO_NEW_PRIVS`, so a guest cannot gain
+privileges through a setuid binary afterwards. Nothing in a `-S` rootfs could
+anyway -- the fake-id0 layer is the only root there is.
+
 `env.js` owns every environment decision: the tracer's knobs, the bootstrap
 environment, and the guest environment. A guest inherits the caller's variables
 -- PRoot is not a container -- except those naming a host path or host-only

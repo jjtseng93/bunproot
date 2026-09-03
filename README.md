@@ -17,6 +17,10 @@ Native library paths are defined once in `dlpath.json`. JavaScript modules open
 those Android libraries through `ffi.js`; guest libraries under `ROOTFS/usr`
 are never used as the tracer's libc.
 
+Guest syscalls are filtered with seccomp so the tracer only stops for the ones
+it translates; `syscall/seccomp.c.js` builds the filter and `PORTING.md`
+records what that is worth.
+
 Environment handling is defined once in `env.js`: the tracer's own knobs, the
 environment the Android bootstrap is started with, and the environment a guest
 inherits. Other modules import from it rather than reading `process.env`.
@@ -84,14 +88,28 @@ The launcher effectively runs:
 
 ## Debugging
 
-Set `PROOT_BUN_VERBOSE=1` (read in `env.js`) to show ELF loading, process
-events, signals, guest exec replacement, and pathname rewriting. A memory fault
-additionally reports `si_code`, `si_addr`, and the mappings the faulting address
-and the faulting PC belong to:
+Every knob is read in `env.js`. Names shared with the original PRoot keep the
+original's name and semantics; the rest are prefixed `PROOT_BUN_` because they
+have no upstream counterpart.
+
+| Variable | Effect |
+| --- | --- |
+| `PROOT_BUN_VERBOSE=1` | Trace ELF loading, process events, signals, guest exec replacement and pathname rewriting. A memory fault also reports `si_code`, `si_addr`, and the mappings the faulting address and the faulting PC belong to. |
+| `PROOT_BUN_PROFILE=1` | On exit, report how many times the tracer stopped, how many of those stops it handled, how many pathnames it translated, and where the wall clock went. |
+| `PROOT_NO_SECCOMP` | Set to any value to stop on every syscall instead of filtering. Upstream's variable, with upstream's semantics: presence is what counts. This is also the automatic fallback when the filter cannot be installed. |
 
 ```sh
 PROOT_BUN_VERBOSE=1 PATH="$PWD:$PATH" LD_PRELOAD= \
   proot -S "$ROOTFS" /bin/ls /
+```
+
+Reading a profile: `stops` is what the tracer paid for and `handled` is what it
+got. Without the seccomp filter the first is two per syscall the *guest* makes;
+with it, two per syscall the *port translates*. A large gap between them means
+the filter is off or is tracing more than it needs to.
+
+```sh
+PROOT_BUN_PROFILE=1 proot -S "$ROOTFS" /bin/sh -c 'bunx cowsay hello'
 ```
 
 Tests involving FFI must run in native Termux. Bun inside a glibc PRoot cannot
