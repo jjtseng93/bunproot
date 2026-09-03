@@ -2,7 +2,7 @@ import { lstatSync, readlinkSync } from "node:fs";
 import { posix } from "node:path";
 
 /** Resolve guest symlinks without ever allowing a target to escape rootfs. */
-export function canonicalizeGuestPath(rootfs,path,{derefFinal=true,maxSymlinks=40}={}) {
+export function canonicalizeGuestPath(rootfs,path,{derefFinal=true,preserveInternalFinal=false,maxSymlinks=40}={}) {
   let pending=posix.normalize(path).split("/").filter(Boolean), resolved=[], followed=0;
   while (pending.length) {
     const component=pending.shift();
@@ -10,7 +10,6 @@ export function canonicalizeGuestPath(rootfs,path,{derefFinal=true,maxSymlinks=4
     if (component==="..") { resolved.pop(); continue; }
     const candidate=`/${[...resolved,component].join("/")}`;
     const isFinal=pending.length===0;
-    if (isFinal&&!derefFinal) { resolved.push(component); continue; }
     let stat;
     try { stat=lstatSync(`${rootfs}${candidate}`); }
     catch (error) {
@@ -19,8 +18,15 @@ export function canonicalizeGuestPath(rootfs,path,{derefFinal=true,maxSymlinks=4
       return posix.normalize(`/${[...resolved,component,...pending].join("/")}`);
     }
     if (!stat.isSymbolicLink()) { resolved.push(component); continue; }
-    if (++followed>maxSymlinks) throw Object.assign(new Error(`too many symbolic links: ${path}`),{code:"ELOOP"});
     const target=readlinkSync(`${rootfs}${candidate}`);
+    // Like upstream link2symlink's TRANSLATED_PATH callback, the storage
+    // symlink is an implementation detail and must look like a regular file
+    // even to lstat/O_NOFOLLOW callers. Ordinary final symlinks still honor
+    // the caller's no-follow semantics.
+    const internalLink=target.startsWith("/.proot.l2s/refs/") ||
+      target.startsWith("/.proot.l2s/objs/");
+    if (isFinal&&!derefFinal&&(!internalLink||preserveInternalFinal)) { resolved.push(component); continue; }
+    if (++followed>maxSymlinks) throw Object.assign(new Error(`too many symbolic links: ${path}`),{code:"ELOOP"});
     const targetPath=target.startsWith("/")?target:posix.resolve(`/${resolved.join("/")}`,target);
     pending=[...posix.normalize(targetPath).split("/").filter(Boolean),...pending];
     resolved=[];

@@ -7,6 +7,7 @@ import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
 import { readElfLoadInfo, relocateElf } from "../execve/elf.c.js";
 import { expandShebang } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
+import { commitEmulatedDirectoryRename, commitEmulatedRename, commitEmulatedUnlink, emulateHardLink, hasEmulatedDirectory, inspectEmulatedAlias, inspectEmulatedObject } from "../extension/link2symlink/link2symlink.c.js";
 
 const PTRACE_PEEKTEXT=1, PTRACE_PEEKDATA=2, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5;
 const PTRACE_CONT=7, PTRACE_ATTACH=16, PTRACE_SYSCALL=24;
@@ -313,15 +314,15 @@ function startGuest(pid, trampoline, images, guest) {
 // Linux arm64 syscall -> pathname registers. Symlink targets are intentionally
 // not translated; only the directory entry being created is a host pathname.
 const PATH_ARGUMENTS = new Map([
-  [33,[{path:1,dirfd:0,deref:false}]], [34,[{path:1,dirfd:0,deref:false}]], [35,[{path:1,dirfd:0,deref:false}]],
-  [36,[{path:2,dirfd:1,deref:false}]], [37,[{path:1,dirfd:0,deref:false},{path:3,dirfd:2,deref:false}]],
-  [38,[{path:1,dirfd:0,deref:false},{path:3,dirfd:2,deref:false}]], [43,[{path:0}]], [45,[{path:0}]],
+  [33,[{path:1,dirfd:0,deref:false}]], [34,[{path:1,dirfd:0,deref:false}]], [35,[{path:1,dirfd:0,deref:false,preserveL2s:true}]],
+  [36,[{path:2,dirfd:1,deref:false,preserveL2s:true}]], [37,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]],
+  [38,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]], [43,[{path:0}]], [45,[{path:0}]],
   [48,[{path:1,dirfd:0}]], [49,[{path:0}]], [51,[{path:0}]],
   [53,[{path:1,dirfd:0}]], [54,[{path:1,dirfd:0}]],
   [56,[{path:1,dirfd:0,nofollow:{arg:2,mask:0x20000n}}]],
   [78,[{path:1,dirfd:0,deref:false}]],
   [79,[{path:1,dirfd:0,nofollow:{arg:3,mask:0x100n}}]], [88,[{path:1,dirfd:0}]],
-  [89,[{path:0}]], [276,[{path:1,dirfd:0,deref:false},{path:3,dirfd:2,deref:false}]],
+  [89,[{path:0}]], [276,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]],
   [281,[{path:1,dirfd:0}]],
   [291,[{path:1,dirfd:0,nofollow:{arg:2,mask:0x100n}}]],
   [437,[{path:1,dirfd:0}]], [439,[{path:1,dirfd:0}]],
@@ -335,14 +336,17 @@ function fdGuestBase(pid,rootfs,task,fd) {
   throw new Error(`dirfd ${fd} points outside rootfs: ${host}`);
 }
 
-function resolveGuestPath(pid,rootfs,task,state,path,spec) {
-  const absolute=path.startsWith("/")?posix.normalize(path):posix.resolve(
+function resolveGuestInput(pid,rootfs,task,state,path,spec) {
+  return path.startsWith("/")?posix.normalize(path):posix.resolve(
     spec.dirfd===undefined?task.cwd:fdGuestBase(pid,rootfs,task,
       Number(BigInt.asIntN(32,getX(state.regs,spec.dirfd)))),path);
+}
+function resolveGuestPath(pid,rootfs,task,state,path,spec) {
+  const absolute=resolveGuestInput(pid,rootfs,task,state,path,spec);
   const flagSaysNoFollow=spec.nofollow!==undefined &&
     (getX(state.regs,spec.nofollow.arg)&spec.nofollow.mask)!==0n;
   return canonicalizeGuestPath(rootfs,absolute,
-    {derefFinal:spec.deref!==false&&!flagSaysNoFollow});
+    {derefFinal:spec.deref!==false&&!flagSaysNoFollow,preserveInternalFinal:spec.preserveL2s===true});
 }
 
 function isKernelFilesystem(path) {
@@ -444,18 +448,50 @@ export function traceProcess(pid, rootfs, guest = null) {
           const { buffer,kind }=task.pendingStat;
           const uidOffset=kind==="statx"?20n:24n;
           writeBytes(memory,taskPid,buffer+uidOffset,new Uint8Array(8));
+          if (task.pendingStat.nlink!==undefined) {
+            const count=new Uint8Array(4);
+            new DataView(count.buffer).setUint32(0,Number(task.pendingStat.nlink),true);
+            writeBytes(memory,taskPid,buffer+(kind==="statx"?16n:20n),count);
+          }
         }
         task.pendingStat=undefined;
       }
       if (task.pendingPathSyscall!==undefined) {
         const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
         let finalResult=result;
+        if (task.pendingL2sUnlink && result===0n) {
+          try { commitEmulatedUnlink(rootfs,task.pendingL2sUnlink); }
+          catch (error) {
+            if (process.env.PROOT_BUN_VERBOSE==="1")
+              console.error(`[ptrace] pid=${taskPid} link2symlink unlink cleanup failed: ${error.message}`);
+          }
+        }
+        if (task.pendingL2sRename && result===0n) {
+          try {
+            const rename=task.pendingL2sRename;
+            commitEmulatedRename(rootfs,rename.source,rename.targetHost,rename.targetGuest,rename.replaced);
+          } catch (error) {
+            if (process.env.PROOT_BUN_VERBOSE==="1")
+              console.error(`[ptrace] pid=${taskPid} link2symlink rename cleanup failed: ${error.message}`);
+          }
+        }
+        if (task.pendingL2sDirectoryRename && result===0n) {
+          try {
+            const rename=task.pendingL2sDirectoryRename;
+            commitEmulatedDirectoryRename(rootfs,rename.sourceGuest,rename.targetGuest);
+          } catch (error) {
+            if (process.env.PROOT_BUN_VERBOSE==="1")
+              console.error(`[ptrace] pid=${taskPid} link2symlink directory rename cleanup failed: ${error.message}`);
+          }
+        }
         if (task.pendingPathSyscall===37 && result===-13n && task.pendingLinkPaths?.length===2) {
           try {
-            copyFileSync(task.pendingLinkPaths[0],task.pendingLinkPaths[1],fsConstants.COPYFILE_EXCL);
+            const emulated=emulateHardLink(rootfs,task.pendingLinkPaths[0],task.pendingLinkPaths[1],
+              task.pendingLinkGuestPaths?.[0],task.pendingLinkGuestPaths?.[1]);
+            if (!emulated) copyFileSync(task.pendingLinkPaths[0],task.pendingLinkPaths[1],fsConstants.COPYFILE_EXCL);
             setX(exited.regs,0,0n); putRegisters(taskPid,exited); finalResult=0n;
             if (process.env.PROOT_BUN_VERBOSE==="1")
-              console.error(`[ptrace] pid=${taskPid} linkat EACCES -> exclusive copy fallback`);
+              console.error(`[ptrace] pid=${taskPid} linkat EACCES -> ${emulated?"link2symlink":"exclusive copy"} fallback`);
           } catch (error) {
             finalResult=BigInt(error.errno??-13);
             if (process.env.PROOT_BUN_VERBOSE==="1")
@@ -467,6 +503,10 @@ export function traceProcess(pid, rootfs, guest = null) {
           console.error(`[ptrace] pid=${taskPid} syscall=${task.pendingPathSyscall} result=${finalResult}`);
         task.pendingPathSyscall=undefined;
         task.pendingLinkPaths=undefined;
+        task.pendingLinkGuestPaths=undefined;
+        task.pendingL2sUnlink=undefined;
+        task.pendingL2sRename=undefined;
+        task.pendingL2sDirectoryRename=undefined;
       }
       if (task.pendingCwd!==null || task.pendingGetcwd!==null) {
         const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
@@ -542,7 +582,13 @@ export function traceProcess(pid, rootfs, guest = null) {
       continue;
     }
     if (syscall===79) task.pendingStat={buffer:getX(state.regs,2),kind:"stat"};
-    if (syscall===80) task.pendingStat={buffer:getX(state.regs,1),kind:"stat"};
+    if (syscall===80) {
+      task.pendingStat={buffer:getX(state.regs,1),kind:"stat"};
+      try {
+        const object=inspectEmulatedObject(rootfs,readlinkSync(`/proc/${taskPid}/fd/${Number(getX(state.regs,0))}`));
+        if (object) task.pendingStat.nlink=object.nlink;
+      } catch {}
+    }
     if (syscall===291) task.pendingStat={buffer:getX(state.regs,4),kind:"statx"};
     if (syscall===SYS_GETCWD) {
       task.pendingGetcwd={ buffer:getX(state.regs,0), size:getX(state.regs,1) };
@@ -592,11 +638,12 @@ export function traceProcess(pid, rootfs, guest = null) {
     const arguments_=PATH_ARGUMENTS.get(syscall);
     if (arguments_===undefined) continue;
     task.pendingPathSyscall=syscall;
-    let scratch=task.scratch, changed=false, hostPaths=[];
+    let scratch=task.scratch, changed=false, hostPaths=[], guestPaths=[];
     for (const spec of arguments_) {
       const address=getX(state.regs,spec.path);
       if (syscall===37 && spec.path===1 && (getX(state.regs,4)&0x1000n)!==0n) {
         hostPaths.push(`/proc/${taskPid}/fd/${Number(BigInt.asIntN(32,getX(state.regs,0)))}`);
+        guestPaths.push(null);
         continue;
       }
       if (address<4096n) continue;
@@ -608,17 +655,39 @@ export function traceProcess(pid, rootfs, guest = null) {
           hostPaths.push(guestPath.replace(/^\/proc\/self(?=\/|$)/,`/proc/${taskPid}`));
         continue;
       }
-      let absoluteGuest;
-      try { absoluteGuest=resolveGuestPath(taskPid,rootfs,task,state,guestPath,spec); }
+      let inputGuest, absoluteGuest;
+      try {
+        inputGuest=resolveGuestInput(taskPid,rootfs,task,state,guestPath,spec);
+        absoluteGuest=resolveGuestPath(taskPid,rootfs,task,state,guestPath,spec);
+      }
       catch (error) { throw new Error(`pid ${taskPid} syscall ${syscall}: ${error.message}`); }
       if (syscall===SYS_CHDIR && spec.path===0) task.pendingCwd=absoluteGuest;
       const host=absoluteGuest==="/"?rootfs:`${rootfs}${absoluteGuest}`;
       hostPaths.push(host);
+      guestPaths.push(absoluteGuest);
+      if ((syscall===79 || syscall===291) && task.pendingStat) {
+        const alias=inspectEmulatedAlias(rootfs,inputGuest==="/"?rootfs:`${rootfs}${inputGuest}`);
+        const object=alias?null:inspectEmulatedObject(rootfs,inputGuest==="/"?rootfs:`${rootfs}${inputGuest}`);
+        if (alias||object) task.pendingStat.nlink=(alias??object).nlink;
+      }
       if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} ${guestPath} (${absoluteGuest}) -> ${host}`);
       writeCString(memory,taskPid,scratch,host); setX(state.regs,spec.path,scratch);
       scratch+=BigInt((new TextEncoder().encode(host).length+8)&~7); changed=true;
     }
-    if (syscall===37) task.pendingLinkPaths=hostPaths;
+    if (syscall===37) { task.pendingLinkPaths=hostPaths; task.pendingLinkGuestPaths=guestPaths; }
+    if (syscall===35 && hostPaths.length===1)
+      task.pendingL2sUnlink=inspectEmulatedAlias(rootfs,hostPaths[0]);
+    if ((syscall===38 || syscall===276) && hostPaths.length===2) {
+      const source=inspectEmulatedAlias(rootfs,hostPaths[0]);
+      const replaced=inspectEmulatedAlias(rootfs,hostPaths[1]);
+      if (source && replaced?.id===source.id) {
+        setKernelSyscallNumber(taskPid,state,SYS_GETPID); task.forcedResult=0n;
+      } else if (source) {
+        task.pendingL2sRename={source,replaced,targetHost:hostPaths[1],targetGuest:guestPaths[1]};
+      } else if (hasEmulatedDirectory(rootfs,guestPaths[0])) {
+        task.pendingL2sDirectoryRename={sourceGuest:guestPaths[0],targetGuest:guestPaths[1]};
+      }
+    }
     if (changed) putRegisters(taskPid,state);
   }
   return rootExit;

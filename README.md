@@ -89,7 +89,9 @@ safely load Android bionic as a second libc.
 - Guest-aware absolute symlinks work for both initial commands and nested exec;
   for example Alpine's `/usr/bin/wget -> /bin/busybox` stays inside `ROOTFS`.
 - Android app-data `linkat` failures use an exclusive-copy fallback, allowing
-  Alpine `apk update` to install downloaded repository indexes.
+  Alpine `apk update` to install downloaded repository indexes. Ordinary
+  failed hard links use the relocatable `refs/objs/mets` emulation described
+  in [link2symlink.md](./link2symlink.md).
 - `-S` resolves a relative rootfs before changing cwd and enables the current
   fake-id0 layer (`uid=0`, `gid=0`, root supplementary group, and root ownership
   in common stat results).

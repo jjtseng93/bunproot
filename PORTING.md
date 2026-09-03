@@ -106,10 +106,20 @@ bun i -g --backend=copyfile cowsay
 ```
 
 Hard-link pathname translation is correct, but Android rejects the underlying
-app-data `linkat` with `EACCES`. The current compatibility fallback creates an
-exclusive copy, including apk's `/proc/self/fd/N` source form; this is enough
-for `apk update`, but general hard-link identity still requires the original
-`link2symlink` emulation tracked under item 8. `execveat` remains open.
+app-data `linkat` with `EACCES`. Apk's special `/proc/self/fd/N` source form
+retains an exclusive-copy fallback; this is enough for `apk update` but does
+not preserve hard-link identity. `execveat` remains open.
+
+The first Bun `link2symlink` slice now replaces ordinary failed guest
+`linkat()` calls with the relocatable `refs/objs/mets` format documented in
+`link2symlink.md`. Existing emulated links share their object on subsequent
+links, and successful `unlinkat()` decrements the dangling-symlink count.
+The original `/proc/PID/fd/N` deleted-file copy special case is retained for
+apk. Single-file rename updates its mirrored ref, same-object rename has native
+no-op semantics, and pathname stat/statx plus descriptor fstat report the
+emulated link count. Directory rename moves its mirrored refs subtree and walks
+only that subtree to retarget affected aliases. Concurrency locking, recovery,
+and native-hard-link restoration remain to be implemented.
 
 Git's native clone path is now an integration regression test:
 
