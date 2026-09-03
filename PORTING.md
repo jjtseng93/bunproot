@@ -58,6 +58,12 @@ The clone event loop now resumes a new tracee immediately after
 SIGSTOP or coalesce it with the event; waiting unconditionally for another stop
 deadlocked Node worker startup.
 
+ARM64 syscall entry/exit classification uses `PTRACE_GET_SYSCALL_INFO` when
+available, with the per-task toggle retained only as an old-kernel fallback.
+Syscall substitution updates `NT_ARM_SYSTEM_CALL`; changing x8 alone does not
+change the syscall already cached by the ARM64 kernel. This fixes BusyBox/musl
+self-exec from an interactive shell.
+
 ## Current priority
 
 Items 1 and 2 are in progress. Implemented so far:

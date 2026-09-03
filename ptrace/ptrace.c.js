@@ -11,6 +11,7 @@ import { canonicalizeGuestPath } from "../path/canon.c.js";
 const PTRACE_PEEKTEXT=1, PTRACE_PEEKDATA=2, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5;
 const PTRACE_CONT=7, PTRACE_ATTACH=16, PTRACE_SYSCALL=24;
 const PTRACE_GETREGSET=0x4204, PTRACE_SETREGSET=0x4205, PTRACE_SETOPTIONS=0x4200;
+const PTRACE_GET_SYSCALL_INFO=0x420e;
 const native = openLibrary("libc", {
   ptrace: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.u64], returns: FFIType.i64 },
   waitpid: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
@@ -35,6 +36,11 @@ function eventMessage(pid) {
   if (call(0x4201,pid,0n,BigInt(ptr(bytes)))<0n) throw new Error("PTRACE_GETEVENTMSG failed");
   return Number(new DataView(bytes.buffer).getBigUint64(0,true));
 }
+function syscallPhase(pid) {
+  const info=new Uint8Array(88);
+  const result=call(PTRACE_GET_SYSCALL_INFO,pid,BigInt(info.byteLength),BigInt(ptr(info)));
+  return result<0n?0:info[0]; // NONE=0, ENTRY=1, EXIT=2, SECCOMP=3
+}
 function getRegisters(pid) {
   const regs = makeRegisterSet(), iovec = makeIovec(regs);
   if (call(PTRACE_GETREGSET, pid, BigInt(NT_PRSTATUS), BigInt(iovec.pointer)) < 0n) throw new Error("PTRACE_GETREGSET failed");
@@ -42,6 +48,17 @@ function getRegisters(pid) {
 }
 function putRegisters(pid, state) {
   if (call(PTRACE_SETREGSET, pid, BigInt(NT_PRSTATUS), BigInt(state.iovec.pointer)) < 0n) throw new Error("PTRACE_SETREGSET failed");
+}
+function setKernelSyscallNumber(pid,state,number) {
+  setX(state.regs,8,BigInt.asUintN(64,BigInt(number)));
+  const value=new Uint8Array(8);
+  new DataView(value.buffer).setBigUint64(0,BigInt.asUintN(64,BigInt(number)),true);
+  const iovec=new Uint8Array(16), view=new DataView(iovec.buffer);
+  view.setBigUint64(0,BigInt(ptr(value)),true);
+  view.setBigUint64(8,8n,true);
+  if (call(PTRACE_SETREGSET,pid,0x404n,BigInt(ptr(iovec)))<0n)
+    throw new Error("unable to set arm64 syscall number");
+  putRegisters(pid,state);
 }
 
 const ARM64_SYSCALL_TRAMPOLINE = 0xd4200000d4000001n; // svc #0; brk #0
@@ -82,14 +99,21 @@ function remoteSyscallAt(pid, address, syscall, args = []) {
   }
 }
 
-function initializeRemoteSyscalls(pid) {
-  const borrowedPc = getPc(getRegisters(pid).regs);
-  const remotePid = remoteSyscallAt(pid, borrowedPc, SYS_GETPID);
-  if (remotePid !== BigInt(pid)) throw new Error(`remote getpid mismatch: expected ${pid}, got ${remotePid}`);
-  const page = remoteSyscallAt(pid, borrowedPc, SYS_MMAP, [0n, 1024n*1024n, 7n, 0x22n, -1n, 0n]);
+function allocateRemoteSyscalls(pid,borrowedPc) {
+  const requested=0x2000000000n;
+  const page=remoteSyscallAt(pid,borrowedPc,SYS_MMAP,
+    [requested,1024n*1024n,7n,0x100022n,-1n,0n]); // FIXED_NOREPLACE|PRIVATE|ANON
   if (page < 0n) throw new Error(`remote mmap failed: ${page}`);
+  if (page!==requested) throw new Error(`remote mmap returned unexpected address 0x${page.toString(16)}`);
   memory.poke(pid, page, ARM64_SYSCALL_TRAMPOLINE);
   return page;
+}
+
+function initializeRemoteSyscalls(pid) {
+  const borrowedPc=getPc(getRegisters(pid).regs);
+  const remotePid=remoteSyscallAt(pid,borrowedPc,SYS_GETPID);
+  if (remotePid!==BigInt(pid)) throw new Error(`remote getpid mismatch: expected ${pid}, got ${remotePid}`);
+  return allocateRemoteSyscalls(pid,borrowedPc);
 }
 
 function resetExecAddressSpace(pid,trampoline) {
@@ -111,6 +135,13 @@ function resetExecAddressSpace(pid,trampoline) {
     if (result<0n && process.env.PROOT_BUN_VERBOSE==="1")
       console.error(`[ptrace] pid=${pid} munmap 0x${start.toString(16)}-0x${end.toString(16)} failed: ${result}`);
   }
+}
+
+function isMapped(pid,address) {
+  return readFileSync(`/proc/${pid}/maps`,"utf8").split("\n").some((line)=>{
+    const match=/^([0-9a-f]+)-([0-9a-f]+)\s/.exec(line);
+    return match && BigInt(`0x${match[1]}`)<=address && BigInt(`0x${match[2]}`)>address;
+  });
 }
 
 function remoteCall(pid, trampoline, syscall, args=[]) {
@@ -260,10 +291,13 @@ const PATH_ARGUMENTS = new Map([
   [36,[{path:2,dirfd:1,deref:false}]], [37,[{path:1,dirfd:0,deref:false},{path:3,dirfd:2,deref:false}]],
   [38,[{path:1,dirfd:0,deref:false},{path:3,dirfd:2,deref:false}]], [43,[{path:0}]], [45,[{path:0}]],
   [48,[{path:1,dirfd:0}]], [49,[{path:0}]], [51,[{path:0}]],
-  [53,[{path:1,dirfd:0}]], [54,[{path:1,dirfd:0}]], [56,[{path:1,dirfd:0}]],
-  [78,[{path:1,dirfd:0,deref:false}]], [79,[{path:1,dirfd:0}]], [88,[{path:1,dirfd:0}]],
+  [53,[{path:1,dirfd:0}]], [54,[{path:1,dirfd:0}]],
+  [56,[{path:1,dirfd:0,nofollow:{arg:2,mask:0x20000n}}]],
+  [78,[{path:1,dirfd:0,deref:false}]],
+  [79,[{path:1,dirfd:0,nofollow:{arg:3,mask:0x100n}}]], [88,[{path:1,dirfd:0}]],
   [89,[{path:0}]], [276,[{path:1,dirfd:0,deref:false},{path:3,dirfd:2,deref:false}]],
-  [281,[{path:1,dirfd:0}]], [291,[{path:1,dirfd:0}]],
+  [281,[{path:1,dirfd:0}]],
+  [291,[{path:1,dirfd:0,nofollow:{arg:2,mask:0x100n}}]],
   [437,[{path:1,dirfd:0}]], [439,[{path:1,dirfd:0}]],
 ]);
 
@@ -279,7 +313,10 @@ function resolveGuestPath(pid,rootfs,task,state,path,spec) {
   const absolute=path.startsWith("/")?posix.normalize(path):posix.resolve(
     spec.dirfd===undefined?task.cwd:fdGuestBase(pid,rootfs,task,
       Number(BigInt.asIntN(32,getX(state.regs,spec.dirfd)))),path);
-  return canonicalizeGuestPath(rootfs,absolute,{derefFinal:spec.deref!==false});
+  const flagSaysNoFollow=spec.nofollow!==undefined &&
+    (getX(state.regs,spec.nofollow.arg)&spec.nofollow.mask)!==0n;
+  return canonicalizeGuestPath(rootfs,absolute,
+    {derefFinal:spec.deref!==false&&!flagSaysNoFollow});
 }
 
 function isKernelFilesystem(path) {
@@ -296,7 +333,7 @@ export function traceProcess(pid, rootfs, guest = null) {
   if (call(PTRACE_SETOPTIONS, pid, 0n, 0x10000fn) < 0n) throw new Error("PTRACE_SETOPTIONS failed");
   if (process.env.PROOT_BUN_VERBOSE === "1" && guest !== null)
     console.error(`[ptrace] bootstrap pid=${pid} executable=${guest.executable} interpreter=${guest.interpreter ?? "static"}`);
-  const trampoline = initializeRemoteSyscalls(pid);
+  let trampoline = initializeRemoteSyscalls(pid);
   if (process.env.PROOT_BUN_VERBOSE === "1")
     console.error(`[ptrace] remote getpid=${pid}; trampoline mmap=0x${trampoline.toString(16)}`);
   const images = loadGuestImages(pid, trampoline, guest);
@@ -308,6 +345,8 @@ export function traceProcess(pid, rootfs, guest = null) {
   let nextScratchSlot=1n;
   const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null,
     pendingCwd:null, pendingGetcwd:null, cwd:"/", scratch:trampoline+4096n+512n }]]);
+  tasks.get(pid).trampoline=trampoline;
+  tasks.get(pid).borrowPc=images.interpreter?.entry??images.main.entry;
   let rootExit=1;
   while (tasks.size>0) {
     for (const [taskPid,task] of tasks) {
@@ -334,7 +373,9 @@ export function traceProcess(pid, rootfs, guest = null) {
           // At EVENT_CLONE/FORK the new tracee is stopped.  Some kernels also
           // report a separate SIGSTOP and some coalesce it with this event;
           // resume now and consume a later SIGSTOP if one is delivered.
-          scratch:trampoline+(++nextScratchSlot)*4096n+512n, running:false });
+          trampoline:task.trampoline,
+          borrowPc:task.borrowPc,
+          scratch:task.trampoline+(++nextScratchSlot)*4096n+512n, running:false });
         if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] new tracee pid=${child} event=${event}`);
         continue;
       }
@@ -344,8 +385,29 @@ export function traceProcess(pid, rootfs, guest = null) {
       if (signal===19) continue; // consume ptrace/vfork bootstrap SIGSTOP
       task.pendingSignal=BigInt(signal); continue;
     }
-    if (!task.entering) {
+    const phase=syscallPhase(taskPid);
+    const isExit=phase===2 || (phase===0 && !task.entering);
+    if (isExit) {
       task.entering=true;
+      if (task.forcedResult!==undefined) {
+        const exited=getRegisters(taskPid);
+        setX(exited.regs,0,task.forcedResult); putRegisters(taskPid,exited);
+        task.forcedResult=undefined;
+      }
+      if (task.idWrites!==undefined) {
+        for (const address of task.idWrites) if (address!==0n)
+          writeBytes(memory,taskPid,address,new Uint8Array(4));
+        task.idWrites=undefined;
+      }
+      if (task.pendingStat!==undefined) {
+        const exited=getRegisters(taskPid);
+        if (BigInt.asIntN(64,getX(exited.regs,0))===0n) {
+          const { buffer,kind }=task.pendingStat;
+          const uidOffset=kind==="statx"?20n:24n;
+          writeBytes(memory,taskPid,buffer+uidOffset,new Uint8Array(8));
+        }
+        task.pendingStat=undefined;
+      }
       if (task.pendingCwd!==null || task.pendingGetcwd!==null) {
         const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
         if (task.pendingCwd!==null) {
@@ -368,13 +430,59 @@ export function traceProcess(pid, rootfs, guest = null) {
       if (task.pendingExec!==null) {
         const next=task.pendingExec; task.pendingExec=null;
         if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} emulating execve ${next.argv.join(" ")}`);
-        resetExecAddressSpace(taskPid,trampoline);
-        startGuest(taskPid,trampoline,loadGuestImages(taskPid,trampoline,next),next);
+        if (!isMapped(taskPid,task.trampoline)) {
+          task.trampoline=allocateRemoteSyscalls(taskPid,task.borrowPc);
+          task.scratch=task.trampoline+4096n+512n;
+          if (process.env.PROOT_BUN_VERBOSE==="1")
+            console.error(`[ptrace] pid=${taskPid} renewed trampoline=0x${task.trampoline.toString(16)}`);
+        }
+        resetExecAddressSpace(taskPid,task.trampoline);
+        const nextImages=loadGuestImages(taskPid,task.trampoline,next);
+        startGuest(taskPid,task.trampoline,nextImages,next);
+        task.borrowPc=nextImages.interpreter?.entry??nextImages.main.entry;
       }
       continue;
     }
     task.entering=false;
     const state=getRegisters(taskPid), syscall=getSyscallNumber(state.regs);
+    if (syscall===SYS_MUNMAP) {
+      const start=getX(state.regs,0), end=start+getX(state.regs,1);
+      const protectedEnd=task.trampoline+1024n*1024n;
+      if (start<protectedEnd && end>task.trampoline) {
+        // The injected loader is process infrastructure, not guest memory.
+        // Pretend an overlapping munmap succeeded while keeping it available
+        // for later exec replacement and pathname scratch storage.
+        setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+        task.forcedResult=0n;
+        continue;
+      }
+    }
+    if (syscall>=174 && syscall<=177) {
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+      task.forcedResult=0n;
+      continue;
+    }
+    if ([144,145,146,147,149,151,152,159].includes(syscall)) {
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+      task.forcedResult=0n;
+      continue;
+    }
+    if (syscall===148 || syscall===150) { // getresuid/getresgid
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+      task.idWrites=[getX(state.regs,0),getX(state.regs,1),getX(state.regs,2)];
+      task.forcedResult=0n;
+      continue;
+    }
+    if (syscall===158) { // getgroups
+      const size=getX(state.regs,0);
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+      task.idWrites=size>0n?[getX(state.regs,1)]:[];
+      task.forcedResult=1n;
+      continue;
+    }
+    if (syscall===79) task.pendingStat={buffer:getX(state.regs,2),kind:"stat"};
+    if (syscall===80) task.pendingStat={buffer:getX(state.regs,1),kind:"stat"};
+    if (syscall===291) task.pendingStat={buffer:getX(state.regs,4),kind:"statx"};
     if (syscall===SYS_GETCWD) {
       task.pendingGetcwd={ buffer:getX(state.regs,0), size:getX(state.regs,1) };
       continue;
@@ -387,7 +495,10 @@ export function traceProcess(pid, rootfs, guest = null) {
         if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} exec capture failed: ${error.message}`);
         continue;
       }
-      setX(state.regs,8,BigInt.asUintN(64,-1n)); putRegisters(taskPid,state); continue;
+      // Substitute a harmless, universally available syscall. Using -1 as a
+      // cancellation sentinel is not reliable on every Android/musl ptrace
+      // path and can allow the real execve to replace the address space first.
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID); continue;
     }
     if (syscall===220) {
       const flags=getX(state.regs,0), unsafe=0x4100n; // CLONE_VM | CLONE_VFORK

@@ -26,6 +26,9 @@ cd /path/to/prbun
 PATH="$PWD:$PATH" LD_PRELOAD= proot -S ROOTFS COMMAND [ARG ...]
 ```
 
+`ROOTFS` may be relative. It is resolved to an absolute path before the
+bootstrap changes its working directory.
+
 For the Termux `proot-distro` Debian rootfs used during development:
 
 ```sh
@@ -73,6 +76,9 @@ safely load Android bionic as a second libc.
 - `/proc`, `/dev`, and `/sys` use the Android kernel filesystems.
 - The current vertical slice handles fork, vfork, clone, clone3, execve, and
   `#!` interpreter chains.
+- `-S` resolves a relative rootfs before changing cwd and enables the current
+  fake-id0 layer (`uid=0`, `gid=0`, root supplementary group, and root ownership
+  in common stat results).
 - Regenerate missing one-to-one placeholders with:
 
 ```sh

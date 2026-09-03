@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { FFIType, ptr } from "bun:ffi";
 import { cString, openLibrary } from "../ffi.js";
 import { readElfInterpreter } from "../execve/elf.c.js";
@@ -27,7 +28,10 @@ function spawnTracee(argv, env) {
 }
 export function parseArguments(argv) {
   if (argv[0] !== "-S" || !argv[1] || !argv[2]) throw new Error("usage: proot -S ROOTFS COMMAND [ARG ...]");
-  return { rootfs: argv[1].replace(/\/+$/, ""), command: argv.slice(2) };
+  // Resolve this before the bootstrap changes cwd to the rootfs. Otherwise a
+  // caller-relative rootfs is interpreted again from inside that rootfs and
+  // subsequent host-path translations acquire the wrong prefix.
+  return { rootfs: resolve(argv[1]), command: argv.slice(2) };
 }
 export function run(argv) {
   const { rootfs, command } = parseArguments(argv);
