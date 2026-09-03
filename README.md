@@ -131,6 +131,13 @@ PROOT_BUN_PROFILE=1 proot -S "$ROOTFS" /bin/sh -c 'bunx cowsay hello'
 Tests involving FFI must run in native Termux. Bun inside a glibc PRoot cannot
 safely load Android bionic as a second libc.
 
+## Testing
+
+[TESTING.md](./TESTING.md) is the checklist to run before trusting a change to
+the tracer: the unit tests, one integration check per area with what each one
+tells you when it fails, the bare rootfs some of them need, and the pitfalls
+that cost more time than the bugs did.
+
 ## Implementation notes
 
 - The initial Android process is `/system/bin/linker64 /system/bin/sh`, stopped

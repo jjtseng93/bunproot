@@ -39,6 +39,9 @@ required three fixes worth keeping in mind:
   directory this way, so `bun x bunmsh` otherwise looked for its relative
   imports next to the storage object.
 
+What to run to check any of this still holds is in
+[TESTING.md](./TESTING.md).
+
 ## Remaining compatibility work
 
 1. **Pathname syscall coverage.** Cover all ARM64 pathname arguments, including
