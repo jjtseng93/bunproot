@@ -32,6 +32,12 @@ required three fixes worth keeping in mind:
 - `getdents64(2)` has to report an emulated hard link as `DT_REG`. `stat(2)`
   already did, but readers that trust `d_type` — Bun's package installer
   walking its own cache — otherwise skip every emulated file.
+- A descriptor opened through an emulated hard link is reported by the kernel
+  under its `/.proot.l2s/objs/<id>` storage name, so `readlink` on
+  `/proc/<PID>/fd/<FD>` has to give back the name the tracee itself used, as in
+  link2symlink's `READLINK_PROC_FD` callback. Bun resolves an ES module's own
+  directory this way, so `bun x bunmsh` otherwise looked for its relative
+  imports next to the storage object.
 
 ## Remaining compatibility work
 

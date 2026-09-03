@@ -395,6 +395,35 @@ function readTraceeBytes(pid,address,length) {
   return output;
 }
 
+// The kernel reports a descriptor opened through an emulated hard link under
+// the storage name no tracee ever used, so remember the name the tracee did
+// use.  Upstream does the same in link2symlink's READLINK_PROC_FD callback
+// (src/extension/link2symlink/link2symlink.c:readlink_proc_fd).
+const L2S_OBJS="/.proot.l2s/objs/";
+const openedAliases=new Map();
+
+function recallOpenedAlias(rootfs,procFd,objectGuest) {
+  const accept=(alias)=>{
+    if (alias===undefined) return null;
+    // Descriptor numbers are reused and links are removed, so the remembered
+    // name still has to lead to this very object.
+    try { return canonicalizeGuestPath(rootfs,alias)===objectGuest?alias:null; }
+    catch { return null; }
+  };
+  if (procFd!==null) {
+    const exact=accept(openedAliases.get(`${procFd.pid}:${procFd.fd}`));
+    if (exact!==null) return exact;
+  }
+  // Threads share one descriptor table while being tracked as separate tasks,
+  // so the opener is not necessarily the reader. Any remembered name that
+  // still resolves to this object names the same file.
+  for (const alias of openedAliases.values()) {
+    const value=accept(alias);
+    if (value!==null) return value;
+  }
+  return null;
+}
+
 function guestPathOf(rootfs,hostPath) {
   if (hostPath===rootfs) return "/";
   if (hostPath.startsWith(`${rootfs}/`)) return hostPath.slice(rootfs.length);
@@ -410,6 +439,7 @@ function guestPathOf(rootfs,hostPath) {
 // /proc/self/exe (bun x re-running itself as `node`) would otherwise exec a
 // host path that does not exist inside the rootfs.
 const PROC_LINK=/^\/proc\/(self|thread-self|\d+)\/(exe|cwd|root)$/;
+const PROC_FD_LINK=/^\/proc\/(self|thread-self|\d+)\/fd\/(\d+)$/;
 function resolveProcLink(taskPid,tasks,guestPath) {
   if (!guestPath.startsWith("/proc/")) return null;
   const match=PROC_LINK.exec(posix.normalize(guestPath));
@@ -556,7 +586,7 @@ export function traceProcess(pid, rootfs, guest = null) {
         }
       }
       if (task.pendingReadlink!==undefined) {
-        const { buffer,size,value }=task.pendingReadlink;
+        const { buffer,size,value,procFd }=task.pendingReadlink;
         task.pendingReadlink=undefined;
         const exited=getRegisters(taskPid);
         if (value!==null) {
@@ -578,11 +608,14 @@ export function traceProcess(pid, rootfs, guest = null) {
           if (result>0n) {
             const host=new TextDecoder().decode(readTraceeBytes(taskPid,buffer,Number(result)));
             if (host===rootfs || host.startsWith(`${rootfs}/`)) {
-              const encoded=new TextEncoder().encode(guestPathOf(rootfs,host));
+              let guest=guestPathOf(rootfs,host);
+              if (guest.startsWith(L2S_OBJS))
+                guest=recallOpenedAlias(rootfs,procFd,guest)??guest;
+              const encoded=new TextEncoder().encode(guest);
               writeTraceeBytes(taskPid,buffer,encoded,size);
               setX(exited.regs,0,BigInt(encoded.length)); putRegisters(taskPid,exited);
               if (process.env.PROOT_BUN_VERBOSE==="1")
-                console.error(`[ptrace] pid=${taskPid} readlink target ${host} -> ${guestPathOf(rootfs,host)}`);
+                console.error(`[ptrace] pid=${taskPid} readlink target ${host} -> ${guest}`);
             }
           }
         }
@@ -590,6 +623,10 @@ export function traceProcess(pid, rootfs, guest = null) {
       if (task.pendingPathSyscall!==undefined) {
         const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
         let finalResult=result;
+        if (task.pendingOpenAlias!==undefined) {
+          if (result>=0n) openedAliases.set(`${taskPid}:${result}`,task.pendingOpenAlias);
+          task.pendingOpenAlias=undefined;
+        }
         if (task.pendingL2sUnlink && result===0n) {
           try { commitEmulatedUnlink(rootfs,task.pendingL2sUnlink); }
           catch (error) {
@@ -767,6 +804,10 @@ export function traceProcess(pid, rootfs, guest = null) {
       }
       continue;
     }
+    if (syscall===SYS_CLOSE) {
+      openedAliases.delete(`${taskPid}:${Number(BigInt.asIntN(32,getX(state.regs,0)))}`);
+      continue;
+    }
     if (syscall===SYS_GETDENTS64) {
       task.pendingGetdents={ fd:Number(BigInt.asIntN(32,getX(state.regs,0))),
         buffer:getX(state.regs,1), size:getX(state.regs,2) };
@@ -778,7 +819,11 @@ export function traceProcess(pid, rootfs, guest = null) {
       if (address>=4096n) { try { linkPath=readCString(memory,taskPid,address); } catch {} }
       const substitute=linkPath!==null&&linkPath.startsWith("/proc/")
         ?resolveProcLink(taskPid,tasks,linkPath):null;
-      task.pendingReadlink={ buffer:getX(state.regs,2), size:getX(state.regs,3), value:substitute };
+      const descriptor=linkPath===null?null:PROC_FD_LINK.exec(posix.normalize(linkPath));
+      task.pendingReadlink={ buffer:getX(state.regs,2), size:getX(state.regs,3), value:substitute,
+        procFd:descriptor===null?null:
+          { pid:descriptor[1]==="self"||descriptor[1]==="thread-self"?taskPid:Number(descriptor[1]),
+            fd:Number(descriptor[2]) } };
       if (substitute!==null) {
         if (process.env.PROOT_BUN_VERBOSE==="1")
           console.error(`[ptrace] pid=${taskPid} readlink ${linkPath} -> ${substitute}`);
@@ -826,6 +871,8 @@ export function traceProcess(pid, rootfs, guest = null) {
       }
       catch (error) { throw new Error(`pid ${taskPid} syscall ${syscall}: ${error.message}`); }
       if (syscall===SYS_CHDIR && spec.path===0) task.pendingCwd=absoluteGuest;
+      if (syscall===SYS_OPENAT && absoluteGuest.startsWith(L2S_OBJS))
+        task.pendingOpenAlias=canonicalizeGuestPath(rootfs,inputGuest,{preserveInternalFinal:true});
       const host=absoluteGuest==="/"?rootfs:`${rootfs}${absoluteGuest}`;
       hostPaths.push(host);
       guestPaths.push(absoluteGuest);
