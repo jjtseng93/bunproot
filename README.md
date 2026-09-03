@@ -1,17 +1,27 @@
-# PRoot Bun port
+# bunproot
 
-This directory contains the Bun/ESM port of PRoot. Each original
-`src/**/*.c` or `src/**/*.h` has a corresponding `bunsrc/**/*.c.js` or
-`bunsrc/**/*.h.js`. The working implementation currently targets ARM64
-Android and must use the Android-native `bun-android`, not a glibc Bun binary.
+A port of [PRoot](https://github.com/termux/proot) to Bun/JavaScript, under the
+**GPL-2.0-or-later** it inherits as a derivative work. Each original
+`src/**/*.c` or `src/**/*.h` has a corresponding `**/*.c.js` or `**/*.h.js`
+here, and `src/...` in a comment names a file of PRoot's C source rather than
+one of this repository's. [NOTICE.md](./NOTICE.md) records which upstream
+commit those citations are to be read against, and the handful of places where
+the tree they were written against differs from upstream;
+[COPYING](./COPYING) is the licence.
+
+The working implementation targets ARM64 Android.
 
 ## Requirements
 
 - A ptrace-capable Termux environment.
 - Android's 64-bit linker at `/system/bin/linker64`.
 - Android bionic libraries under `/apex/com.android.runtime/lib64/bionic`.
-- The native Bun executable at `../bun-android` relative to this directory.
+- A Bun built for Android/bionic, not a glibc one. The `proot` launcher uses
+  whatever `bun` is on `PATH`, which in Termux is already the right kind; if
+  there is none it falls back to a `bun-android` beside the launcher, which you
+  supply yourself.
 - An ARM64 Linux rootfs containing the guest ELF and its `PT_INTERP`.
+  `tools/download-alpine.mjs` fetches one.
 
 Native library paths are defined once in `dlpath.json`. JavaScript modules open
 those Android libraries through `ffi.js`; guest libraries under `ROOTFS/usr`
@@ -30,7 +40,7 @@ inherits. Other modules import from it rather than reading `process.env`.
 Add this directory to `PATH` so the `proot` launcher invokes the Bun port:
 
 ```sh
-cd /path/to/prbun
+cd /path/to/bunproot
 PATH="$PWD:$PATH" LD_PRELOAD= proot [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]
 ```
 
@@ -73,30 +83,27 @@ installation into a temporary `node_modules`, and re-execution of the guest Bun
 as `node`:
 
 ```sh
-cd bunsrc
-sh proot -S ../../alpine /bin/sh -c "bun x cowsay hello"
+sh proot -S ../alpine /bin/sh -c "bun x cowsay hello"
 ```
 
 Node, npm and a second Bun installed through npm are covered by:
 
 ```sh
-cd bunsrc
-sh proot -S ../../alpine /bin/sh -c "apk add npm && npm i bun@1.3.14"
-sh proot -S ../../alpine /bin/sh -c "./node_modules/.bin/bun --version"
+sh proot -S ../alpine /bin/sh -c "apk add npm && npm i bun@1.3.14"
+sh proot -S ../alpine /bin/sh -c "./node_modules/.bin/bun --version"
 ```
 
 Git over HTTPS is covered by the Alpine integration test:
 
 ```sh
-cd bunsrc
-sh proot -S ../../alpine /usr/bin/git clone \
+sh proot -S ../alpine /usr/bin/git clone \
   https://github.com/jjtseng93/jsmdcui /tmp/jsmdcui
 ```
 
 The launcher effectively runs:
 
 ```sh
-/system/bin/linker64 ../bun-android --no-orphans ./index.js "$@"
+bun --no-orphans ./index.js "$@"
 ```
 
 `--no-orphans` covers Bun-owned subprocesses. The tracer also enables
@@ -179,7 +186,7 @@ that cost more time than the bugs did.
 - Regenerate missing one-to-one placeholders with:
 
 ```sh
-../bun-android run generate-stubs.js
+bun run generate-stubs.js
 ```
 
 This is not yet a drop-in replacement for upstream PRoot. See

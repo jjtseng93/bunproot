@@ -1,9 +1,10 @@
 {
-  "name": "proot-bun",
+  "name": "bunproot",
   "private": true,
+  "license": "GPL-2.0-or-later",
   "type": "module",
   "scripts": {
-    "start": "../../bun-android run index.js",
-    "test": "../../bun-android test"
+    "start": "bun run index.js",
+    "test": "bun test"
   }
 }

@@ -312,7 +312,7 @@ and native-hard-link restoration remain to be implemented.
 Git's native clone path is now an integration regression test:
 
 ```sh
-sh proot -S ../../alpine /usr/bin/git clone \
+sh proot -S ../alpine /usr/bin/git clone \
   https://github.com/jjtseng93/jsmdcui /tmp/jsmdcui
 ```
 

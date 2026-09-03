@@ -5,7 +5,7 @@ native Termux: the port loads Android bionic through FFI, which Bun cannot do
 from inside a glibc PRoot.
 
 `proot` below is this directory's launcher, so run the checks from here as
-`sh proot …`, or put the directory on `PATH` as [README.md](./README.md#usage)
+`sh proot …`, or put the repository on `PATH` as [README.md](./README.md#usage)
 describes. `ROOTFS` is an ARM64 Linux rootfs; the examples use the Alpine one
 the port is developed against. A few checks want a second, deliberately bare
 rootfs — see [A rootfs with nothing but Bun](#a-rootfs-with-nothing-but-bun).
@@ -13,8 +13,7 @@ rootfs — see [A rootfs with nothing but Bun](#a-rootfs-with-nothing-but-bun).
 ## Unit tests
 
 ```sh
-cd bunsrc
-LD_PRELOAD= /system/bin/linker64 "$(realpath ../bun-android)" test
+LD_PRELOAD= bun test
 ```
 
 Covers argument and binding parsing, guest path canonicalization, the

@@ -6,7 +6,7 @@ alias realpath=/system/bin/realpath
 sd=$(dirname "$(realpath "$0")")
 
 if ! [ -f "$(which bun)" ] ; then
-  alias bun='/system/bin/linker64 $(realpath "$sd/../bun-android")'
+  alias bun='/system/bin/linker64 $(realpath "$sd/bun-android")'
 fi
 
 unset LD_PRELOAD
