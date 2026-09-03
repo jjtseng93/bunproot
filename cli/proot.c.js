@@ -1,13 +1,13 @@
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { FFIType, ptr } from "bun:ffi";
 import { cString, openLibrary } from "../ffi.js";
 import { readElfInterpreter } from "../execve/elf.c.js";
-import { expandShebang } from "../execve/shebang.c.js";
+import { expandShebang, makeGuestPaths } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
 import { createBindings } from "../path/binding.c.js";
 import { traceProcess } from "../ptrace/ptrace.c.js";
-import { bootstrapEnvironment } from "../env.js";
+import { bootstrapEnvironment, guestEnvironment } from "../env.js";
 
 const { posix_spawn } = openLibrary("libc", {
   posix_spawn: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
@@ -72,7 +72,9 @@ export function run(argv) {
   // execve; without it `proot -S ROOTFS /usr/bin/script` reads the script as
   // an ELF and reports a truncated one.
   let guestArgv=command;
-  const script=expandShebang(executable,guestExecutable,guestArgv);
+  const guestPaths=makeGuestPaths(mounts,
+    guestEnvironment().find((entry)=>entry.startsWith("PATH="))?.slice(5));
+  const script=expandShebang(executable,guestExecutable,guestArgv,guestPaths);
   if (script!==null) {
     guestExecutable=canonicalizeGuestPath(mounts,script.guestPath,{preserveInternalFinal:true});
     executable=mounts.toHost(canonicalizeGuestPath(mounts,guestExecutable));
@@ -90,5 +92,6 @@ export function run(argv) {
     "kill -19 $$; while :; do :; done", "proot-bun",
   ];
   const pid = spawnTracee(childArgv, bootstrapEnvironment());
-  return traceProcess(pid, mounts, { executable, guestPath: guestExecutable, interpreter, loader, argv: guestArgv });
+  return traceProcess(pid, mounts, { executable, guestPath: guestExecutable,
+    name: basename(command[0]), interpreter, loader, argv: guestArgv });
 }

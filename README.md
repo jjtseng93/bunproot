@@ -160,6 +160,12 @@ safely load Android bionic as a second libc.
   `process.title` against.
 - The initial command goes through the same `#!` expansion as a nested
   `execve`, so a script can be named directly on the command line.
+- `#!/usr/bin/env NAME` is resolved by the tracer against the guest's own
+  `PATH` when the rootfs ships no `env`, so a rootfs holding nothing but Bun
+  and its libraries still runs such a script. A guest that does ship `env`
+  keeps using it.
+- The task name is set the way `execve` sets it, so a guest process is not
+  reported as the Android bootstrap's `linker64`.
 - `-S` resolves a relative rootfs before changing cwd and enables the current
   fake-id0 layer (`uid=0`, `gid=0`, root supplementary group, and root ownership
   in common stat results).

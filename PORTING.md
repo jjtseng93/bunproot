@@ -49,9 +49,9 @@ required three fixes worth keeping in mind:
    and detranslate `getcwd` results.
 3. **Canonicalization and symlinks.** Resolve `.`, `..`, bindings, and symlinks
    component by component without allowing traversal outside the guest root.
-4. **Exec fidelity.** Reset signal dispositions, retire old mappings/stacks,
-   and expose correct comm, auxv, and `/proc/self/exe` state. Guest envp
-   propagation and `FD_CLOEXEC` handling are now implemented.
+4. **Exec fidelity.** Retire old mappings/stacks and expose correct auxv and
+   `/proc/<PID>/cmdline` state. Signal dispositions, comm, `/proc/self/exe`,
+   guest envp propagation and `FD_CLOEXEC` handling are now implemented.
 5. **Shebang.** Parse `#!`, rebuild argv, and route scripts through the guest
    interpreter before ELF loading.
 6. **Process model.** Complete thread groups, clone sharing flags, ptrace exec
@@ -193,6 +193,33 @@ automatic fallback when the filter cannot be installed.
 Installing the filter requires `PR_SET_NO_NEW_PRIVS`, so a guest cannot gain
 privileges through a setuid binary afterwards. Nothing in a `-S` rootfs could
 anyway -- the fake-id0 layer is the only root there is.
+
+## What a mapped-in image cannot inherit from execve
+
+`/proc` is the host kernel's, and the guest image is mapped in by the loader
+rather than execve()d, so everything the kernel derives from an exec describes
+the Android bootstrap instead of the guest. `/proc/<PID>/{exe,cwd,root}` are
+answered from tracer state, as upstream does. Two more are not:
+
+- The task name. `execve(2)` sets it to `kbasename(bprm->filename)` --- the
+  pathname it was handed, before symlinks are followed and before a `#!` line
+  is expanded, since binfmt_script replaces `bprm->interp` rather than
+  `bprm->filename`. The loader now does the same through `prctl(PR_SET_NAME)`
+  on the remote-syscall trampoline, which needs no privilege: `/bin/sh` reports
+  `sh` where it is a symlink to busybox, `/bin/busybox sh` reports `busybox`,
+  and a script reports its own name rather than its interpreter's. Without it
+  every guest process reported `linker64`.
+
+- `/proc/<PID>/cmdline`, which still reports the bootstrap's argv. The kernel
+  generates it from `mm->arg_start`/`arg_end`, and moving those needs
+  `PR_SET_MM`, which needs `CAP_SYS_RESOURCE`; the alternative is to intercept
+  opens of that path and answer from the argv the tracer already holds.
+  Upstream has nothing to port here --- it execve()s for real, so its cmdline
+  is simply correct --- and the practical impact is narrow, because a program
+  reads its arguments from the stack, which `buildGuestStack()` builds
+  correctly. `ps` is not the reason to fix it: `/proc` is the host's, so a
+  guest `ps` lists host processes either way, exactly as under upstream PRoot.
+  `/proc/<PID>/environ` and the rest of the exec-derived files are unexamined.
 
 ## Bindings
 

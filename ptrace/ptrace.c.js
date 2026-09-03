@@ -5,7 +5,7 @@ import { openLibrary } from "../ffi.js";
 import { getPc, getSp, getSyscallNumber, getX, makeIovec, makeRegisterSet, NT_PRSTATUS, setPc, setX } from "../tracee/reg.c.js";
 import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
 import { readElfLoadInfo, relocateElf } from "../execve/elf.c.js";
-import { expandShebang } from "../execve/shebang.c.js";
+import { expandShebang, makeGuestPaths } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
 import { guestEnvironment, noSeccomp, verbose } from "../env.js";
 import { count, report, timed } from "../profile.js";
@@ -91,7 +91,8 @@ const SYS_READLINKAT = 78, SYS_GETDENTS64 = 61;
 const SYS_FCHOWNAT = 54, SYS_FCHOWN = 55;
 const SYS_SIGALTSTACK = 132, SYS_RT_SIGACTION = 134, SYS_PRCTL = 167;
 const PTRACE_EVENT_SECCOMP = 7;
-const PR_SET_NO_NEW_PRIVS = 38, PR_SET_SECCOMP = 22, SECCOMP_MODE_FILTER = 2;
+const PR_SET_NO_NEW_PRIVS = 38, PR_SET_SECCOMP = 22, SECCOMP_MODE_FILTER = 2, PR_SET_NAME = 15;
+const TASK_COMM_LEN = 16;
 const DT_REG = 8, DT_LNK = 10;
 // Keep this in sync with the original src/syscall/enter.c.  Android commonly
 // rejects namespace creation, while the process/thread creation itself is OK.
@@ -245,6 +246,23 @@ function resetGuestSignals(pid,trampoline) {
   remoteCall(pid,trampoline,SYS_SIGALTSTACK,[action,0n]);
 }
 
+// execve(2) names the task after the program it was asked for.  The loader has
+// to do the same, or every guest process reports the Android bootstrap's
+// `linker64` -- in the host's process list, and to the guest reading its own
+// /proc/self/comm.  The name is the basename of the pathname handed to
+// execve, before symlinks are followed and before a `#!` line is expanded
+// (fs/exec.c:begin_new_exec calls set_task_comm with kbasename(bprm->filename),
+// and binfmt_script replaces bprm->interp rather than bprm->filename): `/bin/sh`
+// is `sh` even where it is a symlink to busybox, and a script keeps its own
+// name rather than its interpreter's.  The kernel truncates to TASK_COMM_LEN
+// including the NUL.
+function setGuestName(pid,trampoline,requested) {
+  const name=new TextEncoder().encode(requested).subarray(0,TASK_COMM_LEN-1);
+  const address=trampoline+1024n;
+  writeBytes(memory,pid,address,Uint8Array.from([...name,0]));
+  remoteCall(pid,trampoline,SYS_PRCTL,[BigInt(PR_SET_NAME),address,0n,0n,0n]);
+}
+
 function setKernelRootCwd(pid,trampoline,rootfs) {
   const address=trampoline+512n;
   writeCString(memory,pid,address,rootfs);
@@ -317,6 +335,7 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
   let argv=readPointerArray(pid,getX(state.regs,1));
   const env=readPointerArray(pid,getX(state.regs,2));
   const input=pathname.startsWith("/")?posix.normalize(pathname):posix.resolve(task.cwd,pathname);
+  const name=posix.basename(input);
   // Two names for one file: the guest-visible pathname, which goes into argv
   // and /proc/<PID>/exe, and the host pathname the loader actually reads.  They
   // differ for an emulated hard link, and an interpreter that resolves its
@@ -324,7 +343,10 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
   let guestPath=canonicalizeGuestPath(mounts,resolveProcLink(pid,tasks,input)??input,
     {preserveInternalFinal:true});
   let executable=mounts.toHost(canonicalizeGuestPath(mounts,guestPath));
-  const script=expandShebang(executable,guestPath,argv);
+  // The PATH a `#!/usr/bin/env NAME` search has to use is the guest's own, and
+  // for a nested exec that is whatever envp the tracee is passing along.
+  const searchPath=env.find((entry)=>entry.startsWith("PATH="))?.slice(5);
+  const script=expandShebang(executable,guestPath,argv,makeGuestPaths(mounts,searchPath,task.cwd));
   if (script!==null) {
     guestPath=canonicalizeGuestPath(mounts,script.guestPath,{preserveInternalFinal:true});
     executable=mounts.toHost(canonicalizeGuestPath(mounts,guestPath));
@@ -340,7 +362,7 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
   // glibc and the musl build of a package and tries one of them.
   if (loader!==null && !existsSync(loader))
     throw Object.assign(new Error(`ELF interpreter not found: ${interpreter}`),{code:"ENOENT"});
-  return { executable, guestPath, interpreter, loader, argv:argv.length?argv:[pathname], env };
+  return { executable, guestPath, name, interpreter, loader, argv:argv.length?argv:[pathname], env };
 }
 
 function buildGuestStack(pid, trampoline, images, guest) {
@@ -588,6 +610,7 @@ export function traceProcess(pid, mounts, guest = null) {
   if (verbose)
     console.error(`[ptrace] mapped guest entry=0x${images.main.entry.toString(16)} interpreter entry=${images.interpreter ? `0x${images.interpreter.entry.toString(16)}` : "static"}`);
   resetGuestSignals(pid,trampoline);
+  if (guest!==null) setGuestName(pid,trampoline,guest.name??posix.basename(guest.executable));
   setKernelRootCwd(pid,trampoline,mounts.rootfs);
   const filtering=installSyscallFilter(pid,trampoline);
   // Without a filter every syscall has to be stopped to find the few that
@@ -839,6 +862,7 @@ const exited=registers(), result=syscallInfoResult();
         resetExecAddressSpace(taskPid,task.trampoline);
         const nextImages=loadGuestImages(taskPid,task.trampoline,next);
         startGuest(taskPid,task.trampoline,nextImages,next);
+        setGuestName(taskPid,task.trampoline,next.name);
         task.borrowPc=nextImages.interpreter?.entry??nextImages.main.entry;
         task.exe=next.guestPath??guestPathOf(mounts,next.executable);
       }
