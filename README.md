@@ -44,6 +44,15 @@ PATH="$PWD:$PATH" LD_PRELOAD= proot -S "$ROOTFS" \
   /usr/bin/bun x --no-install cowsay hello
 ```
 
+The same command without `--no-install` additionally covers package resolution,
+installation into a temporary `node_modules`, and re-execution of the guest Bun
+as `node`:
+
+```sh
+cd bunsrc
+sh proot -S ../../alpine /bin/sh -c "bun x cowsay hello"
+```
+
 Git over HTTPS is covered by the Alpine integration test:
 
 ```sh
@@ -92,6 +101,9 @@ safely load Android bionic as a second libc.
   Alpine `apk update` to install downloaded repository indexes. Ordinary
   failed hard links use the relocatable `refs/objs/mets` emulation described
   in [link2symlink.md](./link2symlink.md).
+- `/proc/<PID>/{exe,cwd,root}` is answered from tracer state rather than from
+  the kernel, which still describes the Android bootstrap process because the
+  guest image is mapped in instead of `execve`d.
 - `-S` resolves a relative rootfs before changing cwd and enables the current
   fake-id0 layer (`uid=0`, `gid=0`, root supplementary group, and root ownership
   in common stat results).

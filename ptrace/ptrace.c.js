@@ -7,7 +7,7 @@ import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
 import { readElfLoadInfo, relocateElf } from "../execve/elf.c.js";
 import { expandShebang } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
-import { commitEmulatedDirectoryRename, commitEmulatedRename, commitEmulatedUnlink, emulateHardLink, hasEmulatedDirectory, inspectEmulatedAlias, inspectEmulatedObject } from "../extension/link2symlink/link2symlink.c.js";
+import { commitEmulatedDirectoryRename, commitEmulatedRename, commitEmulatedUnlink, emulateHardLink, hasEmulatedDirectory, inspectEmulatedAlias, inspectEmulatedObject, isEmulatedAlias } from "../extension/link2symlink/link2symlink.c.js";
 
 const PTRACE_PEEKTEXT=1, PTRACE_PEEKDATA=2, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5;
 const PTRACE_CONT=7, PTRACE_ATTACH=16, PTRACE_SYSCALL=24;
@@ -74,6 +74,8 @@ function setKernelSyscallNumber(pid,state,number) {
 const ARM64_SYSCALL_TRAMPOLINE = 0xd4200000d4000001n; // svc #0; brk #0
 const SYS_GETPID = 172, SYS_MMAP = 222;
 const SYS_GETCWD = 17, SYS_CHDIR = 49, SYS_OPENAT = 56, SYS_CLOSE = 57, SYS_MUNMAP=215;
+const SYS_READLINKAT = 78, SYS_GETDENTS64 = 61;
+const DT_REG = 8, DT_LNK = 10;
 // Keep this in sync with the original src/syscall/enter.c.  Android commonly
 // rejects namespace creation, while the process/thread creation itself is OK.
 const CLONE_NS_MASK=0x7e020080n;
@@ -241,22 +243,28 @@ function readPointerArray(pid,address,limit=4096) {
   throw new Error("unterminated tracee pointer array");
 }
 
-function prepareExecGuest(pid,rootfs,task,state) {
+function prepareExecGuest(pid,rootfs,task,state,tasks) {
   const pathname=readCString(memory,pid,getX(state.regs,0));
   let argv=readPointerArray(pid,getX(state.regs,1));
   const env=readPointerArray(pid,getX(state.regs,2));
-  let guestPath=pathname.startsWith("/")?posix.normalize(pathname):posix.resolve(task.cwd,pathname);
-  guestPath=canonicalizeGuestPath(rootfs,guestPath);
-  const script=expandShebang(rootfs,guestPath,argv);
+  const input=pathname.startsWith("/")?posix.normalize(pathname):posix.resolve(task.cwd,pathname);
+  // Two names for one file: the guest-visible pathname, which goes into argv
+  // and /proc/<PID>/exe, and the host pathname the loader actually reads.  They
+  // differ for an emulated hard link, and an interpreter that resolves its
+  // imports next to argv[1] must never be handed /.proot.l2s/objs/<id>.
+  let guestPath=canonicalizeGuestPath(rootfs,resolveProcLink(pid,tasks,input)??input,
+    {preserveInternalFinal:true});
+  let executable=`${rootfs}${canonicalizeGuestPath(rootfs,guestPath)}`;
+  const script=expandShebang(executable,guestPath,argv);
   if (script!==null) {
-    guestPath=canonicalizeGuestPath(rootfs,script.guestPath);
+    guestPath=canonicalizeGuestPath(rootfs,script.guestPath,{preserveInternalFinal:true});
+    executable=`${rootfs}${canonicalizeGuestPath(rootfs,guestPath)}`;
     argv=script.argv;
   }
-  const executable=`${rootfs}${guestPath}`;
   const info=readElfLoadInfo(executable);
   const interpreter=info.interpreter;
   const loader=interpreter===null?null:`${rootfs}${interpreter}`;
-  return { rootfs, executable, interpreter, loader, argv:argv.length?argv:[pathname], env };
+  return { rootfs, executable, guestPath, interpreter, loader, argv:argv.length?argv:[pathname], env };
 }
 
 function buildGuestStack(pid, trampoline, images, guest) {
@@ -311,6 +319,12 @@ function startGuest(pid, trampoline, images, guest) {
   return sp;
 }
 
+// arm64 overrides the asm-generic open(2) flags (arch/arm64/include/uapi/asm/
+// fcntl.h): O_NOFOLLOW is 0100000 here, not 0400000.  0x20000 is O_LARGEFILE on
+// this architecture, and musl sets it on every open, so reading it as
+// O_NOFOLLOW suppressed final-symlink dereferencing for every guest open.
+const O_NOFOLLOW = 0x8000n;
+
 // Linux arm64 syscall -> pathname registers. Symlink targets are intentionally
 // not translated; only the directory entry being created is a host pathname.
 const PATH_ARGUMENTS = new Map([
@@ -319,7 +333,7 @@ const PATH_ARGUMENTS = new Map([
   [38,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]], [43,[{path:0}]], [45,[{path:0}]],
   [48,[{path:1,dirfd:0}]], [49,[{path:0}]], [51,[{path:0}]],
   [53,[{path:1,dirfd:0}]], [54,[{path:1,dirfd:0}]],
-  [56,[{path:1,dirfd:0,nofollow:{arg:2,mask:0x20000n}}]],
+  [56,[{path:1,dirfd:0,nofollow:{arg:2,mask:O_NOFOLLOW}}]],
   [78,[{path:1,dirfd:0,deref:false}]],
   [79,[{path:1,dirfd:0,nofollow:{arg:3,mask:0x100n}}]], [88,[{path:1,dirfd:0}]],
   [89,[{path:0}]], [276,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]],
@@ -353,6 +367,61 @@ function isKernelFilesystem(path) {
   return ["/proc","/dev","/sys"].some((prefix)=>path===prefix||path.startsWith(`${prefix}/`));
 }
 
+// writeBytes() stores whole 8-byte words. A readlink(2) result lands in a
+// caller-sized buffer, so the trailing partial word has to keep whatever the
+// tracee already had there instead of being zero-filled past the limit.
+function writeTraceeBytes(pid,address,bytes,capacity) {
+  const aligned=bytes.length&~7;
+  if (aligned>0) writeBytes(memory,pid,address,bytes.subarray(0,aligned));
+  if (bytes.length===aligned) return;
+  const base=address+BigInt(aligned), merged=new Uint8Array(8);
+  if (BigInt(aligned+8)>capacity) {
+    const existing=BigInt.asUintN(64,memory.peek(pid,base));
+    for (let index=0; index<8; index++) merged[index]=Number((existing>>BigInt(index*8))&0xffn);
+  }
+  merged.set(bytes.subarray(aligned),0);
+  writeBytes(memory,pid,base,merged);
+}
+
+function readTraceeBytes(pid,address,length) {
+  const direct=memory.read(pid,address,length);
+  if (direct!==null && direct.length===length) return direct;
+  const output=new Uint8Array(length);
+  for (let offset=0; offset<length; offset+=8) {
+    const word=BigInt.asUintN(64,memory.peek(pid,address+BigInt(offset)));
+    for (let byte=0; byte<8 && offset+byte<length; byte++)
+      output[offset+byte]=Number((word>>BigInt(byte*8))&0xffn);
+  }
+  return output;
+}
+
+function guestPathOf(rootfs,hostPath) {
+  if (hostPath===rootfs) return "/";
+  if (hostPath.startsWith(`${rootfs}/`)) return hostPath.slice(rootfs.length);
+  return hostPath;
+}
+
+// Upstream substitutes "/proc/<PID>/{exe,cwd,root}" with tracee->exe,
+// tracee->fs->cwd and get_root() (path/proc.c:readlink_proc). Here the
+// substitution is mandatory rather than cosmetic: the guest image is mapped in
+// by the loader instead of being execve()d, so the kernel still reports the
+// Android bootstrap binary -- /apex/com.android.runtime/bin/linker64 -- as the
+// process executable. Anything that re-executes itself through
+// /proc/self/exe (bun x re-running itself as `node`) would otherwise exec a
+// host path that does not exist inside the rootfs.
+const PROC_LINK=/^\/proc\/(self|thread-self|\d+)\/(exe|cwd|root)$/;
+function resolveProcLink(taskPid,tasks,guestPath) {
+  if (!guestPath.startsWith("/proc/")) return null;
+  const match=PROC_LINK.exec(posix.normalize(guestPath));
+  if (match===null) return null;
+  const owner=match[1]==="self"||match[1]==="thread-self"?taskPid:Number(match[1]);
+  const known=tasks.get(owner);
+  if (known===undefined) return null;
+  if (match[2]==="root") return "/";
+  if (match[2]==="cwd") return known.cwd;
+  return known.exe??null;
+}
+
 export function traceProcess(pid, rootfs, guest = null) {
   const initial = wait(pid, 2); // WUNTRACED: observe the pre-exec SIGSTOP.
   if ((initial & 0xff) !== 0x7f) throw new Error("tracee did not stop before exec");
@@ -374,7 +443,8 @@ export function traceProcess(pid, rootfs, guest = null) {
   if (process.env.PROOT_BUN_VERBOSE === "1") console.error(`[ptrace] guest sp=0x${guestSp.toString(16)}`);
   let nextScratchSlot=1n;
   const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null,
-    pendingCwd:null, pendingGetcwd:null, cwd:"/", scratch:trampoline+4096n+512n }]]);
+    pendingCwd:null, pendingGetcwd:null, cwd:"/", scratch:trampoline+4096n+512n,
+    exe:guest===null?null:guest.guestPath??guestPathOf(rootfs,guest.executable) }]]);
   tasks.get(pid).trampoline=trampoline;
   tasks.get(pid).borrowPc=images.interpreter?.entry??images.main.entry;
   let rootExit=1;
@@ -407,7 +477,7 @@ export function traceProcess(pid, rootfs, guest = null) {
       if (signal===5 && event>=1 && event<=3) {
         const child=eventMessage(taskPid);
         tasks.set(child,{ entering:true, pendingSignal:0n, pendingExec:null,
-          pendingCwd:null, pendingGetcwd:null, cwd:task.cwd,
+          pendingCwd:null, pendingGetcwd:null, cwd:task.cwd, exe:task.exe,
           // At EVENT_CLONE/FORK the new tracee is stopped.  Some kernels also
           // report a separate SIGSTOP and some coalesce it with this event;
           // resume now and consume a later SIGSTOP if one is delivered.
@@ -455,6 +525,67 @@ export function traceProcess(pid, rootfs, guest = null) {
           }
         }
         task.pendingStat=undefined;
+      }
+      if (task.pendingGetdents!==undefined) {
+        // stat(2) already reports an emulated hard link as the regular file it
+        // stands for, but getdents64(2) hands out the raw directory entry, so
+        // the symlink leaks as DT_LNK. Readers that trust d_type instead of
+        // stat()ing -- bun's package installer walking its own cache -- then
+        // skip every emulated file.
+        const { fd,buffer,size }=task.pendingGetdents;
+        task.pendingGetdents=undefined;
+        const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
+        let directory=null;
+        if (result>0n) { try { directory=readlinkSync(`/proc/${taskPid}/fd/${fd}`); } catch {} }
+        if (directory!==null && (directory===rootfs || directory.startsWith(`${rootfs}/`))) {
+          const bytes=readTraceeBytes(taskPid,buffer,Number(result));
+          const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+          let rewritten=false;
+          for (let offset=0; offset+19<=bytes.length; ) {
+            const reclen=view.getUint16(offset+16,true); // struct linux_dirent64.d_reclen
+            if (reclen<19 || offset+reclen>bytes.length) break;
+            if (bytes[offset+18]===DT_LNK) {
+              let end=offset+19;
+              while (end<offset+reclen && bytes[end]!==0) end++;
+              const name=new TextDecoder().decode(bytes.subarray(offset+19,end));
+              if (isEmulatedAlias(rootfs,`${directory}/${name}`)) { bytes[offset+18]=DT_REG; rewritten=true; }
+            }
+            offset+=reclen;
+          }
+          if (rewritten) writeTraceeBytes(taskPid,buffer,bytes,size);
+        }
+      }
+      if (task.pendingReadlink!==undefined) {
+        const { buffer,size,value }=task.pendingReadlink;
+        task.pendingReadlink=undefined;
+        const exited=getRegisters(taskPid);
+        if (value!==null) {
+          // The substituted syscall never ran, so produce readlinkat(2)'s own
+          // result: the target is copied without a terminating NUL and the
+          // return value is the number of bytes that fit.
+          const encoded=new TextEncoder().encode(value);
+          if (size===0n) setX(exited.regs,0,BigInt.asUintN(64,-22n)); // EINVAL
+          else {
+            const length=Math.min(encoded.length,Number(size));
+            writeTraceeBytes(taskPid,buffer,encoded.subarray(0,length),size);
+            setX(exited.regs,0,BigInt(length));
+          }
+          putRegisters(taskPid,exited);
+        } else {
+          // Detranslate a host target the kernel reported, e.g. through
+          // /proc/<PID>/fd/<FD>, back into the guest namespace.
+          const result=BigInt.asIntN(64,getX(exited.regs,0));
+          if (result>0n) {
+            const host=new TextDecoder().decode(readTraceeBytes(taskPid,buffer,Number(result)));
+            if (host===rootfs || host.startsWith(`${rootfs}/`)) {
+              const encoded=new TextEncoder().encode(guestPathOf(rootfs,host));
+              writeTraceeBytes(taskPid,buffer,encoded,size);
+              setX(exited.regs,0,BigInt(encoded.length)); putRegisters(taskPid,exited);
+              if (process.env.PROOT_BUN_VERBOSE==="1")
+                console.error(`[ptrace] pid=${taskPid} readlink target ${host} -> ${guestPathOf(rootfs,host)}`);
+            }
+          }
+        }
       }
       if (task.pendingPathSyscall!==undefined) {
         const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
@@ -541,6 +672,7 @@ export function traceProcess(pid, rootfs, guest = null) {
         const nextImages=loadGuestImages(taskPid,task.trampoline,next);
         startGuest(taskPid,task.trampoline,nextImages,next);
         task.borrowPc=nextImages.interpreter?.entry??nextImages.main.entry;
+        task.exe=next.guestPath??guestPathOf(rootfs,next.executable);
       }
       continue;
     }
@@ -597,7 +729,7 @@ export function traceProcess(pid, rootfs, guest = null) {
     if (syscall===221) {
       if (process.env.PROOT_BUN_VERBOSE==="1")
         console.error(`[ptrace] pid=${taskPid} execve path=0x${getX(state.regs,0).toString(16)} argv=0x${getX(state.regs,1).toString(16)}`);
-      try { task.pendingExec=prepareExecGuest(taskPid,rootfs,task,state); }
+      try { task.pendingExec=prepareExecGuest(taskPid,rootfs,task,state,tasks); }
       catch (error) {
         if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} exec capture failed phase=${phase}: ${error.message}`);
         continue;
@@ -635,6 +767,25 @@ export function traceProcess(pid, rootfs, guest = null) {
       }
       continue;
     }
+    if (syscall===SYS_GETDENTS64) {
+      task.pendingGetdents={ fd:Number(BigInt.asIntN(32,getX(state.regs,0))),
+        buffer:getX(state.regs,1), size:getX(state.regs,2) };
+      continue;
+    }
+    if (syscall===SYS_READLINKAT) {
+      let linkPath=null;
+      const address=getX(state.regs,1);
+      if (address>=4096n) { try { linkPath=readCString(memory,taskPid,address); } catch {} }
+      const substitute=linkPath!==null&&linkPath.startsWith("/proc/")
+        ?resolveProcLink(taskPid,tasks,linkPath):null;
+      task.pendingReadlink={ buffer:getX(state.regs,2), size:getX(state.regs,3), value:substitute };
+      if (substitute!==null) {
+        if (process.env.PROOT_BUN_VERBOSE==="1")
+          console.error(`[ptrace] pid=${taskPid} readlink ${linkPath} -> ${substitute}`);
+        setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+        continue;
+      }
+    }
     const arguments_=PATH_ARGUMENTS.get(syscall);
     if (arguments_===undefined) continue;
     task.pendingPathSyscall=syscall;
@@ -650,6 +801,19 @@ export function traceProcess(pid, rootfs, guest = null) {
       let guestPath;
       try { guestPath=readCString(memory,taskPid,address); }
       catch (error) { if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] skipped pid=${taskPid} syscall=${syscall}: ${error.message}`); continue; }
+      // "/proc/<PID>/{exe,cwd,root}" names a guest object, so open(2), stat(2)
+      // and execve(2) have to reach it through the rootfs rather than through
+      // the kernel's view of the Android bootstrap process.
+      const procLink=guestPath.startsWith("/proc/")?resolveProcLink(taskPid,tasks,guestPath):null;
+      if (procLink!==null) {
+        const host=procLink==="/"?rootfs:`${rootfs}${procLink}`;
+        hostPaths.push(host); guestPaths.push(procLink);
+        if (process.env.PROOT_BUN_VERBOSE==="1")
+          console.error(`[ptrace] pid=${taskPid} ${guestPath} (${procLink}) -> ${host}`);
+        writeCString(memory,taskPid,scratch,host); setX(state.regs,spec.path,scratch);
+        scratch+=BigInt((new TextEncoder().encode(host).length+8)&~7); changed=true;
+        continue;
+      }
       if (isKernelFilesystem(guestPath)||guestPath.startsWith(`${rootfs}/`)) {
         if (syscall===37)
           hostPaths.push(guestPath.replace(/^\/proc\/self(?=\/|$)/,`/proc/${taskPid}`));

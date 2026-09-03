@@ -87,6 +87,13 @@ export function emulateHardLink(rootfs,sourceHost,targetHost,sourceGuest,targetG
   return true;
 }
 
+// Cheaper than inspectEmulatedAlias(): callers that only need to know whether a
+// name is an emulated hard link should not pay for the mets lookup, and must
+// not inherit its throw on an inconsistent count.
+export function isEmulatedAlias(rootfs,aliasHost) {
+  return inspectAlias(rootfs,aliasHost)!==null;
+}
+
 export function inspectEmulatedAlias(rootfs,aliasHost) {
   const value=inspectAlias(rootfs,aliasHost);
   return value===null?null:{...value,nlink:readCount(rootfs,value.id)};

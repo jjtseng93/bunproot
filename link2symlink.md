@@ -150,7 +150,10 @@ claim that hard-link identity was restored.
 The tracer must hide this representation from the guest. At minimum it must
 coordinate pathname canonicalization with `link`, `linkat`, `unlink`,
 `unlinkat`, `rename`, `renameat`, and `renameat2`; emulate inode and link-count
-results for `stat`, `lstat`, `fstat`, `newfstatat`, and `statx`; and repair the
+results for `stat`, `lstat`, `fstat`, `newfstatat`, and `statx`; report `DT_REG`
+rather than `DT_LNK` for an alias in `getdents64`, since readers that trust
+`d_type` never reach the emulated `stat`; keep the storage pathname out of
+guest-visible names such as `execve` argv and `/proc/PID/exe`; and repair the
 names exposed through `/proc/PID/fd/N`. A guest `readlink` on an emulated hard
 link must behave like `readlink` on an ordinary file rather than expose the
 internal symlink chain.

@@ -25,7 +25,9 @@ export function canonicalizeGuestPath(rootfs,path,{derefFinal=true,preserveInter
     // the caller's no-follow semantics.
     const internalLink=target.startsWith("/.proot.l2s/refs/") ||
       target.startsWith("/.proot.l2s/objs/");
-    if (isFinal&&!derefFinal&&(!internalLink||preserveInternalFinal)) { resolved.push(component); continue; }
+    // A caller that must report a guest-visible name (execve argv, /proc) asks
+    // to stop at the storage symlink even while ordinary symlinks are followed.
+    if (isFinal&&(internalLink?preserveInternalFinal:!derefFinal)) { resolved.push(component); continue; }
     if (++followed>maxSymlinks) throw Object.assign(new Error(`too many symbolic links: ${path}`),{code:"ELOOP"});
     const targetPath=target.startsWith("/")?target:posix.resolve(`/${resolved.join("/")}`,target);
     pending=[...posix.normalize(targetPath).split("/").filter(Boolean),...pending];

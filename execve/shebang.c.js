@@ -9,8 +9,8 @@ export function readShebang(filename) {
   return { interpreter:match[1], argument:match[2]||null };
 }
 
-export function expandShebang(rootfs,guestPath,argv) {
-  const shebang=readShebang(`${rootfs}${guestPath}`);
+export function expandShebang(hostPath,guestPath,argv) {
+  const shebang=readShebang(hostPath);
   if (shebang===null) return null;
   return {
     guestPath:shebang.interpreter,

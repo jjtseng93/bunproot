@@ -12,8 +12,26 @@ bootstrap, ptrace-controlled remote ELF loading, and guest `execve` emulation.
 The nested shebang/exec path is also exercised successfully by:
 
 ```sh
-LD_PRELOAD= proot -S ROOTFS /usr/bin/bun x --no-install cowsay hello
+LD_PRELOAD= proot -S ROOTFS /usr/bin/bun x cowsay hello
 ```
+
+That command resolves a package from the network, installs it into a temporary
+`node_modules`, and re-executes the guest Bun as `node` through a `#!` script,
+so it exercises the pathname, link2symlink, `/proc` and exec paths at once. It
+required three fixes worth keeping in mind:
+
+- ARM64 overrides the asm-generic `open(2)` flags: `O_NOFOLLOW` is `0100000`,
+  and `0400000` — the asm-generic `O_NOFOLLOW` — is `O_LARGEFILE`, which musl
+  sets on every `open`. Reading the wrong bit suppressed final-component
+  symlink resolution for every guest open.
+- `/proc/<PID>/{exe,cwd,root}` must be substituted from tracer state as in
+  `src/path/proc.c:readlink_proc()`. Upstream needs this only for fidelity,
+  because it execve()s the guest for real. Here the guest ELF is mapped in by
+  the loader, so the kernel still reports the Android bootstrap binary and
+  anything re-executing `/proc/self/exe` would leave the rootfs.
+- `getdents64(2)` has to report an emulated hard link as `DT_REG`. `stat(2)`
+  already did, but readers that trust `d_type` — Bun's package installer
+  walking its own cache — otherwise skip every emulated file.
 
 ## Remaining compatibility work
 
