@@ -25,9 +25,9 @@ LD_PRELOAD= proot -S ROOTFS /usr/bin/bun x --no-install cowsay hello
    and detranslate `getcwd` results.
 3. **Canonicalization and symlinks.** Resolve `.`, `..`, bindings, and symlinks
    component by component without allowing traversal outside the guest root.
-4. **Exec fidelity.** Read the guest envp, implement `FD_CLOEXEC`, reset signal
-   dispositions, retire old mappings/stacks, and expose correct comm, auxv, and
-   `/proc/self/exe` state.
+4. **Exec fidelity.** Reset signal dispositions, retire old mappings/stacks,
+   and expose correct comm, auxv, and `/proc/self/exe` state. Guest envp
+   propagation and `FD_CLOEXEC` handling are now implemented.
 5. **Shebang.** Parse `#!`, rebuild argv, and route scripts through the guest
    interpreter before ELF loading.
 6. **Process model.** Complete thread groups, clone sharing flags, ptrace exec
@@ -110,3 +110,29 @@ app-data `linkat` with `EACCES`. The current compatibility fallback creates an
 exclusive copy, including apk's `/proc/self/fd/N` source form; this is enough
 for `apk update`, but general hard-link identity still requires the original
 `link2symlink` emulation tracked under item 8. `execveat` remains open.
+
+Git's native clone path is now an integration regression test:
+
+```sh
+sh proot -S ../../alpine /usr/bin/git clone \
+  https://github.com/jjtseng93/jsmdcui /tmp/jsmdcui
+```
+
+The clone completes through HTTPS, object unpacking, and delta resolution. The
+supporting fixes deliberately follow the original implementation where one
+exists:
+
+- `src/tracee/mem.c` prefers `process_vm_readv` for tracee memory and falls
+  back to `PTRACE_PEEKDATA`; the Bun port now does the same when reading exec
+  pathnames and argument/environment vectors.
+- `src/tracee/event.c` treats a failed `restart_tracee()` as a tracee lifecycle
+  race instead of aborting the whole tracer. The Bun loop now drops a task that
+  disappears between `waitpid` and `PTRACE_SYSCALL`.
+- `src/tracee/tracee.c` derives child sharing from clone flags. The Bun port
+  also removes `CLONE_VM | CLONE_VFORK` when its JavaScript-controlled exec
+  replacement needs a private child address space.
+- A real kernel `execve` closes descriptors marked `FD_CLOEXEC`. Because the
+  Bun loader replaces exec in userspace, it reproduces that kernel behavior by
+  inspecting `/proc/PID/fdinfo` and closing those descriptors before loading
+  the next guest image. This prevents Git helpers from retaining pipe ends and
+  deadlocking.

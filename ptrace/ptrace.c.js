@@ -1,5 +1,5 @@
 import { FFIType, ptr } from "bun:ffi";
-import { constants as fsConstants, copyFileSync, readFileSync, readlinkSync } from "node:fs";
+import { constants as fsConstants, copyFileSync, readFileSync, readdirSync, readlinkSync } from "node:fs";
 import { posix } from "node:path";
 import { openLibrary } from "../ffi.js";
 import { getPc, getSp, getSyscallNumber, getX, makeIovec, makeRegisterSet, NT_PRSTATUS, setPc, setX } from "../tracee/reg.c.js";
@@ -15,11 +15,20 @@ const PTRACE_GET_SYSCALL_INFO=0x420e;
 const native = openLibrary("libc", {
   ptrace: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.u64], returns: FFIType.i64 },
   waitpid: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+  process_vm_readv: { args: [FFIType.i32,FFIType.ptr,FFIType.u64,FFIType.ptr,FFIType.u64,FFIType.u64], returns:FFIType.i64 },
 }).symbols;
 const call = (request, pid, address=0n, data=0n) => native.ptrace(request, pid, address, data);
 const memory = {
   peek: (pid, address) => call(PTRACE_PEEKDATA, pid, address),
   poke(pid, address, word) { if (call(PTRACE_POKEDATA, pid, address, word) === -1n) throw new Error("PTRACE_POKEDATA failed"); },
+  read(pid,address,length) {
+    const output=new Uint8Array(length), local=new Uint8Array(16), remote=new Uint8Array(16);
+    const localView=new DataView(local.buffer), remoteView=new DataView(remote.buffer);
+    localView.setBigUint64(0,BigInt(ptr(output)),true); localView.setBigUint64(8,BigInt(length),true);
+    remoteView.setBigUint64(0,address,true); remoteView.setBigUint64(8,BigInt(length),true);
+    const count=native.process_vm_readv(pid,ptr(local),1n,ptr(remote),1n,0n);
+    return count>0n?output.subarray(0,Number(count)):null;
+  },
 };
 function wait(pid, options = 0) {
   return waitResult(pid,options).status;
@@ -144,6 +153,22 @@ function isMapped(pid,address) {
   });
 }
 
+function closeExecDescriptors(pid,trampoline) {
+  let entries;
+  try { entries=readdirSync(`/proc/${pid}/fdinfo`); }
+  catch { return; }
+  for (const entry of entries) {
+    const fd=Number(entry);
+    if (!Number.isInteger(fd) || fd<0) continue;
+    let text;
+    try { text=readFileSync(`/proc/${pid}/fdinfo/${fd}`,"utf8"); }
+    catch { continue; }
+    const match=/^flags:\s*([0-7]+)/m.exec(text);
+    if (!match || (Number.parseInt(match[1],8)&0x80000)===0) continue;
+    remoteCall(pid,trampoline,SYS_CLOSE,[BigInt(fd)]);
+  }
+}
+
 function remoteCall(pid, trampoline, syscall, args=[]) {
   return remoteSyscallAt(pid, trampoline, syscall, args);
 }
@@ -218,6 +243,7 @@ function readPointerArray(pid,address,limit=4096) {
 function prepareExecGuest(pid,rootfs,task,state) {
   const pathname=readCString(memory,pid,getX(state.regs,0));
   let argv=readPointerArray(pid,getX(state.regs,1));
+  const env=readPointerArray(pid,getX(state.regs,2));
   let guestPath=pathname.startsWith("/")?posix.normalize(pathname):posix.resolve(task.cwd,pathname);
   guestPath=canonicalizeGuestPath(rootfs,guestPath);
   const script=expandShebang(rootfs,guestPath,argv);
@@ -229,7 +255,7 @@ function prepareExecGuest(pid,rootfs,task,state) {
   const info=readElfLoadInfo(executable);
   const interpreter=info.interpreter;
   const loader=interpreter===null?null:`${rootfs}${interpreter}`;
-  return { rootfs, executable, interpreter, loader, argv:argv.length?argv:[pathname] };
+  return { rootfs, executable, interpreter, loader, argv:argv.length?argv:[pathname], env };
 }
 
 function buildGuestStack(pid, trampoline, images, guest) {
@@ -252,7 +278,7 @@ function buildGuestStack(pid, trampoline, images, guest) {
     TMPDIR:"/tmp", PATH:"/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"};
   for (const name of ["LD_PRELOAD","LD_LIBRARY_PATH","PREFIX","TMPPREFIX",
     "BUN_INSTALL","NPM_CONFIG_PREFIX","OLDPWD"]) delete guestEnvironment[name];
-  const envStrings=Object.entries(guestEnvironment).map(([key,value])=>`${key}=${value}`);
+  const envStrings=guest.env??Object.entries(guestEnvironment).map(([key,value])=>`${key}=${value}`);
   const envPointers=envStrings.map(putString);
   const argvPointers=guest.argv.map(putString);
   const execfn=argvPointers[0];
@@ -351,7 +377,15 @@ export function traceProcess(pid, rootfs, guest = null) {
   while (tasks.size>0) {
     for (const [taskPid,task] of tasks) {
       if (!task.running) {
-        if (call(PTRACE_SYSCALL,taskPid,0n,task.pendingSignal)<0n) throw new Error(`PTRACE_SYSCALL failed for ${taskPid}`);
+        if (call(PTRACE_SYSCALL,taskPid,0n,task.pendingSignal)<0n) {
+          // Match upstream restart_tracee(): a task can die after its last
+          // wait status but before the tracer restarts it. This is a normal
+          // lifecycle race, especially for Git's short-lived helpers.
+          tasks.delete(taskPid);
+          if (process.env.PROOT_BUN_VERBOSE==="1")
+            console.error(`[ptrace] tracee ${taskPid} disappeared before restart`);
+          continue;
+        }
         task.pendingSignal=0n; task.running=true;
       }
     }
@@ -462,6 +496,7 @@ export function traceProcess(pid, rootfs, guest = null) {
           if (process.env.PROOT_BUN_VERBOSE==="1")
             console.error(`[ptrace] pid=${taskPid} renewed trampoline=0x${task.trampoline.toString(16)}`);
         }
+        closeExecDescriptors(taskPid,task.trampoline);
         resetExecAddressSpace(taskPid,task.trampoline);
         const nextImages=loadGuestImages(taskPid,task.trampoline,next);
         startGuest(taskPid,task.trampoline,nextImages,next);
@@ -518,7 +553,7 @@ export function traceProcess(pid, rootfs, guest = null) {
         console.error(`[ptrace] pid=${taskPid} execve path=0x${getX(state.regs,0).toString(16)} argv=0x${getX(state.regs,1).toString(16)}`);
       try { task.pendingExec=prepareExecGuest(taskPid,rootfs,task,state); }
       catch (error) {
-        if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} exec capture failed: ${error.message}`);
+        if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} exec capture failed phase=${phase}: ${error.message}`);
         continue;
       }
       // Substitute a harmless, universally available syscall. Using -1 as a
@@ -545,7 +580,8 @@ export function traceProcess(pid, rootfs, guest = null) {
       const args=getX(state.regs,0);
       if (args!==0n) {
         const flags=BigInt.asUintN(64,memory.peek(taskPid,args));
-        const translated=flags&~CLONE_NS_MASK;
+        let translated=flags&~CLONE_NS_MASK;
+        if ((flags&0x4000n)!==0n) translated&=~0x4100n; // VFORK -> private fork
         if (translated!==flags) {
           memory.poke(taskPid,args,translated);
           if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} clone3 flags 0x${flags.toString(16)} -> 0x${translated.toString(16)}`);

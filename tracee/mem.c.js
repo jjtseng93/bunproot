@@ -1,5 +1,12 @@
 const WORD_SIZE = 8;
 export function readCString(ptrace, pid, address, limit = 4096) {
+  if (ptrace.read) {
+    const bytes=ptrace.read(pid,address,limit);
+    if (bytes) {
+      const end=bytes.indexOf(0);
+      if (end>=0) return new TextDecoder().decode(bytes.subarray(0,end));
+    }
+  }
   const output = [];
   for (let offset = 0; offset < limit; offset += WORD_SIZE) {
     const word = BigInt.asUintN(64, ptrace.peek(pid, address + BigInt(offset)));

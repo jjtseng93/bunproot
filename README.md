@@ -44,6 +44,14 @@ PATH="$PWD:$PATH" LD_PRELOAD= proot -S "$ROOTFS" \
   /usr/bin/bun x --no-install cowsay hello
 ```
 
+Git over HTTPS is covered by the Alpine integration test:
+
+```sh
+cd bunsrc
+sh proot -S ../../alpine /usr/bin/git clone \
+  https://github.com/jjtseng93/jsmdcui /tmp/jsmdcui
+```
+
 The launcher effectively runs:
 
 ```sh
@@ -76,6 +84,8 @@ safely load Android bionic as a second libc.
 - `/proc`, `/dev`, and `/sys` use the Android kernel filesystems.
 - The current vertical slice handles fork, vfork, clone, clone3, execve, and
   `#!` interpreter chains.
+- Nested exec preserves the guest environment and applies `FD_CLOEXEC`; tracee
+  strings are read with the same `process_vm_readv`-first strategy as upstream.
 - Guest-aware absolute symlinks work for both initial commands and nested exec;
   for example Alpine's `/usr/bin/wget -> /bin/busybox` stays inside `ROOTFS`.
 - Android app-data `linkat` failures use an exclusive-copy fallback, allowing
