@@ -7,7 +7,9 @@ import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
 import { readElfLoadInfo, relocateElf } from "../execve/elf.c.js";
 import { expandShebang } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
-import { guestEnvironment, verbose } from "../env.js";
+import { guestEnvironment, noSeccomp, verbose } from "../env.js";
+import { count, report, timed } from "../profile.js";
+import { buildFilter, buildProgramHeader } from "../syscall/seccomp.c.js";
 import { commitEmulatedDirectoryRename, commitEmulatedRename, commitEmulatedUnlink, emulateHardLink, hasEmulatedDirectory, inspectEmulatedAlias, inspectEmulatedObject, isEmulatedAlias } from "../extension/link2symlink/link2symlink.c.js";
 
 const PTRACE_PEEKTEXT=1, PTRACE_PEEKDATA=2, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5;
@@ -47,11 +49,21 @@ function eventMessage(pid) {
   if (call(0x4201,pid,0n,BigInt(ptr(bytes)))<0n) throw new Error("PTRACE_GETEVENTMSG failed");
   return Number(new DataView(bytes.buffer).getBigUint64(0,true));
 }
-function syscallPhase(pid) {
-  const info=new Uint8Array(88);
-  const result=call(PTRACE_GET_SYSCALL_INFO,pid,BigInt(info.byteLength),BigInt(ptr(info)));
-  return result<0n?0:info[0]; // NONE=0, ENTRY=1, EXIT=2, SECCOMP=3
+// PTRACE_GET_SYSCALL_INFO already carries the syscall number, its arguments and
+// its return value, so one call answers what would otherwise cost a
+// PTRACE_GETREGSET as well.  The buffer is reused: a stop is handled to
+// completion before the next one is fetched.
+const SYSCALL_INFO=new Uint8Array(88);
+const SYSCALL_INFO_VIEW=new DataView(SYSCALL_INFO.buffer);
+const SYSCALL_INFO_POINTER=BigInt(ptr(SYSCALL_INFO));
+function syscallInfo(pid) {
+  SYSCALL_INFO.fill(0);
+  const result=call(PTRACE_GET_SYSCALL_INFO,pid,BigInt(SYSCALL_INFO.byteLength),SYSCALL_INFO_POINTER);
+  // op: NONE=0, ENTRY=1, EXIT=2, SECCOMP=3
+  return result<0n?0:SYSCALL_INFO[0];
 }
+const syscallInfoNumber=()=>Number(SYSCALL_INFO_VIEW.getBigUint64(24,true));
+const syscallInfoResult=()=>BigInt.asIntN(64,SYSCALL_INFO_VIEW.getBigInt64(24,true));
 function getRegisters(pid) {
   const regs = makeRegisterSet(), iovec = makeIovec(regs);
   if (call(PTRACE_GETREGSET, pid, BigInt(NT_PRSTATUS), BigInt(iovec.pointer)) < 0n) throw new Error("PTRACE_GETREGSET failed");
@@ -77,7 +89,9 @@ const SYS_GETPID = 172, SYS_MMAP = 222;
 const SYS_GETCWD = 17, SYS_CHDIR = 49, SYS_OPENAT = 56, SYS_CLOSE = 57, SYS_MUNMAP=215;
 const SYS_READLINKAT = 78, SYS_GETDENTS64 = 61;
 const SYS_FCHOWNAT = 54, SYS_FCHOWN = 55;
-const SYS_SIGALTSTACK = 132, SYS_RT_SIGACTION = 134;
+const SYS_SIGALTSTACK = 132, SYS_RT_SIGACTION = 134, SYS_PRCTL = 167;
+const PTRACE_EVENT_SECCOMP = 7;
+const PR_SET_NO_NEW_PRIVS = 38, PR_SET_SECCOMP = 22, SECCOMP_MODE_FILTER = 2;
 const DT_REG = 8, DT_LNK = 10;
 // Keep this in sync with the original src/syscall/enter.c.  Android commonly
 // rejects namespace creation, while the process/thread creation itself is OK.
@@ -100,9 +114,12 @@ function remoteSyscallAt(pid, address, syscall, args = []) {
     putRegisters(pid, state);
     if (call(PTRACE_CONT, pid) < 0n) throw new Error("PTRACE_CONT failed during remote syscall");
     let status = wait(pid);
-    // PTRACE_ATTACH can leave the bootstrap's original group-stop queued.
-    while (stoppedSignal(status) === 19) {
-      if (call(PTRACE_CONT, pid) < 0n) throw new Error("failed to drain bootstrap SIGSTOP");
+    // PTRACE_ATTACH can leave the bootstrap's original group-stop queued, and
+    // once the filter is installed the tracer's own remote munmap/chdir/close
+    // trip it: those are already host paths, so let them through untranslated
+    // and keep waiting for the trampoline's brk.
+    while (stoppedSignal(status) === 19 || (status >>> 16) === PTRACE_EVENT_SECCOMP) {
+      if (call(PTRACE_CONT, pid) < 0n) throw new Error("failed to drain remote-syscall stop");
       status = wait(pid);
     }
     if (stoppedSignal(status) !== 5) throw new Error(`remote syscall stopped with status 0x${status.toString(16)}`);
@@ -417,6 +434,34 @@ const PATH_ARGUMENTS = new Map([
   [437,[{path:1,dirfd:0}]], [439,[{path:1,dirfd:0}]],
 ]);
 
+// Every syscall the enter stage looks at: the pathname table plus the calls
+// that are emulated, translated or recorded outright.
+const HANDLED_ON_ENTER=new Set([...PATH_ARGUMENTS.keys(),
+  SYS_MUNMAP, SYS_GETCWD, SYS_CLOSE, SYS_GETDENTS64, SYS_READLINKAT,
+  SYS_FCHOWNAT, SYS_FCHOWN,
+  79, 80, 291,          // fstat, newfstatat, statx
+  144,145,146,147,148,149,150,151,152,158,159, // set*id, getres*id, getgroups
+  174,175,176,177,      // getuid, geteuid, getgid, getegid
+  220,221,435,          // clone, execve, clone3
+]);
+
+// Trace only what this port translates and let the kernel run the rest without
+// a stop.  The filter is inherited across fork and execve, so it is installed
+// once on the bootstrap and every guest afterwards is covered.
+function installSyscallFilter(pid,trampoline) {
+  if (noSeccomp) return false;
+  const { program,length }=buildFilter([...HANDLED_ON_ENTER]);
+  const filterAddress=trampoline+3072n;
+  const headerAddress=filterAddress+BigInt(program.length);
+  if (headerAddress+16n>trampoline+4096n) throw new Error("seccomp filter does not fit the scratch page");
+  writeBytes(memory,pid,filterAddress,program);
+  writeBytes(memory,pid,headerAddress,buildProgramHeader(length,filterAddress));
+  // Without NO_NEW_PRIVS an unprivileged process may not install a filter.
+  if (remoteCall(pid,trampoline,SYS_PRCTL,[BigInt(PR_SET_NO_NEW_PRIVS),1n,0n,0n,0n])<0n) return false;
+  return remoteCall(pid,trampoline,SYS_PRCTL,
+    [BigInt(PR_SET_SECCOMP),BigInt(SECCOMP_MODE_FILTER),headerAddress,0n,0n])===0n;
+}
+
 function fdGuestBase(pid,rootfs,task,fd) {
   if (fd===-100) return task.cwd;
   const host=readlinkSync(`/proc/${pid}/fd/${fd}`);
@@ -528,13 +573,14 @@ function resolveProcLink(taskPid,tasks,guestPath) {
 }
 
 export function traceProcess(pid, rootfs, guest = null) {
+  const started=performance.now();
   const initial = wait(pid, 2); // WUNTRACED: observe the pre-exec SIGSTOP.
   if ((initial & 0xff) !== 0x7f) throw new Error("tracee did not stop before exec");
   if (call(PTRACE_ATTACH, pid) < 0n) throw new Error("PTRACE_ATTACH failed");
   wait(pid);
   // TRACESYSGOOD distinguishes syscall stops; EXITKILL prevents a bootstrap
   // loop from surviving if the Bun tracer crashes or is interrupted.
-  if (call(PTRACE_SETOPTIONS, pid, 0n, 0x10000fn) < 0n) throw new Error("PTRACE_SETOPTIONS failed");
+  if (call(PTRACE_SETOPTIONS, pid, 0n, 0x10008fn) < 0n) throw new Error("PTRACE_SETOPTIONS failed");
   if (verbose && guest !== null)
     console.error(`[ptrace] bootstrap pid=${pid} executable=${guest.executable} interpreter=${guest.interpreter ?? "static"}`);
   let trampoline = initializeRemoteSyscalls(pid);
@@ -545,6 +591,11 @@ export function traceProcess(pid, rootfs, guest = null) {
     console.error(`[ptrace] mapped guest entry=0x${images.main.entry.toString(16)} interpreter entry=${images.interpreter ? `0x${images.interpreter.entry.toString(16)}` : "static"}`);
   resetGuestSignals(pid,trampoline);
   setKernelRootCwd(pid,trampoline,rootfs);
+  const filtering=installSyscallFilter(pid,trampoline);
+  // Without a filter every syscall has to be stopped to find the few that
+  // matter, which is correct but costs two stops per syscall.
+  const restartRequest=filtering?PTRACE_CONT:PTRACE_SYSCALL;
+  if (verbose) console.error(`[ptrace] syscall filter ${filtering?"installed":"unavailable; stopping on every syscall"}`);
   const guestSp=startGuest(pid,trampoline,images,guest);
   if (verbose) console.error(`[ptrace] guest sp=0x${guestSp.toString(16)}`);
   let nextScratchSlot=1n;
@@ -557,7 +608,7 @@ export function traceProcess(pid, rootfs, guest = null) {
   while (tasks.size>0) {
     for (const [taskPid,task] of tasks) {
       if (!task.running) {
-        if (call(PTRACE_SYSCALL,taskPid,0n,task.pendingSignal)<0n) {
+        if (call(task.restart??restartRequest,taskPid,0n,task.pendingSignal)<0n) {
           // Match upstream restart_tracee(): a task can die after its last
           // wait status but before the tracer restarts it. This is a normal
           // lifecycle race, especially for Git's short-lived helpers.
@@ -566,10 +617,11 @@ export function traceProcess(pid, rootfs, guest = null) {
             console.error(`[ptrace] tracee ${taskPid} disappeared before restart`);
           continue;
         }
-        task.pendingSignal=0n; task.running=true;
+        task.pendingSignal=0n; task.restart=undefined; task.running=true;
       }
     }
-    const result=waitResult(-1), taskPid=result.pid, status=result.status;
+    const result=timed("wait",()=>waitResult(-1)), taskPid=result.pid, status=result.status;
+    count("stops");
     const task=tasks.get(taskPid);
     if (!task) continue;
     task.running=false;
@@ -579,7 +631,8 @@ export function traceProcess(pid, rootfs, guest = null) {
     }
     if ((status&0x7f)!==0x7f) { tasks.delete(taskPid); continue; }
     const signal=(status>>8)&0xff, event=status>>>16;
-    if (signal!==0x85) {
+    const seccompStop=signal===5 && event===PTRACE_EVENT_SECCOMP;
+    if (signal!==0x85 && !seccompStop) {
       if (signal===5 && event>=1 && event<=3) {
         const child=eventMessage(taskPid);
         tasks.set(child,{ entering:true, pendingSignal:0n, pendingExec:null,
@@ -600,12 +653,16 @@ export function traceProcess(pid, rootfs, guest = null) {
       if (signal===19) continue; // consume ptrace/vfork bootstrap SIGSTOP
       task.pendingSignal=BigInt(signal); continue;
     }
-    const phase=syscallPhase(taskPid);
-    const isExit=phase===2 || (phase===0 && !task.entering);
+    const phase=timed("syscallPhase",()=>syscallInfo(taskPid));
+    // Registers are only needed by the syscalls this tracer actually handles;
+    // for the overwhelming majority the info block above is the whole story.
+    let fetched=null;
+    const registers=()=>fetched??=getRegisters(taskPid);
+    const isExit=!seccompStop && (phase===2 || (phase===0 && !task.entering));
     if (isExit) {
       task.entering=true;
       if (task.forcedResult!==undefined) {
-        const exited=getRegisters(taskPid);
+        const exited=registers();
         setX(exited.regs,0,task.forcedResult); putRegisters(taskPid,exited);
         task.forcedResult=undefined;
       }
@@ -615,7 +672,7 @@ export function traceProcess(pid, rootfs, guest = null) {
         task.idWrites=undefined;
       }
       if (task.pendingStat!==undefined) {
-        const exited=getRegisters(taskPid);
+        const exited=registers();
         if (BigInt.asIntN(64,getX(exited.regs,0))===0n) {
           const { buffer,kind }=task.pendingStat;
           const uidOffset=kind==="statx"?20n:24n;
@@ -636,21 +693,24 @@ export function traceProcess(pid, rootfs, guest = null) {
         // skip every emulated file.
         const { fd,buffer,size }=task.pendingGetdents;
         task.pendingGetdents=undefined;
-        const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
+const exited=registers(), result=syscallInfoResult();
         let directory=null;
         if (result>0n) { try { directory=readlinkSync(`/proc/${taskPid}/fd/${fd}`); } catch {} }
         if (directory!==null && (directory===rootfs || directory.startsWith(`${rootfs}/`))) {
-          const bytes=readTraceeBytes(taskPid,buffer,Number(result));
+          count("getdents");
+          count("getdentsBytes",Number(result));
+          const bytes=timed("getdents",()=>readTraceeBytes(taskPid,buffer,Number(result)));
           const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
           let rewritten=false;
           for (let offset=0; offset+19<=bytes.length; ) {
             const reclen=view.getUint16(offset+16,true); // struct linux_dirent64.d_reclen
             if (reclen<19 || offset+reclen>bytes.length) break;
             if (bytes[offset+18]===DT_LNK) {
+              count("getdentsLinks");
               let end=offset+19;
               while (end<offset+reclen && bytes[end]!==0) end++;
               const name=new TextDecoder().decode(bytes.subarray(offset+19,end));
-              if (isEmulatedAlias(rootfs,`${directory}/${name}`)) { bytes[offset+18]=DT_REG; rewritten=true; }
+              if (timed("getdentsAlias",()=>isEmulatedAlias(rootfs,`${directory}/${name}`))) { bytes[offset+18]=DT_REG; rewritten=true; }
             }
             offset+=reclen;
           }
@@ -660,7 +720,7 @@ export function traceProcess(pid, rootfs, guest = null) {
       if (task.pendingReadlink!==undefined) {
         const { buffer,size,value,procFd }=task.pendingReadlink;
         task.pendingReadlink=undefined;
-        const exited=getRegisters(taskPid);
+        const exited=registers();
         if (value!==null) {
           // The substituted syscall never ran, so produce readlinkat(2)'s own
           // result: the target is copied without a terminating NUL and the
@@ -693,7 +753,7 @@ export function traceProcess(pid, rootfs, guest = null) {
         }
       }
       if (task.pendingPathSyscall!==undefined) {
-        const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
+const exited=registers(), result=syscallInfoResult();
         let finalResult=result;
         if (task.pendingOpenAlias!==undefined) {
           if (result>=0n) openedAliases.set(`${taskPid}:${result}`,task.pendingOpenAlias);
@@ -749,7 +809,7 @@ export function traceProcess(pid, rootfs, guest = null) {
         task.pendingL2sDirectoryRename=undefined;
       }
       if (task.pendingCwd!==null || task.pendingGetcwd!==null) {
-        const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
+const exited=registers(), result=syscallInfoResult();
         if (task.pendingCwd!==null) {
           if (result===0n) task.cwd=task.pendingCwd;
           task.pendingCwd=null;
@@ -787,7 +847,16 @@ export function traceProcess(pid, rootfs, guest = null) {
       continue;
     }
     task.entering=false;
-    const state=getRegisters(taskPid), syscall=getSyscallNumber(state.regs);
+    const syscall=(phase===1||phase===3)?syscallInfoNumber():getSyscallNumber(registers().regs);
+    // Nothing to do for a syscall this tracer does not translate, and by far
+    // the most syscalls a guest makes are of that kind: reading the registers
+    // for every one of them was the single biggest cost per stop.
+    if (!HANDLED_ON_ENTER.has(syscall)) continue;
+    count("handled");
+    // A seccomp stop is the entry stop; ask for this syscall's exit stop too,
+    // then fall back to running free until the filter traps the next one.
+    if (seccompStop) task.restart=PTRACE_SYSCALL;
+    const state=registers();
     if (syscall===SYS_MUNMAP) {
       const start=getX(state.regs,0), end=start+getX(state.regs,1);
       const protectedEnd=task.trampoline+1024n*1024n;
@@ -956,9 +1025,10 @@ export function traceProcess(pid, rootfs, guest = null) {
         continue;
       }
       let inputGuest, absoluteGuest;
+      count("paths");
       try {
-        inputGuest=resolveGuestInput(taskPid,rootfs,task,state,guestPath,spec);
-        absoluteGuest=resolveGuestPath(taskPid,rootfs,task,state,guestPath,spec);
+        inputGuest=timed("canon",()=>resolveGuestInput(taskPid,rootfs,task,state,guestPath,spec));
+        absoluteGuest=timed("canon",()=>resolveGuestPath(taskPid,rootfs,task,state,guestPath,spec));
       }
       catch (error) { throw new Error(`pid ${taskPid} syscall ${syscall}: ${error.message}`); }
       if (syscall===SYS_CHDIR && spec.path===0) task.pendingCwd=absoluteGuest;
@@ -992,5 +1062,6 @@ export function traceProcess(pid, rootfs, guest = null) {
     }
     if (changed) putRegisters(taskPid,state);
   }
+  report(performance.now()-started);
   return rootExit;
 }
