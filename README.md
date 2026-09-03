@@ -76,6 +76,10 @@ safely load Android bionic as a second libc.
 - `/proc`, `/dev`, and `/sys` use the Android kernel filesystems.
 - The current vertical slice handles fork, vfork, clone, clone3, execve, and
   `#!` interpreter chains.
+- Guest-aware absolute symlinks work for both initial commands and nested exec;
+  for example Alpine's `/usr/bin/wget -> /bin/busybox` stays inside `ROOTFS`.
+- Android app-data `linkat` failures use an exclusive-copy fallback, allowing
+  Alpine `apk update` to install downloaded repository indexes.
 - `-S` resolves a relative rootfs before changing cwd and enables the current
   fake-id0 layer (`uid=0`, `gid=0`, root supplementary group, and root ownership
   in common stat results).

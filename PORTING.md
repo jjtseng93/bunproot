@@ -64,6 +64,17 @@ Syscall substitution updates `NT_ARM_SYSTEM_CALL`; changing x8 alone does not
 change the syscall already cached by the ARM64 kernel. This fixes BusyBox/musl
 self-exec from an interactive shell.
 
+Initial commands now use the same guest-root-aware symlink canonicalization as
+nested exec. Absolute targets such as Alpine's `/usr/bin/wget -> /bin/busybox`
+are resolved inside the guest while argv[0] remains the applet name. Common
+fake-id0 calls and stat ownership are translated for `-S`, including uid, gid,
+supplementary groups, and `ls -l` ownership.
+
+SIGCHLD observed by the tracer is not reinjected: child termination is already
+available through guest wait syscalls, while reinjection after the current
+JS-controlled exec replacement can enter a stale signal frame on musl. This
+fixes BusyBox wget's `ssl_client` completion path.
+
 ## Current priority
 
 Items 1 and 2 are in progress. Implemented so far:
@@ -95,6 +106,7 @@ bun i -g --backend=copyfile cowsay
 ```
 
 Hard-link pathname translation is correct, but Android rejects the underlying
-app-data `linkat` with `EACCES`; matching original PRoot on that operation will
-require the `link2symlink` emulation tracked under item 8. `execveat` and full
-final-component/symlink semantics remain open under items 1 and 3.
+app-data `linkat` with `EACCES`. The current compatibility fallback creates an
+exclusive copy, including apk's `/proc/self/fd/N` source form; this is enough
+for `apk update`, but general hard-link identity still requires the original
+`link2symlink` emulation tracked under item 8. `execveat` remains open.

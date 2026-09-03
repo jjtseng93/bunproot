@@ -1,5 +1,5 @@
 import { FFIType, ptr } from "bun:ffi";
-import { readFileSync, readlinkSync } from "node:fs";
+import { constants as fsConstants, copyFileSync, readFileSync, readlinkSync } from "node:fs";
 import { posix } from "node:path";
 import { openLibrary } from "../ffi.js";
 import { getPc, getSp, getSyscallNumber, getX, makeIovec, makeRegisterSet, NT_PRSTATUS, setPc, setX } from "../tracee/reg.c.js";
@@ -383,6 +383,11 @@ export function traceProcess(pid, rootfs, guest = null) {
       if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} signal=${signal} pc=0x${getPc(stopped.regs).toString(16)} syscall=${getSyscallNumber(stopped.regs)}`);
       if (signal===31) { setX(stopped.regs,0,BigInt.asUintN(64,-38n)); putRegisters(taskPid,stopped); continue; }
       if (signal===19) continue; // consume ptrace/vfork bootstrap SIGSTOP
+      // Child state remains observable through wait4/waitid. Reinjecting the
+      // ptrace-observed SIGCHLD currently enters a stale Android signal frame
+      // after JS-controlled exec replacement on musl (BusyBox wget), which
+      // crashes on handler return.
+      if (signal===17) continue;
       task.pendingSignal=BigInt(signal); continue;
     }
     const phase=syscallPhase(taskPid);
@@ -407,6 +412,27 @@ export function traceProcess(pid, rootfs, guest = null) {
           writeBytes(memory,taskPid,buffer+uidOffset,new Uint8Array(8));
         }
         task.pendingStat=undefined;
+      }
+      if (task.pendingPathSyscall!==undefined) {
+        const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
+        let finalResult=result;
+        if (task.pendingPathSyscall===37 && result===-13n && task.pendingLinkPaths?.length===2) {
+          try {
+            copyFileSync(task.pendingLinkPaths[0],task.pendingLinkPaths[1],fsConstants.COPYFILE_EXCL);
+            setX(exited.regs,0,0n); putRegisters(taskPid,exited); finalResult=0n;
+            if (process.env.PROOT_BUN_VERBOSE==="1")
+              console.error(`[ptrace] pid=${taskPid} linkat EACCES -> exclusive copy fallback`);
+          } catch (error) {
+            finalResult=BigInt(error.errno??-13);
+            if (process.env.PROOT_BUN_VERBOSE==="1")
+              console.error(`[ptrace] pid=${taskPid} linkat fallback failed: ${error.message}; paths=${task.pendingLinkPaths.join(" -> ")}`);
+            setX(exited.regs,0,BigInt.asUintN(64,finalResult)); putRegisters(taskPid,exited);
+          }
+        }
+        if (finalResult<0n && process.env.PROOT_BUN_VERBOSE==="1")
+          console.error(`[ptrace] pid=${taskPid} syscall=${task.pendingPathSyscall} result=${finalResult}`);
+        task.pendingPathSyscall=undefined;
+        task.pendingLinkPaths=undefined;
       }
       if (task.pendingCwd!==null || task.pendingGetcwd!==null) {
         const exited=getRegisters(taskPid), result=BigInt.asIntN(64,getX(exited.regs,0));
@@ -529,23 +555,34 @@ export function traceProcess(pid, rootfs, guest = null) {
     }
     const arguments_=PATH_ARGUMENTS.get(syscall);
     if (arguments_===undefined) continue;
-    let scratch=task.scratch, changed=false;
+    task.pendingPathSyscall=syscall;
+    let scratch=task.scratch, changed=false, hostPaths=[];
     for (const spec of arguments_) {
       const address=getX(state.regs,spec.path);
+      if (syscall===37 && spec.path===1 && (getX(state.regs,4)&0x1000n)!==0n) {
+        hostPaths.push(`/proc/${taskPid}/fd/${Number(BigInt.asIntN(32,getX(state.regs,0)))}`);
+        continue;
+      }
       if (address<4096n) continue;
       let guestPath;
       try { guestPath=readCString(memory,taskPid,address); }
       catch (error) { if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] skipped pid=${taskPid} syscall=${syscall}: ${error.message}`); continue; }
-      if (isKernelFilesystem(guestPath)||guestPath.startsWith(`${rootfs}/`)) continue;
+      if (isKernelFilesystem(guestPath)||guestPath.startsWith(`${rootfs}/`)) {
+        if (syscall===37)
+          hostPaths.push(guestPath.replace(/^\/proc\/self(?=\/|$)/,`/proc/${taskPid}`));
+        continue;
+      }
       let absoluteGuest;
       try { absoluteGuest=resolveGuestPath(taskPid,rootfs,task,state,guestPath,spec); }
       catch (error) { throw new Error(`pid ${taskPid} syscall ${syscall}: ${error.message}`); }
       if (syscall===SYS_CHDIR && spec.path===0) task.pendingCwd=absoluteGuest;
       const host=absoluteGuest==="/"?rootfs:`${rootfs}${absoluteGuest}`;
+      hostPaths.push(host);
       if (process.env.PROOT_BUN_VERBOSE==="1") console.error(`[ptrace] pid=${taskPid} ${guestPath} (${absoluteGuest}) -> ${host}`);
       writeCString(memory,taskPid,scratch,host); setX(state.regs,spec.path,scratch);
       scratch+=BigInt((new TextEncoder().encode(host).length+8)&~7); changed=true;
     }
+    if (syscall===37) task.pendingLinkPaths=hostPaths;
     if (changed) putRegisters(taskPid,state);
   }
   return rootExit;

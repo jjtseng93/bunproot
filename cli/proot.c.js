@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { FFIType, ptr } from "bun:ffi";
 import { cString, openLibrary } from "../ffi.js";
 import { readElfInterpreter } from "../execve/elf.c.js";
+import { canonicalizeGuestPath } from "../path/canon.c.js";
 import { traceProcess } from "../ptrace/ptrace.c.js";
 
 const { posix_spawn } = openLibrary("libc", {
@@ -35,7 +36,10 @@ export function parseArguments(argv) {
 }
 export function run(argv) {
   const { rootfs, command } = parseArguments(argv);
-  const executable = command[0].startsWith("/") ? `${rootfs}${command[0]}` : command[0];
+  const guestExecutable=command[0].startsWith("/")
+    ? canonicalizeGuestPath(rootfs,command[0])
+    : command[0];
+  const executable=guestExecutable.startsWith("/")?`${rootfs}${guestExecutable}`:guestExecutable;
   if (!existsSync(executable)) throw new Error(`guest executable not found: ${executable}`);
   const interpreter = readElfInterpreter(executable);
   const loader = interpreter === null ? null : `${rootfs}${interpreter}`;
