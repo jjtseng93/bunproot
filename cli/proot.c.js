@@ -32,6 +32,10 @@ function spawnTracee(argv, env) {
   return new DataView(pidBytes.buffer).getInt32(0, true);
 }
 const USAGE = "usage: bunproot [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]";
+// Nothing about the usage line says where the rest is, and the rest includes
+// the debug environment variables, so every way of getting the invocation
+// wrong ends by naming --help.
+const TRY_HELP = "try `bunproot --help` for the options and the debug environment variables";
 
 const HELP = `${USAGE}
 
@@ -59,7 +63,7 @@ export function parseArguments(argv) {
   for (; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === "-b" || argument === "--bind" || argument === "-m" || argument === "--mount") {
-      if (argv[++index] === undefined) throw new Error(`${argument} needs a binding\n${USAGE}`);
+      if (argv[++index] === undefined) throw new Error(`${argument} needs a binding\n${USAGE}\n${TRY_HELP}`);
       bindings.push(argv[index]);
       continue;
     }
@@ -70,7 +74,7 @@ export function parseArguments(argv) {
     if (argument === "-h" || argument === "--help") return { help: true };
     if (argument === "-V" || argument === "--version") return { version: true };
     if (argument === "-S" || argument === "--rootfs") {
-      if (argv[++index] === undefined) throw new Error(`${argument} needs a rootfs\n${USAGE}`);
+      if (argv[++index] === undefined) throw new Error(`${argument} needs a rootfs\n${USAGE}\n${TRY_HELP}`);
       // Resolve this before the bootstrap changes cwd to the rootfs. Otherwise
       // a caller-relative rootfs is interpreted again from inside that rootfs
       // and subsequent host-path translations acquire the wrong prefix.
@@ -80,7 +84,7 @@ export function parseArguments(argv) {
     break;
   }
   const command = argv.slice(index);
-  if (rootfs === null || command.length === 0) throw new Error(USAGE);
+  if (rootfs === null || command.length === 0) throw new Error(`${USAGE}\n${TRY_HELP}`);
   return { rootfs, bindings, command };
 }
 export function run(argv) {

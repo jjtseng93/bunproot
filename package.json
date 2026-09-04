@@ -25,7 +25,7 @@
     "bun"
   ],
   "scripts": {
-    "start": "bun run index.js",
+    "start": "bun run proot.js",
     "test": "bun test"
   }
 }
