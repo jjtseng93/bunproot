@@ -36,8 +36,11 @@ const HELP = `${USAGE}
 
   -S, --rootfs ROOTFS      run COMMAND with ROOTFS as its root directory
   -b, --bind HOST[:GUEST]  make a host path visible inside the guest, at the
-      --mount, -m          same pathname or at GUEST; repeatable
+                           same pathname or at GUEST; repeatable
+  -m, --mount              another name for --bind, not a different thing
   -h, --help               show this message
+      --download-alpine    fetch and checksum an Alpine minirootfs into the
+                           current directory, then exit
 
 Either half of a binding may be relative to the current directory, and the
 first colon separates them. The most specific binding wins; the rootfs is the

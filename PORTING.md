@@ -249,6 +249,13 @@ canonicalization stops at the missing component and the table maps what is left
 -- but the mount point is not visible to a directory listing. Upstream
 materialises it with the glue filesystem, which is not ported.
 
+Two smaller pieces of upstream's `-b` are also missing. A guest location ending
+in `!` asks upstream not to dereference it (`-b host:guest!`, described in
+`src/cli/proot.h`); here the `!` is taken as part of the pathname. And upstream
+accepts a long option only as `--bind=path` (the `separator` field of its option
+table is `=`), while this port also accepts `--bind path`. The second is a
+superset and rejects nothing upstream takes; the first is a real gap.
+
 `env.js` owns every environment decision: the tracer's knobs, the bootstrap
 environment, and the guest environment. A guest inherits the caller's variables
 -- PRoot is not a container -- except those naming a host path or host-only

@@ -15,6 +15,15 @@
 // argument. Bun exports BUN_FEATURE_FLAG_NO_ORPHANS whenever the flag is on,
 // which is both the way to ask for it and the way to tell that it is already
 // on, so the re-exec below happens at most once.
+// A rootfs to point -S at is the one thing a fresh install does not come with,
+// and someone who reached bunproot through `bunx` has no checkout to run
+// tools/download-alpine.mjs from. It needs nothing the tracer sets up, so it
+// runs before the re-exec below and takes the process with it.
+if (process.argv[2] === "--download-alpine") {
+  await import("./tools/download-alpine.mjs");
+  process.exit(0);
+}
+
 if (!process.env.BUN_FEATURE_FLAG_NO_ORPHANS) {
   // Drop LD_PRELOAD for the same reason the shell launcher does. The tracer
   // works with Termux's libtermux-exec loaded -- the bootstrap it spawns gets a

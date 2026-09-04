@@ -91,9 +91,13 @@ you place beside it.
 ### Get a rootfs
 
 ```sh
-bun tools/download-alpine.mjs      # fetches and checksums an Alpine minirootfs
-mkdir alpine && tar xzf alpine-minirootfs-*.tar.gz -C alpine
+bunproot --download-alpine                 # fetches and checksums a minirootfs
+mkdir alpine && cd alpine && tar -xzvf ../alpine-minirootfs-*.tar.gz && cd ..
 ```
+
+It prints the URL and the expected SHA-256 and asks before downloading, and
+verifies what it got. From a source checkout the same script is
+`bun tools/download-alpine.mjs`.
 
 Any ARM64 Linux rootfs works; Alpine is simply what this port is tested
 against.
