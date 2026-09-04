@@ -149,10 +149,18 @@ There is no shell in it, no coreutils, and no `/usr/bin/env` — a
 `#!/usr/bin/env NAME` script still runs, because the tracer does the `PATH`
 search itself rather than running an `env` that is not there. Give that guest a
 network and `bun x` installs the rest, so a shell with `ls`, `cat` and `curl` is
-one command away:
+one command away — here [bunmsh](https://github.com/jjtseng93/bunmsh), the Bun
+Modern Shell, which carries those as builtins:
 
 ```sh
 bunproot -S ./bare /bin/bun x bunmsh -c 'echo hi; ls /'
+```
+
+Without `-c` the same command drops you into that shell, interactively, inside
+the five-file guest:
+
+```sh
+bunproot -S ./bare /bin/bun x bunmsh
 ```
 
 It is not a *small* rootfs — Bun is 70-odd MiB — but it is one you can assemble
