@@ -125,6 +125,43 @@ validate both legs of every ref and reconstruct counts from valid refs before
 garbage-collecting any object. A zero or missing count alone never authorizes
 deleting user data.
 
+## Reading a rootfs the original PRoot has used
+
+The two formats do not overlap, and nothing here reads the original's -- but
+`-b /data` makes such a rootfs usable read-only, and is the first thing to
+reach for:
+
+```sh
+bunproot -S ./that-rootfs -b /data /bin/sh
+```
+
+Upstream PRoot turns a hard link into a two-level symlink chain whose target is
+a *host* pathname. A symlink target inside a guest is read as a guest pathname,
+so following it re-roots that host path into the rootfs, where it is not
+present. The bind puts that path inside the guest as well, and it resolves.
+Measured against a proot-distro Debian rootfs whose store held 170538 entries,
+a file that fails without the bind reads back its 679 bytes with it.
+
+Left out, the bind costs every such file in the rootfs at once. It costs them
+loudly: the read exits 1 with `Permission denied`, never a short or empty read.
+The errno itself is incidental. The re-rooted path runs into the zero-mode
+`d---------` stub directory proot-distro leaves in the rootfs for its own bind
+mounts, a component or two before the part of the path that does not exist at
+all.
+
+Two limits. The bind only works while the rootfs has not been moved or renamed
+away from the path recorded when those symlinks were made -- the original
+format's own limitation, not one this port adds, since the same move breaks the
+same rootfs under the original PRoot too. And read-only is a discipline, not
+something enforced: writing to such a rootfs under this port lays down a second
+store beside the first, and the two do not know about each other. Detect one by
+`/.l2s` at its root.
+
+The format difference is deliberate, and that first limit is what it buys. The
+original names its storage with host pathnames, so a rootfs that moves takes
+every one of those files out of reach; everything here is a guest pathname and
+survives the move.
+
 ## Restoration to native hard links
 
 On a filesystem that permits native hard links, a recovery tool walks
