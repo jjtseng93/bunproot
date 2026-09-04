@@ -124,12 +124,30 @@ Bun itself that is five files:
 /etc/resolv.conf              a resolver, without which `bun x` cannot install
 ```
 
-`resolv.conf` is just one line, `nameserver 1.1.1.1`. Run this command to
-generate it:
+An Alpine rootfs with Bun installed already has four of them — `musl` carries
+the loader, and installing Bun brings `libstdc++` and `libgcc` in with it — so
+the Alpine from [Get a rootfs](#get-a-rootfs) is where to copy them from. The
+fifth, `resolv.conf`, is one line you write yourself.
+
+Where Bun itself landed inside that Alpine depends on how it was installed —
+npm puts it in `/usr/local/bin`, the official installer in `~/.bun/bin` — so
+ask the guest rather than guessing:
 
 ```sh
+mkdir -p bare/bin bare/lib bare/etc
+BUN=$(bunproot -S ./alpine /bin/sh -c 'command -v bun')
+
+cp -L "./alpine$BUN"                   bare/bin/bun
+cp -L alpine/lib/ld-musl-aarch64.so.1  bare/lib/
+cp -L alpine/usr/lib/libstdc++.so.6    bare/lib/
+cp -L alpine/usr/lib/libgcc_s.so.1     bare/lib/
 echo 'nameserver 1.1.1.1' > bare/etc/resolv.conf
 ```
+
+`cp -L` is what settles the symlink question. It follows Alpine's
+`libstdc++.so.6 -> libstdc++.so.6.0.34` and npm's
+`bun -> ../lib/node_modules/bun/bin/bun.exe`, and writes real files under the
+names the loader asks for.
 
 Name each file the way the loader asks for it and no symbolic links are needed:
 the loader at the `PT_INTERP` path (`readelf -l` shows it), each library at its
