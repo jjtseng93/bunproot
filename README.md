@@ -20,6 +20,39 @@ Termux is not an option — still has a way out to a Linux userspace. Bun is the
 one thing such an environment can be given as a single file, so it is the one
 thing this depends on.
 
+> **A rootfs the original PRoot has used needs `-b /data`.** Both emulate hard
+> links — Android rejects `link(2)` on app storage — but not in the same on-disk
+> format, and this port reads only its own. Add the bind and such a rootfs works partially(read-only):
+>
+> ```sh
+> bunproot -S ./that-rootfs -b /data /bin/sh
+> ```
+>
+> If you leave the bind out, any hardlink that was turned into a symlink by the upstream PRoot will become unreadable.
+> That includes a large amount of files.
+> Here is why. Upstream PRoot turns hardlinks into double-layer symlinks which target a *host*
+> pathname. A symlink target inside a guest is read as a guest pathname, so
+> following it re-roots that host path into the rootfs, where it is not present. The
+> bind puts that path inside the guest as well, and it resolves.
+>
+> Tell the two formats apart by the store at the rootfs root: `/.l2s` is the
+> original's, `/.proot.l2s` is this port's. A fresh rootfs, or one only ever
+> opened with bunproot, needs nothing.
+>
+> The bind only works while the rootfs has not been moved or renamed away from the original path.
+> What it recovers is a host path recorded at the time the symlink was made. That is the
+> original format's own limitation, not something this port adds: the same move
+> breaks the same rootfs under the original PRoot too.
+>
+> And the bind is for getting at what is there, not for moving in. Writing to
+> such a rootfs under this port lays down a second store beside the first, and
+> the two do not know about each other.
+>
+> The formats differ deliberately, and that is what the difference buys. This
+> port records guest pathnames, so a rootfs stays readable wherever it is put —
+> which is the whole point of a rootfs you can carry out of Termux. Being unable
+> to read the original's store is the price.
+
 Licensed **GPL-2.0-or-later**, inherited as a derivative work of PRoot.
 [NOTICE.md](./NOTICE.md) records what it was ported from and how to read the
 `src/...` citations in the comments; [COPYING](./COPYING) is the licence.
@@ -137,16 +170,17 @@ ask the guest rather than guessing:
 mkdir -p bare/bin bare/lib bare/etc
 BUN=$(bunproot -S ./alpine /bin/sh -c 'command -v bun')
 
-cp -L "./alpine$BUN"                   bare/bin/bun
-cp -L alpine/lib/ld-musl-aarch64.so.1  bare/lib/
-cp -L alpine/usr/lib/libstdc++.so.6    bare/lib/
-cp -L alpine/usr/lib/libgcc_s.so.1     bare/lib/
+cp "./alpine$BUN"                   bare/bin/bun
+cp alpine/lib/ld-musl-aarch64.so.1  bare/lib/
+cp alpine/usr/lib/libstdc++.so.6    bare/lib/
+cp alpine/usr/lib/libgcc_s.so.1     bare/lib/
 echo 'nameserver 1.1.1.1' > bare/etc/resolv.conf
 ```
 
-`cp -L` is what settles the symlink question. It follows Alpine's
+That settles the symlink question by itself: `cp` follows a symbolic link it
+is given as a source unless told otherwise, so Alpine's
 `libstdc++.so.6 -> libstdc++.so.6.0.34` and npm's
-`bun -> ../lib/node_modules/bun/bin/bun.exe`, and writes real files under the
+`bun -> ../lib/node_modules/bun/bin/bun.exe` arrive as real files under the
 names the loader asks for.
 
 Name each file the way the loader asks for it and no symbolic links are needed:
