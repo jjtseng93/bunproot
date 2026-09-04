@@ -8,6 +8,7 @@ import { canonicalizeGuestPath } from "../path/canon.c.js";
 import { createBindings } from "../path/binding.c.js";
 import { traceProcess } from "../ptrace/ptrace.c.js";
 import { bootstrapEnvironment, guestEnvironment } from "../env.js";
+import pkg from "../package.json" with { type: "json" };
 
 const { posix_spawn } = openLibrary("libc", {
   posix_spawn: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
@@ -39,6 +40,7 @@ const HELP = `${USAGE}
                            same pathname or at GUEST; repeatable
   -m, --mount              another name for --bind, not a different thing
   -h, --help               show this message
+  -V, --version            show the version and exit
       --download-alpine    fetch and checksum an Alpine minirootfs into the
                            current directory, then exit
 
@@ -66,6 +68,7 @@ export function parseArguments(argv) {
       continue;
     }
     if (argument === "-h" || argument === "--help") return { help: true };
+    if (argument === "-V" || argument === "--version") return { version: true };
     if (argument === "-S" || argument === "--rootfs") {
       if (argv[++index] === undefined) throw new Error(`${argument} needs a rootfs\n${USAGE}`);
       // Resolve this before the bootstrap changes cwd to the rootfs. Otherwise
@@ -84,6 +87,7 @@ export function run(argv) {
   const parsed = parseArguments(argv);
   // Only a --help before the command is ours; after it, it belongs to the guest.
   if (parsed.help) { console.log(HELP); return 0; }
+  if (parsed.version) { console.log(`${pkg.name} ${pkg.version}`); return 0; }
   const { rootfs, bindings, command } = parsed;
   const mounts = createBindings(rootfs, bindings);
   let guestExecutable=command[0].startsWith("/")

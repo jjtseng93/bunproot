@@ -21,7 +21,7 @@ function download(url, redirects = 0) {
   return new Promise((resolve, reject) => {
     const request = https.get(url, {
       rejectUnauthorized: false,
-      headers: { 'user-agent': 'buninu-download-alpine/1' },
+      headers: { 'user-agent': 'bunproot-download-alpine/1' },
     }, response => {
       const status = response.statusCode || 0;
       if (status >= 300 && status < 400 && response.headers.location) {

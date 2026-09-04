@@ -48,7 +48,7 @@ export function createBindings(rootfs, specifications = []) {
   const requested = specifications.map(parseBinding).filter((binding) => {
     if (existsSync(binding.host)) return true;
     if (!ignoreMissingBindings)
-      console.error(`proot-bun: can't sanitize binding "${binding.host}": no such file or directory`);
+      console.error(`bunproot: can't sanitize binding "${binding.host}": no such file or directory`);
     return false;
   });
   const entries = [{ host: resolveHost(rootfs), guest: "/" }, ...requested];
