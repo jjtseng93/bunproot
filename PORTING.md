@@ -7,8 +7,9 @@ for the original PRoot. Its current integration target is:
 LD_PRELOAD= proot -S ROOTFS /bin/sh -c 'ls /'
 ```
 
-This works in the native Termux environment through an Android `linker64` shell
-bootstrap, ptrace-controlled remote ELF loading, and guest `execve` emulation.
+This works in a native Android process — Termux or any other host with Bun on
+`PATH` — through an Android `linker64` shell bootstrap, ptrace-controlled remote
+ELF loading, and guest `execve` emulation.
 The nested shebang/exec path is also exercised successfully by:
 
 ```sh

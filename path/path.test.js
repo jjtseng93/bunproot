@@ -24,6 +24,12 @@ test("bindings are collected in order and never eat the command", () => {
   expect(parseArguments(["-S", "/rootfs", "-b", "/a:/x", "--bind=/b:/y", "/bin/sh", "-c", "-b"])).toEqual({
     rootfs: "/rootfs", bindings: ["/a:/x", "/b:/y"], command: ["/bin/sh", "-c", "-b"],
   });
+  // -h/--help before the command is ours; after it, it belongs to the guest.
+  expect(parseArguments(["--help"])).toEqual({ help: true });
+  expect(parseArguments(["-S", "/rootfs", "-h"])).toEqual({ help: true });
+  expect(parseArguments(["-S", "/rootfs", "/bin/sh", "--help"])).toEqual({
+    rootfs: "/rootfs", bindings: [], command: ["/bin/sh", "--help"],
+  });
   expect(() => parseArguments(["-S", "/rootfs"])).toThrow();
   expect(() => parseArguments(["-b", "/data", "/bin/sh"])).toThrow();
   expect(() => parseArguments(["-S", "/rootfs", "-b"])).toThrow();

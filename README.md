@@ -1,27 +1,155 @@
 # bunproot
 
-A port of [PRoot](https://github.com/termux/proot) to Bun/JavaScript, under the
-**GPL-2.0-or-later** it inherits as a derivative work. Each original
-`src/**/*.c` or `src/**/*.h` has a corresponding `**/*.c.js` or `**/*.h.js`
-here, and `src/...` in a comment names a file of PRoot's C source rather than
-one of this repository's. [NOTICE.md](./NOTICE.md) records which upstream
-commit those citations are to be read against, and the handful of places where
-the tree they were written against differs from upstream;
-[COPYING](./COPYING) is the licence.
+A port of [PRoot](https://github.com/termux/proot) to Bun/JavaScript: a
+userspace `chroot`, `mount --bind` and shebang loader for Android, needing no
+root and no kernel support beyond `ptrace`.
 
-The working implementation targets ARM64 Android.
+It runs wherever `bunx` does — Termux, a shell inside an app built with
+[minapk](https://github.com/jjtseng93/minapk)
+([npm](https://www.npmjs.com/package/@drxiaozhi/minapk)), or any other Android
+environment with Bun on `PATH`. The tracer itself is Bun; the guest is an ARM64
+Linux rootfs you supply.
 
-## Requirements
+**This is early work, and it is not trying to replace Termux's PRoot.** That
+one is mature, complete and considerably faster; if you are in Termux and it
+works for you, keep using it. What this port is for is the case after Termux: a
+rootfs runner whose only dependency is a Bun binary, so an Android environment
+that never had a package manager — an app built by minapk, a device where
+Termux is not an option — still has a way out to a Linux userspace. Bun is the
+one thing such an environment can be given as a single file, so it is the one
+thing this depends on.
 
-- A ptrace-capable Termux environment.
-- Android's 64-bit linker at `/system/bin/linker64`.
-- Android bionic libraries under `/apex/com.android.runtime/lib64/bionic`.
-- A Bun built for Android/bionic, not a glibc one. The `proot` launcher uses
-  whatever `bun` is on `PATH`, which in Termux is already the right kind; if
-  there is none it falls back to a `bun-android` beside the launcher, which you
-  supply yourself.
+Licensed **GPL-2.0-or-later**, inherited as a derivative work of PRoot.
+[NOTICE.md](./NOTICE.md) records what it was ported from and how to read the
+`src/...` citations in the comments; [COPYING](./COPYING) is the licence.
+
+## Quick start
+
+bunproot needs a Bun built for Android/bionic, and how you get one depends on
+where you are.
+
+### Route 1: Termux, from the TUR repository
+
+Termux packages Bun in [TUR](https://github.com/termux-user-repository/tur),
+which is the shortest path — `bunx` comes with it:
+
+```sh
+pkg install tur-repo
+pkg install bun
+bunx bunproot --help
+```
+
+### Route 2: an app built with minapk
+
+An app built with [minapk](https://github.com/jjtseng93/minapk) has no npm and
+no npx, so the Bun that runs bunproot has to be the one the APK was built with.
+Two of them work today:
+
+- the Bun binary from Termux's TUR repository, or
+- the official Bun binary run under the `LD_PRELOAD` shim minapk supplies
+  ([oven-sh/bun#39060](https://github.com/oven-sh/bun/issues/39060)).
+
+Either gives the app a `bunx` that can install:
+
+```sh
+bunx bunproot --help
+```
+
+A stock official Bun without that shim cannot, because installing on Android
+runs into the platform's seccomp policy
+([oven-sh/bun#39084](https://github.com/oven-sh/bun/pull/39084)). bunproot
+keeps its own entry point at the package root partly for that reason — see the
+comment at the top of `proot.js`. minapk's documentation covers the build side.
+
+### Route 3: an Android shell with npm
+
+Where Node is already present — some terminal apps ship it — Bun installs
+through npm:
+
+```sh
+npm install -g bun
+npx bunproot --help
+```
+
+Every route leaves you with the same `bunproot` command. On platforms other
+than Android, follow the [official Bun installation
+guide](https://bun.com/docs/installation) — though the tracer targets ARM64
+Android and does not yet run anywhere else.
+
+### Route 4: from source
+
+```sh
+git clone <this repository> bunproot
+cd bunproot
+bun proot.js --help          # or: sh proot --help
+```
+
+`proot.js` is the entry npm links as `bunproot`; `proot` is a shell launcher
+for a device with no Bun on `PATH`, which falls back to a `bun-android` binary
+you place beside it.
+
+### Get a rootfs
+
+```sh
+bun tools/download-alpine.mjs      # fetches and checksums an Alpine minirootfs
+mkdir alpine && tar xzf alpine-minirootfs-*.tar.gz -C alpine
+```
+
+Any ARM64 Linux rootfs works; Alpine is simply what this port is tested
+against.
+
+### First run
+
+```sh
+bunproot -S ./alpine /bin/sh -c 'cat /etc/os-release'
+```
+
+## Usage
+
+```text
+bunproot [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]
+```
+
+`ROOTFS` may be relative. It is resolved to an absolute path before the
+bootstrap changes its working directory.
+
+`-b`/`--bind` (`-m`/`--mount`) makes a host path visible inside the guest, and
+may be repeated. `-b HOST` binds it at the same pathname; `-b HOST:GUEST` binds
+it somewhere else. The first colon separates the two halves, and either half
+may be relative to the caller's working directory:
+
+```sh
+bunproot -S ./alpine -b /sdcard -b ./sdk:/opt/sdk /bin/sh
+```
+
+The most specific binding wins, so `-b /opt/sdk:/usr/lib/sdk` covers everything
+below `/usr/lib/sdk` and nothing above it; the rootfs is simply the binding at
+`/`. A binding whose host path does not exist is reported and dropped, as
+upstream does; `PROOT_IGNORE_MISSING_BINDINGS` silences the report but still
+drops it. `/proc`, `/dev` and `/sys` reach the host kernel filesystems without
+needing a binding.
+
+The guest is a real distribution, so its own tools work:
+
+```sh
+bunproot -S ./alpine /bin/sh -c 'apk add npm && npm i -g bun'
+bunproot -S ./alpine /bin/sh -c 'bun x cowsay hello'
+bunproot -S ./alpine /usr/bin/git clone https://github.com/jjtseng93/jsmdcui /tmp/jsmdcui
+```
+
+[TESTING.md](./TESTING.md) collects these as the regression checks, with what
+each one tells you when it fails.
+
+## What it needs
+
+- An Android device where `ptrace` is permitted for app processes. That is the
+  normal case; a hardened or work-profile environment may not allow it.
+- Android's 64-bit linker at `/system/bin/linker64`, and bionic under
+  `/apex/com.android.runtime/lib64/bionic`.
+- A Bun built for Android/bionic, not a glibc one. `bunproot` uses whatever
+  `bun` is on `PATH`, which every route above provides; the `proot` shell
+  launcher additionally falls back to a `bun-android` beside it.
 - An ARM64 Linux rootfs containing the guest ELF and its `PT_INTERP`.
-  `tools/download-alpine.mjs` fetches one.
 
 Native library paths are defined once in `dlpath.json`. JavaScript modules open
 those Android libraries through `ffi.js`; guest libraries under `ROOTFS/usr`
@@ -35,78 +163,9 @@ Environment handling is defined once in `env.js`: the tracer's own knobs, the
 environment the Android bootstrap is started with, and the environment a guest
 inherits. Other modules import from it rather than reading `process.env`.
 
-## Usage
-
-Add this directory to `PATH` so the `proot` launcher invokes the Bun port:
-
-```sh
-cd /path/to/bunproot
-PATH="$PWD:$PATH" LD_PRELOAD= proot [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]
-```
-
-`ROOTFS` may be relative. It is resolved to an absolute path before the
-bootstrap changes its working directory.
-
-`-b`/`--bind` (`-m`/`--mount`) makes a host path visible inside the guest, and
-may be repeated. `-b HOST` binds it at the same pathname; `-b HOST:GUEST` binds
-it somewhere else. The first colon separates the two halves, and either half
-may be relative to the caller's working directory:
-
-```sh
-proot -S "$ROOTFS" -b /sdcard -b ./sdk:/opt/sdk /bin/sh
-```
-
-The most specific binding wins, so `-b /opt/sdk:/usr/lib/sdk` covers everything
-below `/usr/lib/sdk` and nothing above it; the rootfs is simply the binding at
-`/`. A binding whose host path does not exist is reported and dropped, as
-upstream does; `PROOT_IGNORE_MISSING_BINDINGS` silences the report but still
-drops it. `/proc`, `/dev` and `/sys` reach the host kernel filesystems without
-needing a binding.
-
-For the Termux `proot-distro` Debian rootfs used during development:
-
-```sh
-ROOTFS=/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs
-PATH="$PWD:$PATH" LD_PRELOAD= proot -S "$ROOTFS" /bin/ls /
-PATH="$PWD:$PATH" LD_PRELOAD= proot -S "$ROOTFS" /bin/sh -c 'ls /'
-```
-
-Shebang handling and nested guest `execve` can be checked with:
-
-```sh
-PATH="$PWD:$PATH" LD_PRELOAD= proot -S "$ROOTFS" \
-  /usr/bin/bun x --no-install cowsay hello
-```
-
-The same command without `--no-install` additionally covers package resolution,
-installation into a temporary `node_modules`, and re-execution of the guest Bun
-as `node`:
-
-```sh
-sh proot -S ../alpine /bin/sh -c "bun x cowsay hello"
-```
-
-Node, npm and a second Bun installed through npm are covered by:
-
-```sh
-sh proot -S ../alpine /bin/sh -c "apk add npm && npm i bun@1.3.14"
-sh proot -S ../alpine /bin/sh -c "./node_modules/.bin/bun --version"
-```
-
-Git over HTTPS is covered by the Alpine integration test:
-
-```sh
-sh proot -S ../alpine /usr/bin/git clone \
-  https://github.com/jjtseng93/jsmdcui /tmp/jsmdcui
-```
-
-The launcher effectively runs:
-
-```sh
-bun --no-orphans ./index.js "$@"
-```
-
-`--no-orphans` covers Bun-owned subprocesses. The tracer also enables
+Each original `src/**/*.c` or `src/**/*.h` has a corresponding `**/*.c.js` or
+`**/*.h.js` here. The launcher effectively runs `bun --no-orphans ./index.js`;
+`--no-orphans` covers Bun-owned subprocesses, and the tracer also enables
 `PTRACE_O_EXITKILL`, which kills tracees if the tracer exits unexpectedly.
 
 ## Debugging
@@ -135,8 +194,8 @@ the filter is off or is tracing more than it needs to.
 PROOT_BUN_PROFILE=1 proot -S "$ROOTFS" /bin/sh -c 'bunx cowsay hello'
 ```
 
-Tests involving FFI must run in native Termux. Bun inside a glibc PRoot cannot
-safely load Android bionic as a second libc.
+Tests involving FFI must run as a native Android process. Bun inside a glibc
+PRoot cannot safely load Android bionic as a second libc.
 
 ## Testing
 

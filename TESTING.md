@@ -1,12 +1,12 @@
 # Regression checks
 
-What to run before trusting a change to the tracer. Everything here must run in
-native Termux: the port loads Android bionic through FFI, which Bun cannot do
-from inside a glibc PRoot.
+What to run before trusting a change to the tracer. Everything here must run as
+a native Android process — Termux, or any other host with Bun on `PATH`. It
+cannot run inside a glibc PRoot: the port loads Android bionic through FFI, and
+Bun cannot safely take that as a second libc.
 
-`proot` below is this directory's launcher, so run the checks from here as
-`sh proot …`, or put the repository on `PATH` as [README.md](./README.md#usage)
-describes. `ROOTFS` is an ARM64 Linux rootfs; the examples use the Alpine one
+`proot` below is the command: `bunproot` where the package is installed,
+`bun proot.js` or `sh proot` from a source checkout. `ROOTFS` is an ARM64 Linux rootfs; the examples use the Alpine one
 the port is developed against. A few checks want a second, deliberately bare
 rootfs — see [A rootfs with nothing but Bun](#a-rootfs-with-nothing-but-bun).
 
@@ -78,7 +78,7 @@ PROOT_NO_SECCOMP=1 proot -S "$ROOTFS" /bin/sh -c 'echo ok'
 
 ## Pitfalls that cost more time than the bugs
 
-- **`/tmp` is not writable in native Termux.** It is `drwxrwx--x shell shell`;
+- **`/tmp` is not writable on Android.** It is `drwxrwx--x shell shell`;
   `$TMPDIR` is `$PREFIX/tmp`. A test that writes to `/tmp` fails for that
   reason and not for yours.
 

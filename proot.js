@@ -3,9 +3,12 @@
 // npm owns the bin link and the shebang is the only way to say "run this with
 // Bun".
 //
-// It lives at the package root on purpose. `bun install -g` silently skips the
-// bin link for a package whose `bin` target sits in a subdirectory, so a
-// `./cli/proot.js` would install and then not be on PATH.
+// It lives at the package root on purpose. Bin linking on Android runs into
+// Android's seccomp policy, which answers `openat2` with SIGSYS
+// (oven-sh/bun#39084). The containment check that calls it only runs when the
+// `bin` target has a parent directory to check, so `./cli/proot.js` installs
+// and then is not on PATH -- silently, as of Bun 1.4.0 -- while a target at the
+// package root never reaches that code at all.
 //
 // `--no-orphans` is a runtime flag: Bun reads it at startup, so the process
 // cannot turn it on for itself, and a shebang cannot portably carry a second

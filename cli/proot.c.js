@@ -30,7 +30,23 @@ function spawnTracee(argv, env) {
   if (status !== 0) throw new Error(`posix_spawn failed: ${status}`);
   return new DataView(pidBytes.buffer).getInt32(0, true);
 }
-const USAGE = "usage: proot [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]";
+const USAGE = "usage: bunproot [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]";
+
+const HELP = `${USAGE}
+
+  -S, --rootfs ROOTFS      run COMMAND with ROOTFS as its root directory
+  -b, --bind HOST[:GUEST]  make a host path visible inside the guest, at the
+      --mount, -m          same pathname or at GUEST; repeatable
+  -h, --help               show this message
+
+Either half of a binding may be relative to the current directory, and the
+first colon separates them. The most specific binding wins; the rootfs is the
+binding at "/". /proc, /dev and /sys reach the host kernel without one.
+
+PROOT_BUN_VERBOSE=1   trace what the tracer does
+PROOT_BUN_PROFILE=1   report stop counts and where the time went
+PROOT_NO_SECCOMP      stop on every syscall instead of filtering
+PROOT_IGNORE_MISSING_BINDINGS   do not warn about a binding that does not exist`;
 
 export function parseArguments(argv) {
   const bindings = [];
@@ -46,6 +62,7 @@ export function parseArguments(argv) {
       bindings.push(argument.slice(argument.indexOf("=") + 1));
       continue;
     }
+    if (argument === "-h" || argument === "--help") return { help: true };
     if (argument === "-S" || argument === "--rootfs") {
       if (argv[++index] === undefined) throw new Error(`${argument} needs a rootfs\n${USAGE}`);
       // Resolve this before the bootstrap changes cwd to the rootfs. Otherwise
@@ -61,7 +78,10 @@ export function parseArguments(argv) {
   return { rootfs, bindings, command };
 }
 export function run(argv) {
-  const { rootfs, bindings, command } = parseArguments(argv);
+  const parsed = parseArguments(argv);
+  // Only a --help before the command is ours; after it, it belongs to the guest.
+  if (parsed.help) { console.log(HELP); return 0; }
+  const { rootfs, bindings, command } = parsed;
   const mounts = createBindings(rootfs, bindings);
   let guestExecutable=command[0].startsWith("/")
     ? canonicalizeGuestPath(mounts,command[0],{preserveInternalFinal:true})
