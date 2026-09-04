@@ -40,7 +40,7 @@ export function makeGuestPaths(mounts,searchPath,cwd="/") {
 }
 
 // `#!/usr/bin/env NAME` asks for a PATH search, which is the one thing a
-// shebang line cannot express on its own. The kernel satisfies it by execing
+// shebang line cannot express on its own. The kernel satisfies it by executing
 // /usr/bin/env, so a rootfs that ships no coreutils cannot run such a script
 // at all -- even when the interpreter it names is right there on PATH. The
 // search is the whole of env's job here and the tracer can do it directly.

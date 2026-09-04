@@ -45,13 +45,18 @@ a rootfs holding only a Bun binary, its libraries, and a resolver:
 
 ```text
 /bin/bun
-/lib/ld-musl-aarch64.so.1  /lib/libc.musl-aarch64.so.1
-/lib/libstdc++.so.6        /lib/libgcc_s.so.1
+/lib/ld-musl-aarch64.so.1
+/lib/libstdc++.so.6
+/lib/libgcc_s.so.1
 /etc/resolv.conf
 ```
 
-`libgcc_s.so.1` is needed even though `readelf -d` does not list it: it is
-`libstdc++`'s own dependency, not Bun's.
+No symbolic links: name the loader at Bun's `PT_INTERP` path and each library at
+its `SONAME`, and nothing has to be linked. `libgcc_s.so.1` is needed even
+though `readelf -d` does not list it against Bun — it is `libstdc++`'s own
+dependency. `libc.musl-aarch64.so.1` needs no file: musl's loader answers for
+that name itself. `resolv.conf` is one line — `nameserver 1.1.1.1` — and is not
+optional here, since the check below installs a package.
 
 ```sh
 proot -S "$BARE" /bin/bun x bunmsh -c 'echo ok; ls /'

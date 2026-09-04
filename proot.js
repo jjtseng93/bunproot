@@ -42,7 +42,7 @@ if (!process.env.BUN_FEATURE_FLAG_NO_ORPHANS) {
   // inside an npm-installed bun rather than the bun on PATH, and where Bun was
   // started through Android's linker -- `linker64 ./bun-android`, which is how
   // this port runs on a device with no Bun package -- it is the linker itself.
-  // Re-execing that runs a linker with no arguments.
+  // Re-executing that runs a linker with no arguments.
   const bun = Bun.which("bun") || process.argv0;
 
   const child = Bun.spawnSync({

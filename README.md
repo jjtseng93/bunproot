@@ -8,7 +8,8 @@ It runs wherever `bunx` does — Termux, a shell inside an app built with
 [minapk](https://github.com/jjtseng93/minapk)
 ([npm](https://www.npmjs.com/package/@drxiaozhi/minapk)), or any other Android
 environment with Bun on `PATH`. The tracer itself is Bun; the guest is an ARM64
-Linux rootfs you supply.
+Linux rootfs you supply — and that rootfs can be as little as
+[five files](#a-rootfs-can-be-five-files).
 
 **This is early work, and it is not trying to replace Termux's PRoot.** That
 one is mature, complete and considerably faster; if you are in Termux and it
@@ -107,6 +108,55 @@ against.
 ```sh
 bunproot -S ./alpine /bin/sh -c 'cat /etc/os-release'
 ```
+
+## A rootfs can be five files
+
+A distribution is the convenient guest, not the required one. The guest needs
+an ELF the loader can map and whatever that ELF asks for — nothing else. For
+Bun itself that is five files:
+
+```text
+/bin/bun
+/lib/ld-musl-aarch64.so.1     musl's loader, which is also its libc
+/lib/libstdc++.so.6
+/lib/libgcc_s.so.1            libstdc++'s own dependency, which `readelf -d`
+                              does not list against bun
+/etc/resolv.conf              a resolver, without which `bun x` cannot install
+```
+
+`resolv.conf` is just one line, `nameserver 1.1.1.1`. Run this command to
+generate it:
+
+```sh
+echo 'nameserver 1.1.1.1' > bare/etc/resolv.conf
+```
+
+Name each file the way the loader asks for it and no symbolic links are needed:
+the loader at the `PT_INTERP` path (`readelf -l` shows it), each library at its
+`SONAME` rather than its versioned filename — `libstdc++.so.6`, not
+`libstdc++.so.6.0.34`. Copying a distribution's `/lib` verbatim brings its
+symlink farm along, but none of it is load-bearing here. Bun's other
+dependency, `libc.musl-aarch64.so.1`, needs no file of its own: musl's loader
+is musl's libc, and it answers for that name itself.
+
+That is a working guest:
+
+```sh
+bunproot -S ./bare /bin/bun -e 'console.log(process.platform, process.arch)'
+```
+
+There is no shell in it, no coreutils, and no `/usr/bin/env` — a
+`#!/usr/bin/env NAME` script still runs, because the tracer does the `PATH`
+search itself rather than running an `env` that is not there. Give that guest a
+network and `bun x` installs the rest, so a shell with `ls`, `cat` and `curl` is
+one command away:
+
+```sh
+bunproot -S ./bare /bin/bun x bunmsh -c 'echo hi; ls /'
+```
+
+It is not a *small* rootfs — Bun is 70-odd MiB — but it is one you can assemble
+by copying five files, with no distribution to download, unpack or trust.
 
 ## Usage
 
