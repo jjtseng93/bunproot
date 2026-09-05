@@ -634,13 +634,21 @@ export function traceProcess(pid, mounts, guest = null) {
   if (verbose) console.error(`[ptrace] guest sp=0x${guestSp.toString(16)}`);
   let nextScratchSlot=1n;
   const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null,
-    pendingCwd:null, pendingGetcwd:null, cwd:"/", scratch:trampoline+4096n+512n,
+    pendingCwd:null, pendingGetcwd:null, cwd:"/", configured:true, seenStop:true,
+    scratch:trampoline+4096n+512n,
     exe:guest===null?null:guest.guestPath??guestPathOf(mounts,guest.executable) }]]);
   tasks.get(pid).trampoline=trampoline;
   tasks.get(pid).borrowPc=images.interpreter?.entry??images.main.entry;
   let rootExit=1;
   while (tasks.size>0) {
     for (const [taskPid,task] of tasks) {
+      // A new tracee is restartable only once both halves have arrived: the
+      // parent's fork event, which carries the cwd and scratch page it
+      // inherits, and its own first stop. They race, either can be reaped
+      // first, and restarting before the stop fails with ESRCH -- which used
+      // to be read as "the tracee died" and dropped it, leaving a shell's
+      // pipeline hung about one run in ten.
+      if (!task.configured || !task.seenStop) continue;
       if (!task.running) {
         if (call(task.restart??restartRequest,taskPid,0n,task.pendingSignal)<0n) {
           // Match upstream restart_tracee(): a task can die after its last
@@ -656,9 +664,21 @@ export function traceProcess(pid, mounts, guest = null) {
     }
     const result=timed("wait",()=>waitResult(-1)), taskPid=result.pid, status=result.status;
     count("stops");
-    const task=tasks.get(taskPid);
-    if (!task) continue;
+    let task=tasks.get(taskPid);
+    if (!task) {
+      // The new tracee's own stop and its parent's PTRACE_EVENT_FORK race, and
+      // either can be reaped first. Dropping the stop leaves the tracee in
+      // ptrace-stop forever, because nothing else ever restarts it -- an
+      // intermittent hang whenever a shell builds a pipeline. Upstream creates
+      // the tracee on first sight instead (get_tracee(NULL, pid, true),
+      // src/tracee/event.c:417); the parent's event fills in the rest.
+      task={ entering:true, pendingSignal:0n, pendingExec:null, pendingCwd:null,
+        pendingGetcwd:null, cwd:"/", exe:null, running:false, configured:false, seenStop:false };
+      tasks.set(taskPid,task);
+      if (verbose) console.error(`[ptrace] tracee ${taskPid} stopped before its parent's fork event`);
+    }
     task.running=false;
+    task.seenStop=true;
     if ((status&0x7f)===0) {
       if (taskPid===pid) rootExit=(status>>8)&0xff;
       tasks.delete(taskPid); continue;
@@ -669,14 +689,19 @@ export function traceProcess(pid, mounts, guest = null) {
     if (signal!==0x85 && !seccompStop) {
       if (signal===5 && event>=1 && event<=3) {
         const child=eventMessage(taskPid);
-        tasks.set(child,{ entering:true, pendingSignal:0n, pendingExec:null,
-          pendingCwd:null, pendingGetcwd:null, cwd:task.cwd, exe:task.exe,
-          // At EVENT_CLONE/FORK the new tracee is stopped.  Some kernels also
-          // report a separate SIGSTOP and some coalesce it with this event;
-          // resume now and consume a later SIGSTOP if one is delivered.
-          trampoline:task.trampoline,
-          borrowPc:task.borrowPc,
-          scratch:task.trampoline+(++nextScratchSlot)*4096n+512n, running:false });
+        // This event does not mean the child has stopped yet, only that it
+        // exists. Its own stop is reported separately and may be reaped either
+        // side of this one, so record what it inherits and let the restart
+        // loop wait for the stop.
+        const inherited={ pendingExec:null, pendingCwd:null, pendingGetcwd:null,
+          cwd:task.cwd, exe:task.exe, trampoline:task.trampoline, borrowPc:task.borrowPc,
+          scratch:task.trampoline+(++nextScratchSlot)*4096n+512n, configured:true };
+        // The child may already be tracked, having stopped before this event
+        // arrived; then it is only missing what it could not know, and its own
+        // run state is the accurate one.
+        const existing=tasks.get(child);
+        if (existing) Object.assign(existing,inherited);
+        else tasks.set(child,{ entering:true, pendingSignal:0n, running:false, seenStop:false, ...inherited });
         if (verbose) console.error(`[ptrace] new tracee pid=${child} event=${event}`);
         continue;
       }
