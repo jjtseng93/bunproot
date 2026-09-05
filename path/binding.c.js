@@ -7,7 +7,7 @@
 
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { ignoreMissingBindings } from "../env.js";
+import { ignoreMissingBindings, verbose } from "../env.js";
 
 // "/proc/self/..." stays literal: "self" is resolved by the kernel at syscall
 // time against the calling tracee, so resolving it here would pin the binding
@@ -51,12 +51,24 @@ export function createBindings(rootfs, specifications = []) {
       console.error(`bunproot: can't sanitize binding "${binding.host}": no such file or directory`);
     return false;
   });
-  const entries = [{ host: resolveHost(rootfs), guest: "/" }, ...requested];
+  const root = { host: resolveHost(rootfs), guest: "/" };
+  // Two bindings on the same guest pathname: the last one is the active one,
+  // and upstream says so before dropping the other
+  // (src/path/binding.c:insort_binding, case PATHS_ARE_EQUAL).
+  const active = new Map();
+  for (const entry of [root, ...requested]) {
+    const replaced = active.get(entry.guest);
+    if (replaced && verbose && !ignoreMissingBindings)
+      console.error(`bunproot: both "${replaced.host}" and "${entry.host}" are bound to `+
+        `"${entry.guest}", only the last binding is active`);
+    active.set(entry.guest, entry);
+  }
+  const entries = [...active.values()];
   const byGuest = [...entries].sort((a, b) => b.guest.length - a.guest.length);
   const byHost = [...entries].sort((a, b) => b.host.length - a.host.length);
 
   return {
-    rootfs: entries[0].host,
+    rootfs: root.host,
     entries,
 
     /** Where a guest pathname lives on the host. Always answers: the rootfs

@@ -9,6 +9,7 @@ import { createBindings } from "../path/binding.c.js";
 import { traceProcess } from "../ptrace/ptrace.c.js";
 import { bootstrapEnvironment, guestEnvironment } from "../env.js";
 import pkg from "../package.json" with { type: "json" };
+import { parseDnsMode, resolverBindings } from "../dns.js";
 
 const { posix_spawn } = openLibrary("libc", {
   posix_spawn: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
@@ -44,6 +45,9 @@ const HELP = `${USAGE}
                            same pathname or at GUEST; repeatable
   -m, --mount              another name for --bind, not a different thing
   -h, --help               show this message
+      --dns MODE           expands in place into the --bind for a resolver:
+                           auto (default) only where the rootfs has none,
+                           simple always, off never; no and false mean off
   -V, --version            show the version and exit
       --download-alpine    fetch and checksum an Alpine minirootfs into the
                            current directory, then exit
@@ -58,8 +62,10 @@ PROOT_NO_SECCOMP      stop on every syscall instead of filtering
 PROOT_IGNORE_MISSING_BINDINGS   do not warn about a binding that does not exist`;
 
 export function parseArguments(argv) {
+  // A binding is a specification string; --dns contributes a token expanded
+  // once the rootfs is known, in the place it was written.
   const bindings = [];
-  let rootfs = null, index = 0;
+  let rootfs = null, sawDns = false, index = 0;
   for (; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === "-b" || argument === "--bind" || argument === "-m" || argument === "--mount") {
@@ -69,6 +75,15 @@ export function parseArguments(argv) {
     }
     if (argument.startsWith("--bind=") || argument.startsWith("--mount=")) {
       bindings.push(argument.slice(argument.indexOf("=") + 1));
+      continue;
+    }
+    if (argument === "--dns") {
+      if (argv[++index] === undefined) throw new Error(`--dns needs a mode\n${USAGE}\n${TRY_HELP}`);
+      bindings.push({ dns: parseDnsMode(argv[index]) }); sawDns = true;
+      continue;
+    }
+    if (argument.startsWith("--dns=")) {
+      bindings.push({ dns: parseDnsMode(argument.slice(6)) }); sawDns = true;
       continue;
     }
     if (argument === "-h" || argument === "--help") return { help: true };
@@ -85,6 +100,9 @@ export function parseArguments(argv) {
   }
   const command = argv.slice(index);
   if (rootfs === null || command.length === 0) throw new Error(`${USAGE}\n${TRY_HELP}`);
+  // The default sits ahead of everything the caller wrote, so any binding of
+  // theirs on the same pathname is the later one and wins.
+  if (!sawDns) bindings.unshift({ dns: "auto" });
   return { rootfs, bindings, command };
 }
 export function run(argv) {
@@ -93,7 +111,8 @@ export function run(argv) {
   if (parsed.help) { console.log(HELP); return 0; }
   if (parsed.version) { console.log(`${pkg.name} ${pkg.version}`); return 0; }
   const { rootfs, bindings, command } = parsed;
-  const mounts = createBindings(rootfs, bindings);
+  const mounts = createBindings(rootfs, bindings.flatMap((entry) =>
+    typeof entry === "string" ? [entry] : resolverBindings(rootfs, entry.dns)));
   let guestExecutable=command[0].startsWith("/")
     ? canonicalizeGuestPath(mounts,command[0],{preserveInternalFinal:true})
     : command[0];
