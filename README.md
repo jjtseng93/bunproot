@@ -258,16 +258,18 @@ each one tells you when it fails.
 
 - An Android device where `ptrace` is permitted for app processes. That is the
   normal case; a hardened or work-profile environment may not allow it.
-- Android's 64-bit linker at `/system/bin/linker64`, and bionic under
-  `/apex/com.android.runtime/lib64/bionic`.
+- Android's 64-bit linker at `/system/bin/linker64`, and bionic — found in the
+  Runtime APEX on Android 10 and later, in `/system/lib64` before that.
 - A Bun built for Android/bionic, not a glibc one. `bunproot` uses whatever
   `bun` is on `PATH`, which every route above provides; the `proot` shell
   launcher additionally falls back to a `bun-android` beside it.
 - An ARM64 Linux rootfs containing the guest ELF and its `PT_INTERP`.
 
-Native library paths are defined once in `dlpath.json`. JavaScript modules open
-those Android libraries through `ffi.js`; guest libraries under `ROOTFS/usr`
-are never used as the tracer's libc.
+Native library paths are resolved once in `dlpath.js`, which searches the
+Runtime APEX and then `/system/lib64` so one order covers every Android release
+without asking the platform its version. JavaScript modules open those Android
+libraries through `ffi.js`; guest libraries under `ROOTFS/usr` are never used as
+the tracer's libc.
 
 Guest syscalls are filtered with seccomp so the tracer only stops for the ones
 it translates; `syscall/seccomp.c.js` builds the filter and `PORTING.md`

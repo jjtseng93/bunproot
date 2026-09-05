@@ -445,6 +445,11 @@ function startGuest(pid, trampoline, images, guest) {
 // this architecture, and musl sets it on every open, so reading it as
 // O_NOFOLLOW suppressed final-symlink dereferencing for every guest open.
 const O_NOFOLLOW = 0x8000n;
+// The group upstream translates as SYMLINK when this bit is set: fchownat,
+// newfstatat, utimensat and name_to_handle_at (src/syscall/enter.c:2645).
+// fchmodat, faccessat and mknodat are not in it -- the kernel does not honour
+// the flag for them -- so they stay REGULAR here too.
+const AT_SYMLINK_NOFOLLOW = 0x100n;
 
 // Linux arm64 syscall -> pathname registers. Symlink targets are intentionally
 // not translated; only the directory entry being created is a host pathname.
@@ -453,13 +458,14 @@ const PATH_ARGUMENTS = new Map([
   [36,[{path:2,dirfd:1,deref:false,preserveL2s:true}]], [37,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]],
   [38,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]], [43,[{path:0}]], [45,[{path:0}]],
   [48,[{path:1,dirfd:0}]], [49,[{path:0}]], [51,[{path:0}]],
-  [53,[{path:1,dirfd:0}]], [54,[{path:1,dirfd:0}]],
+  [53,[{path:1,dirfd:0}]], [54,[{path:1,dirfd:0,nofollow:{arg:4,mask:AT_SYMLINK_NOFOLLOW}}]],
   [56,[{path:1,dirfd:0,nofollow:{arg:2,mask:O_NOFOLLOW}}]],
   [78,[{path:1,dirfd:0,deref:false}]],
-  [79,[{path:1,dirfd:0,nofollow:{arg:3,mask:0x100n}}]], [88,[{path:1,dirfd:0}]],
+  [79,[{path:1,dirfd:0,nofollow:{arg:3,mask:AT_SYMLINK_NOFOLLOW}}]],
+  [88,[{path:1,dirfd:0,nofollow:{arg:3,mask:AT_SYMLINK_NOFOLLOW}}]],
   [89,[{path:0}]], [276,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]],
   [281,[{path:1,dirfd:0}]],
-  [291,[{path:1,dirfd:0,nofollow:{arg:2,mask:0x100n}}]],
+  [291,[{path:1,dirfd:0,nofollow:{arg:2,mask:AT_SYMLINK_NOFOLLOW}}]],
   [437,[{path:1,dirfd:0}]], [439,[{path:1,dirfd:0}]],
 ]);
 
@@ -828,8 +834,10 @@ const exited=registers(), result=exitResult(phase,exited);
           }
         }
         if (finalResult<0n && verbose)
-          console.error(`[ptrace] pid=${taskPid} syscall=${task.pendingPathSyscall} result=${finalResult}`);
+          console.error(`[ptrace] pid=${taskPid} syscall=${task.pendingPathSyscall} result=${finalResult}`+
+            (task.pendingPaths?.length?` paths=${task.pendingPaths.join(" -> ")}`:""));
         task.pendingPathSyscall=undefined;
+        task.pendingPaths=undefined;
         task.pendingLinkPaths=undefined;
         task.pendingLinkGuestPaths=undefined;
         task.pendingL2sUnlink=undefined;
@@ -1075,6 +1083,9 @@ const exited=registers(), result=exitResult(phase,exited);
       writeCString(memory,taskPid,scratch,host); setX(state.regs,spec.path,scratch);
       scratch+=BigInt((new TextEncoder().encode(host).length+8)&~7); changed=true;
     }
+    // Kept for the failure line below: a path syscall that returns an error is
+    // only diagnosable next to the pathname it was given.
+    task.pendingPaths=guestPaths;
     if (syscall===37) { task.pendingLinkPaths=hostPaths; task.pendingLinkGuestPaths=guestPaths; }
     if (syscall===35 && hostPaths.length===1)
       task.pendingL2sUnlink=inspectEmulatedAlias(mounts.rootfs,hostPaths[0]);

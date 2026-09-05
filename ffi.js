@@ -1,5 +1,5 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
-import dlpath from "./dlpath.json" with { type: "json" };
+import dlpath, { LIBRARY_DIRECTORIES, libraryFile } from "./dlpath.js";
 
 const definitions = {
   libc: {
@@ -12,7 +12,11 @@ const handles = new Map();
 
 export function openLibrary(name, symbols = definitions[name]) {
   const path = dlpath[name];
-  if (!path) throw new Error(`Unknown shared library: ${name}`);
+  if (path === undefined) throw new Error(`Unknown shared library: ${name}`);
+  // Not a dlopen failure: the file is not on this device at all. Say where it
+  // was looked for, since the answer is an Android release, not a broken port.
+  if (path === null) throw new Error(
+    `${libraryFile(name)} not found in ${LIBRARY_DIRECTORIES.join(" or ")}`);
   if (!symbols) throw new Error(`No FFI symbol definition for: ${name}`);
   const cacheKey = `${name}:${Object.keys(symbols).join(",")}`;
   if (!handles.has(cacheKey)) handles.set(cacheKey, dlopen(path, symbols));

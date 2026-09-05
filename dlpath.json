@@ -1,5 +1,0 @@
-{
-  "libc": "/apex/com.android.runtime/lib64/bionic/libc.so",
-  "libdl": "/apex/com.android.runtime/lib64/bionic/libdl.so",
-  "libm": "/apex/com.android.runtime/lib64/bionic/libm.so"
-}
