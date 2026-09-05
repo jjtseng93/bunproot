@@ -10,29 +10,38 @@ test("legacy argument translation and -S parsing remain deterministic", () => {
   expect(translatePath("/")).toBe("/etc");
   expect(translatePath("/tmp")).toBe("/tmp");
   expect(parseArguments(["-S", "/rootfs/", "/bin/ls", "/"])).toEqual({
-    rootfs: "/rootfs", bindings: [{ dns: "auto" }], command: ["/bin/ls", "/"],
+    rootfs: "/rootfs", bindings: [{ dns: "auto" }], command: ["/bin/ls", "/"], killOnExit: false,
   });
   expect(parseArguments(["-S", "../alpine", "/bin/sh"])).toEqual({
-    rootfs: resolve("../alpine"), bindings: [{ dns: "auto" }], command: ["/bin/sh"],
+    rootfs: resolve("../alpine"), bindings: [{ dns: "auto" }], command: ["/bin/sh"], killOnExit: false,
   });
 });
 
 test("bindings are collected in order and never eat the command", () => {
   expect(parseArguments(["-b", "/data", "-S", "/rootfs", "/bin/sh"])).toEqual({
-    rootfs: "/rootfs", bindings: [{ dns: "auto" }, "/data"], command: ["/bin/sh"],
+    rootfs: "/rootfs", bindings: [{ dns: "auto" }, "/data"], command: ["/bin/sh"], killOnExit: false,
   });
   expect(parseArguments(["-S", "/rootfs", "-b", "/a:/x", "--bind=/b:/y", "/bin/sh", "-c", "-b"])).toEqual({
-    rootfs: "/rootfs", bindings: [{ dns: "auto" }, "/a:/x", "/b:/y"], command: ["/bin/sh", "-c", "-b"],
+    rootfs: "/rootfs", bindings: [{ dns: "auto" }, "/a:/x", "/b:/y"], command: ["/bin/sh", "-c", "-b"], killOnExit: false,
   });
   // -h/--help before the command is ours; after it, it belongs to the guest.
   expect(parseArguments(["--help"])).toEqual({ help: true });
   expect(parseArguments(["-S", "/rootfs", "-h"])).toEqual({ help: true });
   expect(parseArguments(["-S", "/rootfs", "/bin/sh", "--help"])).toEqual({
-    rootfs: "/rootfs", bindings: [{ dns: "auto" }], command: ["/bin/sh", "--help"],
+    rootfs: "/rootfs", bindings: [{ dns: "auto" }], command: ["/bin/sh", "--help"], killOnExit: false,
   });
   expect(() => parseArguments(["-S", "/rootfs"])).toThrow();
   expect(() => parseArguments(["-b", "/data", "/bin/sh"])).toThrow();
   expect(() => parseArguments(["-S", "/rootfs", "-b"])).toThrow();
+});
+
+test("--kill-on-exit is a tracer option and never reaches the guest", () => {
+  expect(parseArguments(["--kill-on-exit", "-S", "/r", "/bin/sh", "-c", "exit"]))
+    .toMatchObject({ killOnExit: true, command: ["/bin/sh", "-c", "exit"] });
+  expect(parseArguments(["-koe", "-S", "/r", "/bin/sh"]))
+    .toMatchObject({ killOnExit: true, command: ["/bin/sh"] });
+  expect(parseArguments(["-S", "/r", "/bin/sh", "--kill-on-exit"]))
+    .toMatchObject({ killOnExit: false, command: ["/bin/sh", "--kill-on-exit"] });
 });
 
 test("a bare binding keeps its pathname, a pair maps one to the other", () => {

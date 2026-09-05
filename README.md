@@ -221,7 +221,7 @@ by copying five files, with no distribution to download, unpack or trust.
 ## Usage
 
 ```text
-bunproot [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]
+bunproot [-koe|--kill-on-exit] [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]
 ```
 
 `ROOTFS` may be relative. It is resolved to an absolute path before the
@@ -242,6 +242,18 @@ below `/usr/lib/sdk` and nothing above it; the rootfs is simply the binding at
 upstream does; `PROOT_IGNORE_MISSING_BINDINGS` silences the report but still
 drops it. `/proc`, `/dev` and `/sys` reach the host kernel filesystems without
 needing a binding.
+
+Like upstream PRoot, bunproot normally waits for every descendant of `COMMAND`
+to exit. A browser or daemon may leave detached processes behind after an
+interactive shell exits; use `-koe`/`--kill-on-exit` when leaving that shell
+should terminate the whole guest session immediately:
+
+```sh
+bunproot -koe -S ./alpine /bin/sh
+```
+
+The option belongs before `COMMAND`. A `--kill-on-exit` after `COMMAND` is an
+argument to the guest program instead.
 
 The guest is a real distribution, so its own tools work:
 

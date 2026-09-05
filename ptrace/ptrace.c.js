@@ -634,7 +634,7 @@ function resolveProcLink(taskPid,tasks,guestPath) {
   return known.exe??null;
 }
 
-export function traceProcess(pid, mounts, guest = null) {
+export function traceProcess(pid, mounts, guest = null, { killOnExit = false } = {}) {
   const started=performance.now();
   const initial = wait(pid, 2); // WUNTRACED: observe the pre-exec SIGSTOP.
   if ((initial & 0xff) !== 0x7f) throw new Error("tracee did not stop before exec");
@@ -675,7 +675,7 @@ export function traceProcess(pid, mounts, guest = null) {
     tasks.delete(taskPid);
   };
   let rootExit=1;
-  while (tasks.size>0) {
+  traceLoop: while (tasks.size>0) {
     for (const [taskPid,task] of tasks) {
       // A new tracee is restartable only once both halves have arrived: the
       // parent's fork event, which carries the cwd and scratch page it
@@ -716,11 +716,23 @@ export function traceProcess(pid, mounts, guest = null) {
     task.seenStop=true;
     if ((status&0x7f)===0) {
       if (verbose) console.error(`[ptrace] tracee ${taskPid} exited status=${(status>>8)&0xff}`);
-      if (taskPid===pid) rootExit=(status>>8)&0xff;
+      if (taskPid===pid && killOnExit) {
+        rootExit=(status>>8)&0xff;
+        if (verbose && tasks.size>1)
+          console.error(`[ptrace] root tracee exited; tracer exit will kill ${tasks.size-1} remaining task(s)`);
+        break traceLoop;
+      }
       deleteTask(taskPid); continue;
     }
     if ((status&0x7f)!==0x7f) {
-      if (verbose) console.error(`[ptrace] tracee ${taskPid} terminated signal=${status&0x7f}`);
+      const terminatingSignal=status&0x7f;
+      if (verbose) console.error(`[ptrace] tracee ${taskPid} terminated signal=${terminatingSignal}`);
+      if (taskPid===pid && killOnExit) {
+        rootExit=128+terminatingSignal;
+        if (verbose && tasks.size>1)
+          console.error(`[ptrace] root tracee terminated; tracer exit will kill ${tasks.size-1} remaining task(s)`);
+        break traceLoop;
+      }
       deleteTask(taskPid); continue;
     }
     const signal=(status>>8)&0xff, event=status>>>16;

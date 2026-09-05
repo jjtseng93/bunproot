@@ -38,6 +38,7 @@ Each line names what breaks when it fails, so a red one points somewhere.
 | `proot -S "$ROOTFS" -b /some/dir:/mnt /bin/sh -c 'cat /mnt/f; cd /mnt && pwd'` | Bindings in both directions, including `getcwd` detranslation |
 | `proot -S "$ROOTFS" /bin/sh -c 'readlink /proc/self/exe; cat /proc/$$/comm; :'` | The state a mapped-in image cannot inherit from `execve`. The trailing `:` matters: without it the shell execs itself away into the last command, and `$$` names that command instead |
 | `proot -S "$ROOTFS" /usr/bin/python3 -c 'import os; f=os.memfd_create("p", 11); print(os.open(f"/proc/self/fd/{f}", os.O_RDONLY))'` | Reopening an existing descriptor on Android. `/proc/self/fd/N` must be substituted with `dup(N)` rather than passed to the kernel, which rejects it with `EACCES` under ptrace |
+| `proot -koe -S "$ROOTFS" /bin/sh -c 'sleep 300 &'` | `-koe`/`--kill-on-exit` detached-child cleanup. It must return immediately with status 0; without the option, waiting for the background child is upstream-compatible behaviour |
 
 ## Firefox on Termux:X11
 

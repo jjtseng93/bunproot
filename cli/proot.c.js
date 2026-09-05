@@ -32,7 +32,7 @@ function spawnTracee(argv, env) {
   if (status !== 0) throw new Error(`posix_spawn failed: ${status}`);
   return new DataView(pidBytes.buffer).getInt32(0, true);
 }
-const USAGE = "usage: bunproot [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]";
+const USAGE = "usage: bunproot [-koe|--kill-on-exit] [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]";
 // Nothing about the usage line says where the rest is, and the rest includes
 // the debug environment variables, so every way of getting the invocation
 // wrong ends by naming --help.
@@ -40,17 +40,29 @@ const TRY_HELP = "try `bunproot --help` for the options and the debug environmen
 
 const HELP = `${USAGE}
 
-  -S, --rootfs ROOTFS      run COMMAND with ROOTFS as its root directory
-  -b, --bind HOST[:GUEST]  make a host path visible inside the guest, at the
-                           same pathname or at GUEST; repeatable
-  -m, --mount              another name for --bind, not a different thing
-  -h, --help               show this message
-      --dns MODE           expands in place into the --bind for a resolver:
-                           auto (default) only where the rootfs has none,
-                           simple always, off never; no and false mean off
-  -V, --version            show the version and exit
-      --download-alpine    fetch and checksum an Alpine minirootfs into the
-                           current directory, then exit
+  -S, --rootfs ROOTFS
+      run COMMAND with ROOTFS as its root directory
+
+  -b, --bind HOST[:GUEST]
+      bind HOST at GUEST, or at the same path; repeatable
+
+  -m, --mount
+      another name for --bind, not a different thing
+
+  --dns MODE
+      resolver binding: auto (default), simple, or off
+
+  -koe, --kill-on-exit
+      kill all remaining guest processes when COMMAND exits
+
+  --download-alpine
+      download and verify an Alpine minirootfs, then exit
+
+  -h, --help
+      show this message
+
+  -V, --version
+      show the version and exit
 
 Either half of a binding may be relative to the current directory, and the
 first colon separates them. The most specific binding wins; the rootfs is the
@@ -65,7 +77,7 @@ export function parseArguments(argv) {
   // A binding is a specification string; --dns contributes a token expanded
   // once the rootfs is known, in the place it was written.
   const bindings = [];
-  let rootfs = null, sawDns = false, index = 0;
+  let rootfs = null, sawDns = false, killOnExit = false, index = 0;
   for (; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === "-b" || argument === "--bind" || argument === "-m" || argument === "--mount") {
@@ -88,6 +100,7 @@ export function parseArguments(argv) {
     }
     if (argument === "-h" || argument === "--help") return { help: true };
     if (argument === "-V" || argument === "--version") return { version: true };
+    if (argument === "-koe" || argument === "--kill-on-exit") { killOnExit = true; continue; }
     if (argument === "-S" || argument === "--rootfs") {
       if (argv[++index] === undefined) throw new Error(`${argument} needs a rootfs\n${USAGE}\n${TRY_HELP}`);
       // Resolve this before the bootstrap changes cwd to the rootfs. Otherwise
@@ -103,14 +116,14 @@ export function parseArguments(argv) {
   // The default sits ahead of everything the caller wrote, so any binding of
   // theirs on the same pathname is the later one and wins.
   if (!sawDns) bindings.unshift({ dns: "auto" });
-  return { rootfs, bindings, command };
+  return { rootfs, bindings, command, killOnExit };
 }
 export function run(argv) {
   const parsed = parseArguments(argv);
   // Only a --help before the command is ours; after it, it belongs to the guest.
   if (parsed.help) { console.log(HELP); return 0; }
   if (parsed.version) { console.log(`${pkg.name} ${pkg.version}`); return 0; }
-  const { rootfs, bindings, command } = parsed;
+  const { rootfs, bindings, command, killOnExit } = parsed;
   const mounts = createBindings(rootfs, bindings.flatMap((entry) =>
     typeof entry === "string" ? [entry] : resolverBindings(rootfs, entry.dns)));
   let guestExecutable=command[0].startsWith("/")
@@ -143,5 +156,5 @@ export function run(argv) {
   ];
   const pid = spawnTracee(childArgv, bootstrapEnvironment());
   return traceProcess(pid, mounts, { executable, guestPath: guestExecutable,
-    name: basename(command[0]), interpreter, loader, argv: guestArgv });
+    name: basename(command[0]), interpreter, loader, argv: guestArgv }, { killOnExit });
 }
