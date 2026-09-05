@@ -37,6 +37,94 @@ Each line names what breaks when it fails, so a red one points somewhere.
 | `proot -S "$ROOTFS" /bin/sh -c 'npm --version && npm root -g'` | Environment hygiene: the answer must be a guest path, never a host one |
 | `proot -S "$ROOTFS" -b /some/dir:/mnt /bin/sh -c 'cat /mnt/f; cd /mnt && pwd'` | Bindings in both directions, including `getcwd` detranslation |
 | `proot -S "$ROOTFS" /bin/sh -c 'readlink /proc/self/exe; cat /proc/$$/comm; :'` | The state a mapped-in image cannot inherit from `execve`. The trailing `:` matters: without it the shell execs itself away into the last command, and `$$` names that command instead |
+| `proot -S "$ROOTFS" /usr/bin/python3 -c 'import os; f=os.memfd_create("p", 11); print(os.open(f"/proc/self/fd/{f}", os.O_RDONLY))'` | Reopening an existing descriptor on Android. `/proc/self/fd/N` must be substituted with `dup(N)` rather than passed to the kernel, which rejects it with `EACCES` under ptrace |
+
+## Firefox on Termux:X11
+
+With Termux:X11 already listening on TCP display 0, Firefox runs directly:
+
+```sh
+DISPLAY=127.0.0.1:0 proot -S "$ROOTFS" \
+  /usr/lib/firefox/firefox about:blank
+```
+
+No `/dev` binding is needed; `/proc`, `/dev` and `/sys` already reach the host
+kernel filesystems.  Firefox's own content sandbox can remain enabled.
+
+Three tracer behaviours are load-bearing here:
+
+- Firefox creates shared-memory snapshots with `memfd_create`, then reopens
+  them through `/proc/self/fd/N`. Android rejects that procfs open with
+  `EACCES` while the tracee is under ptrace, so fake-id0 substitutes `dup(N)`,
+  matching upstream PRoot. An `O_PATH` descriptor is excluded because `dup`
+  would preserve `O_PATH` instead of applying the requested access mode.
+- Firefox's content sandbox deliberately catches `SIGSYS` and brokers blocked
+  syscalls. A caught SIGSYS must be delivered to the guest handler; only a
+  tracee with the default disposition gets the Android compatibility fallback
+  of `ENOSYS`.
+- Firefox can have more than 255 simultaneously tracked tasks. Scratch slots
+  are returned to a free pool when tasks exit, and their shared region must be
+  large enough for the live set.
+
+The 2026-09-05 check kept Firefox 151 alive for more than 65 seconds with its
+normal sandbox, no SIGSEGV, and no tracer failure. `PROOT_BUN_VERBOSE=1` is
+useful for this check: a clean run has no `signal=11` line.
+
+### Symbolizing a Firefox crash
+
+Alpine provides matching symbols separately. Install them in the same rootfs
+as Firefox; the package version must match the installed browser:
+
+```sh
+proot -S "$ROOTFS" /sbin/apk add firefox-dbg
+```
+
+For Alpine 3.24 the useful file is:
+
+```text
+$ROOTFS/usr/lib/debug/usr/lib/firefox/libxul.so.debug
+```
+
+Confirm that it belongs to the stripped library before trusting a result:
+
+```sh
+file "$ROOTFS/usr/lib/firefox/libxul.so"
+readelf -n "$ROOTFS/usr/lib/firefox/libxul.so" | grep -A1 'Build ID'
+readelf -n "$ROOTFS/usr/lib/debug/usr/lib/firefox/libxul.so.debug" | grep -A1 'Build ID'
+```
+
+`PROOT_BUN_VERBOSE=1` reports a fault as a mapping plus a mapping-relative
+offset, for example `libxul.so +0x1b3f78c`. That number is not always an ELF
+virtual address suitable for `addr2line`. Read the executable `PT_LOAD` first:
+
+```sh
+readelf -l "$ROOTFS/usr/lib/firefox/libxul.so" | sed -n '/LOAD/,+1p'
+```
+
+In the Firefox 151 build used here, the executable mapping started at file
+offset `0x238c000`; its `PT_LOAD` had `p_offset=0x238cd98` and
+`p_vaddr=0x239cd98`, a further `0x10000` virtual-address delta. Therefore the
+reported `+0x1b3f78c` was symbolized at `0x3edb78c`:
+
+```sh
+llvm-addr2line -Cfipe \
+  "$ROOTFS/usr/lib/debug/usr/lib/firefox/libxul.so.debug" \
+  0x3edb78c
+```
+
+That resolved to `WritableSharedMap::WritableSharedMap()`; disassembly and the
+nearby crash-reason string then showed
+`MOZ_RELEASE_ASSERT(mHandle.IsValid() && mMapping.IsValid())`. Mozilla's
+[`SharedMap.cpp`](https://searchfox.org/firefox-main/source/dom/ipc/SharedMap.cpp)
+is the corresponding upstream source. Recalculate the offsets for every build
+rather than copying the Firefox 151 constants above.
+
+The symbols add roughly 514 MiB. Once diagnosis is complete they can be
+removed without removing Firefox:
+
+```sh
+proot -S "$ROOTFS" /sbin/apk del firefox-dbg
+```
 
 ## A rootfs nothing has touched yet
 

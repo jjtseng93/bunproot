@@ -49,6 +49,13 @@ function eventMessage(pid) {
   if (call(0x4201,pid,0n,BigInt(ptr(bytes)))<0n) throw new Error("PTRACE_GETEVENTMSG failed");
   return Number(new DataView(bytes.buffer).getBigUint64(0,true));
 }
+
+function catchesSignal(pid,signal) {
+  try {
+    const match=/^SigCgt:\s+([0-9a-f]+)/mi.exec(readFileSync(`/proc/${pid}/status`,"utf8"));
+    return match!==null && (BigInt(`0x${match[1]}`)&(1n<<BigInt(signal-1)))!==0n;
+  } catch { return false; }
+}
 // PTRACE_GET_SYSCALL_INFO already carries the syscall number, its arguments and
 // its return value, so one call answers what would otherwise cost a
 // PTRACE_GETREGSET as well.  The buffer is reused: a stop is handled to
@@ -92,8 +99,9 @@ function setKernelSyscallNumber(pid,state,number) {
 }
 
 const ARM64_SYSCALL_TRAMPOLINE = 0xd4200000d4000001n; // svc #0; brk #0
+const TRAMPOLINE_REGION_SIZE = 16n*1024n*1024n;
 const SYS_GETPID = 172, SYS_MMAP = 222;
-const SYS_GETCWD = 17, SYS_CHDIR = 49, SYS_FCHDIR = 50, SYS_OPENAT = 56, SYS_CLOSE = 57, SYS_MUNMAP=215;
+const SYS_GETCWD = 17, SYS_DUP = 23, SYS_CHDIR = 49, SYS_FCHDIR = 50, SYS_OPENAT = 56, SYS_CLOSE = 57, SYS_MUNMAP=215;
 const SYS_READLINKAT = 78, SYS_GETDENTS64 = 61;
 const SYS_FCHOWNAT = 54, SYS_FCHOWN = 55;
 const SYS_SIGALTSTACK = 132, SYS_RT_SIGACTION = 134, SYS_PRCTL = 167;
@@ -142,7 +150,7 @@ function remoteSyscallAt(pid, address, syscall, args = []) {
 function allocateRemoteSyscalls(pid,borrowedPc) {
   const requested=0x2000000000n;
   const page=remoteSyscallAt(pid,borrowedPc,SYS_MMAP,
-    [requested,1024n*1024n,7n,0x100022n,-1n,0n]); // FIXED_NOREPLACE|PRIVATE|ANON
+    [requested,TRAMPOLINE_REGION_SIZE,7n,0x100022n,-1n,0n]); // FIXED_NOREPLACE|PRIVATE|ANON
   if (page < 0n) throw new Error(`remote mmap failed: ${page}`);
   if (page!==requested) throw new Error(`remote mmap returned unexpected address 0x${page.toString(16)}`);
   memory.poke(pid, page, ARM64_SYSCALL_TRAMPOLINE);
@@ -157,7 +165,7 @@ function initializeRemoteSyscalls(pid) {
 }
 
 function resetExecAddressSpace(pid,trampoline) {
-  const trampolineEnd=trampoline+1024n*1024n;
+  const trampolineEnd=trampoline+TRAMPOLINE_REGION_SIZE;
   const mappings=readFileSync(`/proc/${pid}/maps`,"utf8").trim().split("\n");
   for (const line of mappings) {
     const match=/^([0-9a-f]+)-([0-9a-f]+)\s/.exec(line);
@@ -654,12 +662,18 @@ export function traceProcess(pid, mounts, guest = null) {
   const guestSp=startGuest(pid,trampoline,images,guest);
   if (verbose) console.error(`[ptrace] guest sp=0x${guestSp.toString(16)}`);
   let nextScratchSlot=1n;
+  const freeScratchSlots=[];
   const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null,
     pendingCwd:null, pendingGetcwd:null, cwd:"/", configured:true, seenStop:true,
-    scratch:trampoline+4096n+512n,
+    scratch:trampoline+4096n+512n, scratchSlot:1n,
     exe:guest===null?null:guest.guestPath??guestPathOf(mounts,guest.executable) }]]);
   tasks.get(pid).trampoline=trampoline;
   tasks.get(pid).borrowPc=images.interpreter?.entry??images.main.entry;
+  const deleteTask=(taskPid)=>{
+    const removed=tasks.get(taskPid);
+    if (removed?.scratchSlot!==undefined) freeScratchSlots.push(removed.scratchSlot);
+    tasks.delete(taskPid);
+  };
   let rootExit=1;
   while (tasks.size>0) {
     for (const [taskPid,task] of tasks) {
@@ -675,7 +689,7 @@ export function traceProcess(pid, mounts, guest = null) {
           // Match upstream restart_tracee(): a task can die after its last
           // wait status but before the tracer restarts it. This is a normal
           // lifecycle race, especially for Git's short-lived helpers.
-          tasks.delete(taskPid);
+          deleteTask(taskPid);
           if (verbose)
             console.error(`[ptrace] tracee ${taskPid} disappeared before restart`);
           continue;
@@ -701,10 +715,14 @@ export function traceProcess(pid, mounts, guest = null) {
     task.running=false;
     task.seenStop=true;
     if ((status&0x7f)===0) {
+      if (verbose) console.error(`[ptrace] tracee ${taskPid} exited status=${(status>>8)&0xff}`);
       if (taskPid===pid) rootExit=(status>>8)&0xff;
-      tasks.delete(taskPid); continue;
+      deleteTask(taskPid); continue;
     }
-    if ((status&0x7f)!==0x7f) { tasks.delete(taskPid); continue; }
+    if ((status&0x7f)!==0x7f) {
+      if (verbose) console.error(`[ptrace] tracee ${taskPid} terminated signal=${status&0x7f}`);
+      deleteTask(taskPid); continue;
+    }
     const signal=(status>>8)&0xff, event=status>>>16;
     const seccompStop=signal===5 && event===PTRACE_EVENT_SECCOMP;
     if (signal!==0x85 && !seccompStop) {
@@ -714,9 +732,11 @@ export function traceProcess(pid, mounts, guest = null) {
         // exists. Its own stop is reported separately and may be reaped either
         // side of this one, so record what it inherits and let the restart
         // loop wait for the stop.
+        const scratchSlot=freeScratchSlots.pop()??++nextScratchSlot;
+        if (scratchSlot*4096n>=TRAMPOLINE_REGION_SIZE) throw new Error("tracee scratch space exhausted");
         const inherited={ pendingExec:null, pendingCwd:null, pendingGetcwd:null,
           cwd:task.cwd, exe:task.exe, trampoline:task.trampoline, borrowPc:task.borrowPc,
-          scratch:task.trampoline+(++nextScratchSlot)*4096n+512n, configured:true };
+          scratch:task.trampoline+scratchSlot*4096n+512n, scratchSlot, configured:true };
         // The child may already be tracked, having stopped before this event
         // arrived; then it is only missing what it could not know, and its own
         // run state is the accurate one.
@@ -733,13 +753,19 @@ export function traceProcess(pid, mounts, guest = null) {
       let stopped;
       try { stopped=getRegisters(taskPid); }
       catch {
-        tasks.delete(taskPid);
+        deleteTask(taskPid);
         if (verbose) console.error(`[ptrace] tracee ${taskPid} died before its signal could be read`);
         continue;
       }
       if (verbose)
         console.error(`[ptrace] pid=${taskPid} signal=${signal} pc=0x${getPc(stopped.regs).toString(16)} syscall=${getSyscallNumber(stopped.regs)}${describeFault(taskPid,signal,getPc(stopped.regs),getX(stopped.regs,30))}`);
-      if (signal===31) { setX(stopped.regs,0,BigInt.asUintN(64,-38n)); putRegisters(taskPid,stopped); continue; }
+      // Android's app seccomp reports blocked syscalls as SIGSYS.  A guest
+      // with the default disposition needs ENOSYS so libc can fall back, but
+      // sandboxes such as Firefox's deliberately install a SIGSYS handler to
+      // broker the syscall.  Let that handler see the signal.
+      if (signal===31 && !catchesSignal(taskPid,signal)) {
+        setX(stopped.regs,0,BigInt.asUintN(64,-38n)); putRegisters(taskPid,stopped); continue;
+      }
       if (signal===19) continue; // consume ptrace/vfork bootstrap SIGSTOP
       task.pendingSignal=BigInt(signal); continue;
     }
@@ -958,7 +984,7 @@ const exited=registers(), result=exitResult(phase,exited);
     const state=registers();
     if (syscall===SYS_MUNMAP) {
       const start=getX(state.regs,0), end=start+getX(state.regs,1);
-      const protectedEnd=task.trampoline+1024n*1024n;
+      const protectedEnd=task.trampoline+TRAMPOLINE_REGION_SIZE;
       if (start<protectedEnd && end>task.trampoline) {
         // The injected loader is process infrastructure, not guest memory.
         // Pretend an overlapping munmap succeeded while keeping it available
@@ -1107,6 +1133,33 @@ const exited=registers(), result=exitResult(phase,exited);
     const arguments_=PATH_ARGUMENTS.get(syscall);
     if (arguments_===undefined) continue;
     task.pendingPathSyscall=syscall;
+    if (syscall===SYS_OPENAT) {
+      const address=getX(state.regs,1);
+      let path=null;
+      if (address>=4096n) { try { path=readCString(memory,taskPid,address); } catch {} }
+      const descriptor=path===null?null:PROC_FD_LINK.exec(posix.normalize(path));
+      const owner=descriptor===null?null:
+        descriptor[1]==="self"||descriptor[1]==="thread-self"?taskPid:Number(descriptor[1]);
+      if (descriptor!==null && owner===taskPid) {
+        const fd=Number(descriptor[2]);
+        let existingFlags=0;
+        try {
+          const match=/^flags:\s+([0-7]+)/m.exec(readFileSync(`/proc/${taskPid}/fdinfo/${fd}`,"utf8"));
+          if (match!==null) existingFlags=parseInt(match[1],8);
+        } catch {}
+        // Reopening a tracee's descriptor through procfs is denied by Android
+        // even for /proc/self/fd/N.  Upstream fake_id0 substitutes dup(N).
+        // An O_PATH descriptor is the exception: dup would preserve O_PATH
+        // instead of applying the access mode requested by openat.
+        if ((existingFlags&0x200000)===0) {
+          task.pendingPaths=[path];
+          setX(state.regs,0,BigInt(fd));
+          setKernelSyscallNumber(taskPid,state,SYS_DUP);
+          if (verbose) console.error(`[ptrace] pid=${taskPid} openat ${path} -> dup(${fd})`);
+          continue;
+        }
+      }
+    }
     let scratch=task.scratch, changed=false, hostPaths=[], guestPaths=[];
     for (const spec of arguments_) {
       const address=getX(state.regs,spec.path);
