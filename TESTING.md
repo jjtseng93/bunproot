@@ -32,11 +32,37 @@ Each line names what breaks when it fails, so a red one points somewhere.
 | `proot -S "$ROOTFS" /usr/bin/git clone -q https://github.com/jjtseng93/jsmdcui "$C"` | HTTPS, git's helper processes, the link2symlink hard-link emulation on pack files |
 | `proot -S "$ROOTFS" /bin/sh -c "mkdir -p $FRESH; cd $FRESH; git init -q . && echo x > a && git add a && git -c user.email=a@b -c user.name=c commit -qm t"` | Loose-object hard links. **`$FRESH` must be a guest path that has never been used** — see the pitfalls below |
 | `proot -S "$ROOTFS" /usr/bin/wget -q -O- https://example.com` | An absolute guest symlink (`/usr/bin/wget -> /bin/busybox`), TLS, and `ssl_client`'s completion path |
-| `proot -S "$ROOTFS" /sbin/apk fix` | Archive extraction and ownership. Must print `OK: … in N packages` with **no** error count |
+| `proot -S "$ROOTFS" /sbin/apk fix` | Archive extraction and ownership. Must print `OK: … in N packages` with **no** error count. It repairs what a first install got wrong, so run [the fresh-rootfs check](#a-rootfs-nothing-has-touched-yet) too |
 | `proot -S "$ROOTFS" /usr/bin/node -e 'require("child_process").execSync("echo hi")'` | SIGCHLD forwarding, which needs the signal dispositions an emulated exec resets |
 | `proot -S "$ROOTFS" /bin/sh -c 'npm --version && npm root -g'` | Environment hygiene: the answer must be a guest path, never a host one |
 | `proot -S "$ROOTFS" -b /some/dir:/mnt /bin/sh -c 'cat /mnt/f; cd /mnt && pwd'` | Bindings in both directions, including `getcwd` detranslation |
 | `proot -S "$ROOTFS" /bin/sh -c 'readlink /proc/self/exe; cat /proc/$$/comm; :'` | The state a mapped-in image cannot inherit from `execve`. The trailing `:` matters: without it the shell execs itself away into the last command, and `$$` names that command instead |
+
+## A rootfs nothing has touched yet
+
+The check above runs against a rootfs that is already populated, and there is a
+class of bug it cannot see. Extract a minirootfs, give it a resolver, and
+install a package that ships symbolic links:
+
+```sh
+mkdir fresh && tar -xzf alpine-minirootfs-*-aarch64.tar.gz -C fresh
+echo 'nameserver 1.1.1.1' > fresh/etc/resolv.conf
+proot -S ./fresh /sbin/apk add git
+```
+
+It must end in `OK: … in N packages` with **no** `failed to preserve` warning
+and no error count. `git` is the package to use because its `git-core`
+directory is a hundred-odd links, but `fish` and `chromium` exercise the same
+thing.
+
+What this catches is a flag the tracer must honour rather than a permission:
+`apk` chowns a symbolic link with `AT_SYMLINK_NOFOLLOW`, and a package extracts
+its links before their targets, so a tracer that dereferences anyway lands on a
+target that does not exist yet and reports `ENOENT` as `failed to preserve …:
+owner`. A rootfs that already has those targets resolves the link fine and
+stays green, which is why this needs a rootfs from the tarball each time.
+`apk fix` afterwards repairs the damage and hides the bug, so a green `apk fix`
+is not a substitute.
 
 ## A rootfs with nothing but Bun
 
