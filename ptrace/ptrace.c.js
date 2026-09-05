@@ -64,6 +64,13 @@ function syscallInfo(pid) {
 }
 const syscallInfoNumber=()=>Number(SYSCALL_INFO_VIEW.getBigUint64(24,true));
 const syscallInfoResult=()=>BigInt.asIntN(64,SYSCALL_INFO_VIEW.getBigInt64(24,true));
+// PTRACE_GET_SYSCALL_INFO is Linux 5.3 and newer. Where it is missing the info
+// block stays zeroed, so its "result" reads as success for every syscall that
+// ever fails -- which silently disables the linkat(2) EACCES fallback and lets
+// the link2symlink bookkeeping commit against calls that did not happen. The
+// register holds the same value on every kernel; the info block is only worth
+// reading because it saves the PTRACE_GETREGSET when the kernel filled it in.
+const exitResult=(phase,state)=>phase===2?syscallInfoResult():BigInt.asIntN(64,getX(state.regs,0));
 function getRegisters(pid) {
   const regs = makeRegisterSet(), iovec = makeIovec(regs);
   if (call(PTRACE_GETREGSET, pid, BigInt(NT_PRSTATUS), BigInt(iovec.pointer)) < 0n) throw new Error("PTRACE_GETREGSET failed");
@@ -714,7 +721,7 @@ export function traceProcess(pid, mounts, guest = null) {
         // skip every emulated file.
         const { fd,buffer,size }=task.pendingGetdents;
         task.pendingGetdents=undefined;
-const exited=registers(), result=syscallInfoResult();
+const exited=registers(), result=exitResult(phase,exited);
         let directory=null;
         if (result>0n) { try { directory=readlinkSync(`/proc/${taskPid}/fd/${fd}`); } catch {} }
         if (directory!==null && mounts.toGuest(directory)!==null) {
@@ -774,7 +781,7 @@ const exited=registers(), result=syscallInfoResult();
         }
       }
       if (task.pendingPathSyscall!==undefined) {
-const exited=registers(), result=syscallInfoResult();
+const exited=registers(), result=exitResult(phase,exited);
         let finalResult=result;
         if (task.pendingOpenAlias!==undefined) {
           if (result>=0n) openedAliases.set(`${taskPid}:${result}`,task.pendingOpenAlias);
@@ -830,7 +837,7 @@ const exited=registers(), result=syscallInfoResult();
         task.pendingL2sDirectoryRename=undefined;
       }
       if (task.pendingCwd!==null || task.pendingGetcwd!==null) {
-const exited=registers(), result=syscallInfoResult();
+const exited=registers(), result=exitResult(phase,exited);
         if (task.pendingCwd!==null) {
           if (result===0n) task.cwd=task.pendingCwd;
           task.pendingCwd=null;
