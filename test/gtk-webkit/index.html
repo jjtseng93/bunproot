@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bunproot GTK/WebKit test</title>
+  <style>
+    html { font-size: 150%; }
+    textarea, button, input, select { font-size: 1em; }
+  </style>
+</head>
+<body style="background-color: #62e6f0">
+  <script>
+    const arg = decodeURIComponent(location.search.slice(5));
+    if (arg.startsWith("http")) location.href = arg;
+  </script>
+  <p>Hello! 我愛 KDE Plasma Desktop</p>
+  <p><textarea id="jstest" style="width: 90vw; height: 40vh">alert(arg);</textarea></p>
+  <button onclick="eval(jstest.value)">Run 執行</button>
+</body>
+</html>

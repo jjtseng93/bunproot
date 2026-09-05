@@ -107,6 +107,66 @@ still works too, since a kernel may refuse the filter:
 PROOT_NO_SECCOMP=1 proot -S "$ROOTFS" /bin/sh -c 'echo ok'
 ```
 
+## GTK3/WebKit and glycin on Android
+
+Recent Alpine `gdk-pixbuf` uses glycin to decode images.  Glycin normally
+starts each loader through bubblewrap with a user namespace and seccomp
+sandbox.  Android app processes cannot create that user namespace.  PRoot can
+make the capability probe appear successful by removing namespace flags, but
+the real loader then fails or hangs when the first PNG is requested.  GTK may
+report this later as an assertion in `gtkiconhelper.c`.
+
+For a rootfs used only in a trusted test environment, install the included
+pass-through wrapper:
+
+```sh
+cp test/gtk-webkit/bwrap-passthrough.sh "$ROOTFS/usr/bin/bwrap"
+chmod 755 "$ROOTFS/usr/bin/bwrap"
+```
+
+The same directory contains the minimal browser and a native-Termux launcher;
+see [`test/gtk-webkit/README.md`](./test/gtk-webkit/README.md).
+
+This is a security tradeoff, not sandbox emulation: it discards bubblewrap's
+isolation options and runs the image loader directly.  If WebKit uses the same
+`bwrap`, its web processes are unsandboxed too.  Do not use this workaround for
+untrusted pages or files.
+
+There is one bunproot-specific detail in the wrapper: it must launch and wait
+for the payload as a child; it must not end with `exec "$@"`.  With `exec`, the
+short-lived `glycin-image-rs` process becomes an orphaned zombie and GLib waits
+forever for its D-Bus decode response.  Keeping the wrapper shell as its parent
+lets the same request complete.
+
+Verify PNG decoding before involving GTK or WebKit:
+
+```sh
+proot -S "$ROOTFS" -b /dev /bin/sh -c 'python3 - <<"PY"
+import gi, glob
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf
+p = glob.glob("/usr/share/icons/**/*.png", recursive=True)[0]
+pb = GdkPixbuf.Pixbuf.new_from_file(p)
+print("PNG loaded OK", pb.get_width(), "x", pb.get_height())
+PY'
+```
+
+Once that prints `PNG loaded OK`, launch the GTK/WebKit test with the X server
+already running:
+
+```sh
+DISPLAY=127.0.0.1:0 \
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 \
+WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+LIBGL_ALWAYS_SOFTWARE=1 \
+proot -S "$ROOTFS" -b /dev /bin/sh -c \
+  'cd /root/wv && exec python3 gtk3wv4.py'
+```
+
+The successful 2026-09-05 check loaded a 48x48 PNG, kept the browser alive for
+more than 60 seconds with empty stderr, and displayed page content through
+Termux:X11.
+
 ## Pitfalls that cost more time than the bugs
 
 - **`/tmp` is not writable on Android.** It is `drwxrwx--x shell shell`;

@@ -207,7 +207,7 @@ function remoteCall(pid, trampoline, syscall, args=[]) {
 // A memory fault says far more with the address it happened at and the mapping
 // that address belongs to: an emulated exec that leaves a stale mapping behind
 // shows up as a write into a region the guest never asked for.
-function describeFault(pid,signal,pc) {
+function describeFault(pid,signal,pc,lr=null) {
   if (signal!==4 && signal!==7 && signal!==11) return "";
   const info=new Uint8Array(128);
   if (call(PTRACE_GETSIGINFO,pid,0n,BigInt(ptr(info)))<0n) return "";
@@ -227,6 +227,27 @@ function describeFault(pid,signal,pc) {
   const faulted=locate(address), executing=locate(pc);
   if (faulted!==null) description+=` in [${faulted}]`;
   if (executing!==null) description+=` from [${executing}]`;
+  // The link register names the caller, which is what identifies an abort
+  // helper's real origin -- __stack_chk_fail and friends all look alike at pc.
+  if (lr!==null) { const called=locate(lr); if (called!==null) description+=` calledby [${called}]`; }
+  // A poor man's backtrace: the stack words that land inside an executable
+  // mapping are, near enough, the return addresses of the frames above.
+  try {
+    const sp=getX(getRegisters(pid).regs,31);
+    const bytes=readTraceeBytes(pid,sp,2048);
+    const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+    const seen=new Set(), frames=[];
+    for (let offset=0; offset+8<=bytes.length && frames.length<8; offset+=8) {
+      const word=view.getBigUint64(offset,true);
+      if (word<0x1000n) continue;
+      const where=locate(word);
+      if (where===null || !/ r-xp /.test(where)) continue;
+      const name=where.replace(/^.*\s(\S+) (\+0x[0-9a-f]+)$/,"$1 $2");
+      if (seen.has(name)) continue;
+      seen.add(name); frames.push(name.replace(/^.*\//,""));
+    }
+    if (frames.length) description+=` stack[${frames.join(" <- ")}]`;
+  } catch {}
   return description;
 }
 
@@ -705,9 +726,19 @@ export function traceProcess(pid, mounts, guest = null) {
         if (verbose) console.error(`[ptrace] new tracee pid=${child} event=${event}`);
         continue;
       }
-      const stopped=getRegisters(taskPid);
+      // A tracee can die between its wait status and this fetch -- firefox's
+      // crash handler re-raises, and the process is gone by the time the
+      // signal is inspected. Upstream treats that as an ordinary lifecycle
+      // race in restart_tracee(); here it must not take the tracer with it.
+      let stopped;
+      try { stopped=getRegisters(taskPid); }
+      catch {
+        tasks.delete(taskPid);
+        if (verbose) console.error(`[ptrace] tracee ${taskPid} died before its signal could be read`);
+        continue;
+      }
       if (verbose)
-        console.error(`[ptrace] pid=${taskPid} signal=${signal} pc=0x${getPc(stopped.regs).toString(16)} syscall=${getSyscallNumber(stopped.regs)}${describeFault(taskPid,signal,getPc(stopped.regs))}`);
+        console.error(`[ptrace] pid=${taskPid} signal=${signal} pc=0x${getPc(stopped.regs).toString(16)} syscall=${getSyscallNumber(stopped.regs)}${describeFault(taskPid,signal,getPc(stopped.regs),getX(stopped.regs,30))}`);
       if (signal===31) { setX(stopped.regs,0,BigInt.asUintN(64,-38n)); putRegisters(taskPid,stopped); continue; }
       if (signal===19) continue; // consume ptrace/vfork bootstrap SIGSTOP
       task.pendingSignal=BigInt(signal); continue;
@@ -726,8 +757,14 @@ export function traceProcess(pid, mounts, guest = null) {
         task.forcedResult=undefined;
       }
       if (task.idWrites!==undefined) {
+        // A uid_t is four bytes and PTRACE_POKEDATA writes eight, so these
+        // must go through the read-modify-write path or each one zeroes the
+        // four bytes after it. getresuid(2) is handed three adjacent locals,
+        // which puts the third write past the end of them: GTK's
+        // check_setugid() calls it, and the overrun tripped the stack
+        // protector before any window could open.
         for (const address of task.idWrites) if (address!==0n)
-          writeBytes(memory,taskPid,address,new Uint8Array(4));
+          writeTraceeBytes(taskPid,address,new Uint8Array(4),4n);
         task.idWrites=undefined;
       }
       if (task.pendingStat!==undefined) {
