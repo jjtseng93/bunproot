@@ -93,7 +93,7 @@ function setKernelSyscallNumber(pid,state,number) {
 
 const ARM64_SYSCALL_TRAMPOLINE = 0xd4200000d4000001n; // svc #0; brk #0
 const SYS_GETPID = 172, SYS_MMAP = 222;
-const SYS_GETCWD = 17, SYS_CHDIR = 49, SYS_OPENAT = 56, SYS_CLOSE = 57, SYS_MUNMAP=215;
+const SYS_GETCWD = 17, SYS_CHDIR = 49, SYS_FCHDIR = 50, SYS_OPENAT = 56, SYS_CLOSE = 57, SYS_MUNMAP=215;
 const SYS_READLINKAT = 78, SYS_GETDENTS64 = 61;
 const SYS_FCHOWNAT = 54, SYS_FCHOWN = 55;
 const SYS_SIGALTSTACK = 132, SYS_RT_SIGACTION = 134, SYS_PRCTL = 167;
@@ -472,7 +472,7 @@ const PATH_ARGUMENTS = new Map([
 // Every syscall the enter stage looks at: the pathname table plus the calls
 // that are emulated, translated or recorded outright.
 const HANDLED_ON_ENTER=new Set([...PATH_ARGUMENTS.keys(),
-  SYS_MUNMAP, SYS_GETCWD, SYS_CLOSE, SYS_GETDENTS64, SYS_READLINKAT,
+  SYS_MUNMAP, SYS_GETCWD, SYS_CLOSE, SYS_GETDENTS64, SYS_READLINKAT, SYS_FCHDIR,
   SYS_FCHOWNAT, SYS_FCHOWN,
   79, 80, 291,          // fstat, newfstatat, statx
   144,145,146,147,148,149,150,151,152,158,159, // set*id, getres*id, getgroups
@@ -1000,6 +1000,20 @@ const exited=registers(), result=exitResult(phase,exited);
         if (BigInt.asUintN(32,getX(state.regs,argument))!==0xffffffffn)
           setX(state.regs,argument,BigInt(real));
       putRegisters(taskPid,state);
+    }
+    if (syscall===SYS_FCHDIR) {
+      // A shell may change directory through a descriptor rather than a
+      // pathname -- fish does -- and chdir(2) alone then leaves this tracer's
+      // idea of the cwd behind, so every later relative path is translated
+      // against the directory the guest has already left. Upstream resolves
+      // "." against the descriptor for the same reason
+      // (src/syscall/enter.c:2048, `case PR_fchdir`).
+      const fd=Number(BigInt.asIntN(32,getX(state.regs,0)));
+      // An unresolvable descriptor leaves the cwd alone rather than guessing:
+      // the exit stage only commits a pendingCwd that is not null.
+      try { task.pendingCwd=fdGuestBase(taskPid,mounts,task,fd); }
+      catch { task.pendingCwd=null; }
+      continue;
     }
     if (syscall===SYS_CLOSE) {
       openedAliases.delete(`${taskPid}:${Number(BigInt.asIntN(32,getX(state.regs,0)))}`);
