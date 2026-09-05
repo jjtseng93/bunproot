@@ -149,7 +149,7 @@ wrapper or the tracer. Treat a pass as reassurance and a failure as
 inconclusive.
 
 ```sh
-bun proot.js -S "$ROOTFS" -b /dev /bin/sh -c 'python3 - <<"PY"
+bun proot.js -S "$ROOTFS" /bin/sh -c 'python3 - <<"PY"
 import gi, glob, os
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import GdkPixbuf

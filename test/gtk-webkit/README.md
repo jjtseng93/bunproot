@@ -36,9 +36,12 @@ bun proot.js -S "$ROOTFS" /bin/sh -c '
     update-mime-database /usr/share/mime'
 ```
 
-A distribution tarball ships an empty `/dev`, and device nodes cannot be
-created without real root, so the host's has to be bound in. `run.sh` passes
-`-b /dev` for this.
+No `-b /dev` is needed, even though a distribution tarball ships an empty
+`/dev` and device nodes cannot be created without real root. `/proc`, `/dev`
+and `/sys` are passed to the kernel untranslated, so the guest gets the host's
+device nodes: `/dev/null` inside the rootfs is the real `crw-rw-rw- 1, 3`, and
+nothing is ever created under `ROOTFS/dev`. Only `ls /dev` differs from a
+normal system, because Android refuses to list that directory to an app.
 
 ## The X server
 

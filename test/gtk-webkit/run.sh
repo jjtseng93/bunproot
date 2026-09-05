@@ -18,5 +18,7 @@ export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 export WEBKIT_DISABLE_COMPOSITING_MODE=1
 export LIBGL_ALWAYS_SOFTWARE=1
 
-exec bun "$REPO/proot.js" -S "$ROOTFS" -b /dev -b "$HERE:/opt/bunproot-gtk-webkit" \
+# No -b /dev: bunproot passes /proc, /dev and /sys to the kernel untranslated,
+# so the guest already sees the host's device nodes.
+exec bun "$REPO/proot.js" -S "$ROOTFS" -b "$HERE:/opt/bunproot-gtk-webkit" \
   /usr/bin/python3 /opt/bunproot-gtk-webkit/browser.py
