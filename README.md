@@ -254,15 +254,61 @@ bunproot -koe -S ./alpine /bin/sh
 
 ### Native bubblewrap
 
-The guest's real `bwrap` can run inside bunproot. Android does not grant the
-app real mount or user namespaces, so bunproot strips namespace flags and
-represents bind mounts, unmounts and `pivot_root` transitions in its own
-runtime mount table. `/proc/self/mountinfo` is synthesized from that table so
-bwrap validates the same filesystem view that pathname translation enforces.
+The guest's real, unmodified `bwrap` can run inside bunproot, without a wrapper
+or `LD_PRELOAD`. Android does not grant the app real mount or user namespaces,
+so bunproot emulates their syscalls and represents bind mounts, unmounts and
+`pivot_root` transitions in a per-process runtime mount table.
+`/proc/self/mountinfo` is synthesized from that table so bwrap validates the
+same filesystem view that pathname translation enforces. The stock bwrap
+arguments hidden in Flatpak's `--args` file descriptor are supported too.
 
 This is compatibility, not a kernel security boundary: a bwrap payload is
 still protected only by bunproot's ptrace pathname isolation. See the native
 one-file-root regression in [TESTING.md](./TESTING.md#native-bubblewrap).
+
+`proot -S` also supplies `/dev`, maps `/dev/udmabuf` to `/dev/null` when a
+device node is unavailable, and provides Android-hidden overflow uid/gid
+values. These are built-in compatibility bindings; no Termux prefix bind is
+required. A writable `TMPDIR` is required for temporary sandbox roots and
+synthetic mountinfo files.
+
+### Flatpak through stock bwrap
+
+With Flatpak, bubblewrap and D-Bus installed in the rootfs, applications run
+through the distribution's stock `/usr/bin/bwrap`:
+
+```sh
+proot -S "$ROOTFS" /bin/sh -lc \
+  'flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo &&
+   flatpak install -y flathub org.gnome.Calculator'
+
+DISPLAY=127.0.0.1:0 proot -koe -S "$ROOTFS" /bin/sh -lc \
+  'export DISPLAY XDG_RUNTIME_DIR=/run/user/0
+   mkdir -p "$XDG_RUNTIME_DIR"
+   exec dbus-run-session -- /bin/sh'
+
+# Run these at the guest shell prompt. They share one session bus.
+flatpak run org.gnome.Calculator &
+flatpak run ANOTHER.APP
+```
+
+The X server must already accept TCP display 0; bunproot does not start it.
+`dbus-run-session` wraps the whole guest shell, not each application. Every
+application launched from that shell inherits the same
+`DBUS_SESSION_BUS_ADDRESS` and can communicate with the others. Exiting the
+shell removes the session bus, so no persistent host or Termux D-Bus service
+is required. Wrapping each `flatpak run` separately is suitable for an isolated
+smoke test, but gives every application a different bus and is not a desktop
+session.
+
+The launcher should normally already provide a writable `TMPDIR`; if a
+minimal APK environment does not, set it to that app's cache directory. It
+need not be a Termux path.
+
+Flatpak's payload seccomp filter remains installed. bunproot removes only
+`--unshare-net` from bwrap's internal argument stream because an Android app
+UID cannot configure loopback inside a real network namespace. Consequently
+the emulated sandbox does **not** provide network-namespace isolation.
 
 The option belongs before `COMMAND`. A `--kill-on-exit` after `COMMAND` is an
 argument to the guest program instead.

@@ -127,6 +127,13 @@ export function run(argv) {
   if (parsed.version) { console.log(`${pkg.name} ${pkg.version}`); return 0; }
   const { rootfs, bindings, command, killOnExit } = parsed;
   const compatibilityBindings=[
+    "/dev:/dev",
+    // Android exposes /dev/udmabuf in directory listings but SELinux denies
+    // app UIDs even a stat(2).  bubblewrap's --dev copies every visible node,
+    // so present the harmless, accessible null device under that name.  Keep
+    // this in the tracer instead of requiring every enter_rootfs launcher to
+    // know about an Android-specific device.
+    "/dev/null:/dev/udmabuf",
     `${OVERFLOW_ID}:/proc/sys/kernel/overflowuid`,
     `${OVERFLOW_ID}:/proc/sys/kernel/overflowgid`,
   ];

@@ -1,6 +1,7 @@
 import { FFIType, ptr } from "bun:ffi";
-import { constants as fsConstants, copyFileSync, existsSync, readFileSync, readdirSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { posix } from "node:path";
+import { tmpdir } from "node:os";
 import { openLibrary } from "../ffi.js";
 import { getPc, getSp, getSyscallNumber, getX, makeIovec, makeRegisterSet, NT_PRSTATUS, setPc, setX } from "../tracee/reg.c.js";
 import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
@@ -100,9 +101,10 @@ function setKernelSyscallNumber(pid,state,number) {
 
 const ARM64_SYSCALL_TRAMPOLINE = 0xd4200000d4000001n; // svc #0; brk #0
 const TRAMPOLINE_REGION_SIZE = 16n*1024n*1024n;
-const SYS_GETPID = 172, SYS_MMAP = 222;
+const SYS_READ = 63, SYS_LSEEK = 62, SYS_GETPID = 172, SYS_MMAP = 222;
 const SYS_GETCWD = 17, SYS_DUP = 23, SYS_CHDIR = 49, SYS_FCHDIR = 50, SYS_OPENAT = 56, SYS_CLOSE = 57, SYS_MUNMAP=215;
 const SYS_READLINKAT = 78, SYS_GETDENTS64 = 61;
+const SYS_BIND = 200, SYS_CONNECT = 203;
 const SYS_FCHOWNAT = 54, SYS_FCHOWN = 55;
 const SYS_SIGALTSTACK = 132, SYS_RT_SIGACTION = 134, SYS_PRCTL = 167;
 const PTRACE_EVENT_SECCOMP = 7;
@@ -379,6 +381,40 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
   let guestPath=canonicalizeGuestPath(mounts,resolveProcLink(pid,tasks,input)??input,
     {preserveInternalFinal:true});
   let executable=mounts.toHost(canonicalizeGuestPath(mounts,guestPath));
+  // Flatpak hides almost all bubblewrap options in a NUL-separated --args FD.
+  // Android app processes cannot configure loopback after CLONE_NEWNET and
+  // the tracer deliberately virtualizes namespace creation, so letting bwrap
+  // touch the host network namespace would fail (or mutate it on permissive
+  // systems). Expand the FD here and drop exactly --unshare-net. This keeps the
+  // guest's stock bwrap executable and needs no wrapper or LD_PRELOAD.
+  if (existsSync(executable) &&
+      (posix.basename(guestPath)==="bwrap" || posix.basename(guestPath)==="bwrap-real")) {
+    const expanded=[];
+    for (let index=0; index<argv.length; index++) {
+      let fd=null;
+      if (argv[index]==="--args" && index+1<argv.length) fd=argv[++index];
+      else if (argv[index].startsWith("--args=")) fd=argv[index].slice(7);
+      if (fd!==null && /^\d+$/.test(fd)) {
+        const hidden=new TextDecoder().decode(readTraceeFd(pid,task,Number(fd))).split("\0");
+        if (hidden.at(-1)==="") hidden.pop(); // the terminating NUL is not an argument
+        for (let hiddenIndex=hidden.length-1; hiddenIndex>=0; hiddenIndex--)
+          if (hidden[hiddenIndex]==="--unshare-net") hidden.splice(hiddenIndex,1);
+        expanded.push(...hidden);
+      } else expanded.push(argv[index]);
+    }
+    argv=expanded;
+    // Remember bwrap's persistent fd bindings by destination. At mount(2)
+    // time the source can be an anonymous /proc/self/fd path whose displayed
+    // pathname is not useful; the option list is the stable association and
+    // avoids depending on Flatpak's current fd allocation order.
+    task.bwrapFdMounts=new Map();
+    for (let index=0; index+2<argv.length; index++) {
+      if (!["--bind-fd","--ro-bind-fd","--dev-bind-fd"].includes(argv[index])) continue;
+      const fd=Number(argv[index+1]);
+      if (Number.isInteger(fd)) task.bwrapFdMounts.set(posix.normalize(argv[index+2]),fd);
+      index+=2;
+    }
+  }
   // The PATH a `#!/usr/bin/env NAME` search has to use is the guest's own, and
   // for a nested exec that is whatever envp the tracee is passing along.
   const searchPath=env.find((entry)=>entry.startsWith("PATH="))?.slice(5);
@@ -390,7 +426,11 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
   }
   const info=readElfLoadInfo(executable);
   const interpreter=info.interpreter;
-  const loader=interpreter===null?null:mounts.toHost(interpreter);
+  // The sandbox root commonly has /lib -> usr/lib.  Resolve that guest link
+  // before translating it; otherwise a perfectly valid glibc loader is looked
+  // up in the empty tmpfs placeholder rather than the /usr runtime binding.
+  const loader=interpreter===null?null:
+    mounts.toHost(canonicalizeGuestPath(mounts,interpreter));
   // Refuse the exec here, while the caller can still let the real execve run
   // and report the error itself.  Once the commit stage has torn down the
   // address space there is nothing left to return an errno to -- and a guest
@@ -503,6 +543,7 @@ const PATH_ARGUMENTS = new Map([
 const HANDLED_ON_ENTER=new Set([...PATH_ARGUMENTS.keys(),
   SYS_MUNMAP, SYS_GETCWD, SYS_CLOSE, SYS_GETDENTS64, SYS_READLINKAT, SYS_FCHDIR,
   SYS_FCHOWNAT, SYS_FCHOWN,
+  SYS_BIND, SYS_CONNECT,
   39,40,41,97,268,       // umount2, mount, pivot_root, unshare, setns
   79, 80, 291,          // fstat, newfstatat, statx
   144,145,146,147,148,149,150,151,152,158,159, // set*id, getres*id, getgroups
@@ -556,20 +597,87 @@ function emulateNamespaceFilesystem(pid,mounts,task,state,syscall) {
   if (syscall===40) { // mount(source, target, fstype, flags, data)
     const sourceAddress=getX(state.regs,0), targetAddress=getX(state.regs,1);
     if (targetAddress<4096n) return;
-    const target=resolveGuestInput(pid,mounts,task,state,readCString(memory,pid,targetAddress),{});
+    let target=resolveGuestInput(pid,mounts,task,state,readCString(memory,pid,targetAddress),{});
+    const targetFd=/^\/proc\/self\/fd\/(\d+)$/.exec(target);
+    let descriptorSourceHost=null;
+    if (targetFd!==null) {
+      try {
+        const targetNumber=Number(targetFd[1]);
+        const targetHost=readlinkSync(`/proc/${pid}/fd/${targetNumber}`);
+        target=mounts.toGuest(targetHost)??target;
+        const stagedRoot=mounts.toHost("/newroot");
+        const candidates=readdirSync(`/proc/${pid}/fd`).map(Number)
+          .filter((fd)=>Number.isInteger(fd)&&fd>targetNumber).sort((a,b)=>a-b);
+        const eligible=[];
+        for (const fd of candidates) {
+          let candidate;
+          try { candidate=readlinkSync(`/proc/${pid}/fd/${fd}`); } catch { continue; }
+          const mountingDev=target==="/newroot/dev" || target.startsWith("/newroot/dev/");
+          if (candidate==="/proc" || candidate.startsWith("/proc/") ||
+              (!mountingDev && (candidate==="/dev" || candidate.startsWith("/dev/"))) ||
+              candidate.startsWith("/memfd:") ||
+              candidate.startsWith("pipe:") || candidate.startsWith("socket:") ||
+              candidate.startsWith("anon_inode:") || candidate.endsWith(" (deleted)") ||
+              candidate===stagedRoot || candidate.startsWith(`${stagedRoot}/`)) continue;
+          eligible.push({fd,candidate});
+        }
+        const bwrapDestination=target==="/newroot"?"/":target.slice("/newroot".length);
+        const wantedFd=task.bwrapFdMounts?.get(bwrapDestination);
+        const targetName=posix.basename(target);
+        const selected=eligible.find(({fd})=>fd===wantedFd)??
+          eligible.find(({candidate})=>posix.basename(candidate)===targetName)??eligible[0];
+        if (selected) {
+          const {fd,candidate}=selected;
+          const candidateGuest=mounts.toGuest(candidate);
+          const kernelOld=candidateGuest===null?null:/^\/oldroot(\/proc|\/dev|\/sys)(?:\/|$)/.exec(candidateGuest);
+          descriptorSourceHost=kernelOld?candidateGuest.slice("/oldroot".length):candidate;
+        }
+      } catch {}
+    }
     const flags=getX(state.regs,3);
-    if ((flags&0x1000n)!==0n && sourceAddress>=4096n) { // MS_BIND
-      const source=resolveGuestPath(pid,mounts,task,state,readCString(memory,pid,sourceAddress),{});
-      const oldKernel=/^\/oldroot(\/proc|\/dev|\/sys)(?:\/|$)/.exec(source);
-      let host=oldKernel?source.slice("/oldroot".length):mounts.toHost(source);
+    if (verbose) console.error(`[ptrace] pid=${pid} mount source=0x${sourceAddress.toString(16)} target=${target} flags=0x${flags.toString(16)}`);
+    if ((flags&0x1000n)!==0n) { // MS_BIND
+      if ((flags&0x20n)!==0n) return; // remount only changes flags
+      let source=null;
+      if (sourceAddress>=4096n) {
+        try { source=resolveGuestPath(pid,mounts,task,state,readCString(memory,pid,sourceAddress),{}); }
+        catch {}
+      }
+      const oldKernel=source===null?null:/^\/oldroot(\/proc|\/dev|\/sys)(?:\/|$)/.exec(source);
+      let host=oldKernel?source.slice("/oldroot".length):source===null?null:mounts.toHost(source);
+      // For bwrap's fd-to-fd form, the opened descriptors are authoritative.
+      // Android's outer seccomp SIGSYS frame can expose an unrelated pathname
+      // through x0 (observed as both /proc/<pid>/statm and trace_marker).
+      if (descriptorSourceHost!==null) host=descriptorSourceHost;
+      // Android's seccomp-generated SIGSYS stop can expose a cleared source
+      // register for bwrap's /proc/self/fd/N bind.  The immediately preceding
+      // O_PATH open is the authoritative source in that form.
+      const sourceFd=source===null?null:/^\/proc\/self\/fd\/(\d+)$/.exec(source);
+      if (sourceFd!==null) host=task.openedHostFds?.get(Number(sourceFd[1]))??host;
+      if (source===null && task.lastExternalSourceHost) host=task.lastExternalSourceHost;
       if (target==="/newroot" && task.lastExternalSourceHost) host=task.lastExternalSourceHost;
+      if (host===null) return;
+      // --bind-data/--ro-bind-data stages an ordinary /bindfileXXXXXX and
+      // unlinks it immediately after mount(2). A real mount pins the inode;
+      // an emulated pathname binding must make its own stable snapshot first.
+      if (/\/bindfile[^/]+$/.test(host)) {
+        try {
+          const snapshotDir=mkdtempSync(posix.join(process.env.TMPDIR??tmpdir(),
+            "bunproot-bind-data-"));
+          const snapshot=posix.join(snapshotDir,"payload");
+          copyFileSync(host,snapshot);
+          host=snapshot;
+        } catch {}
+      }
       if (target.startsWith("/proc/self/fd/")) return;
       mounts.bind(host,target);
-      if (verbose) console.error(`[ptrace] pid=${pid} emulated bind ${source} -> ${target}`);
+      if (verbose) console.error(`[ptrace] pid=${pid} emulated bind ${source??"<fd>"} (${host}) -> ${target}`);
     } else {
       const fstypeAddress=getX(state.regs,2);
       const fstype=fstypeAddress>=4096n?readCString(memory,pid,fstypeAddress):"";
-      const host={proc:"/proc",sysfs:"/sys",devtmpfs:"/dev",devpts:"/dev/pts"}[fstype];
+      const host=fstype==="tmpfs"
+        ?mkdtempSync(posix.join(process.env.TMPDIR??tmpdir(),"bunproot-tmpfs-"))
+        :{proc:"/proc",sysfs:"/sys",devtmpfs:"/dev",devpts:"/dev/pts"}[fstype];
       if (host) {
         mounts.bind(host,target);
         if (verbose) console.error(`[ptrace] pid=${pid} emulated ${fstype} ${host} -> ${target}`);
@@ -641,6 +749,29 @@ function readTraceeBytes(pid,address,length) {
   return output;
 }
 
+function readTraceeFd(pid,task,fd,limit=1024*1024) {
+  const original=remoteCall(pid,task.trampoline,SYS_LSEEK,[BigInt(fd),0n,1n]);
+  if (remoteCall(pid,task.trampoline,SYS_LSEEK,[BigInt(fd),0n,0n])<0n)
+    throw new Error(`cannot seek tracee fd ${fd}`);
+  const chunks=[];
+  let total=0;
+  try {
+    while (total<limit) {
+      const amount=Number(remoteCall(pid,task.trampoline,SYS_READ,
+        [BigInt(fd),task.scratch,2048n]));
+      if (amount<=0) break;
+      chunks.push(readTraceeBytes(pid,task.scratch,amount));
+      total+=amount;
+    }
+  } finally {
+    if (original>=0n) remoteCall(pid,task.trampoline,SYS_LSEEK,[BigInt(fd),original,0n]);
+  }
+  const output=new Uint8Array(total);
+  let offset=0;
+  for (const chunk of chunks) { output.set(chunk,offset); offset+=chunk.length; }
+  return output;
+}
+
 // The kernel reports a descriptor opened through an emulated hard link under
 // the storage name no tracee ever used, so remember the name the tracee did
 // use.  Upstream does the same in link2symlink's READLINK_PROC_FD callback
@@ -653,7 +784,10 @@ function recallOpenedAlias(mounts,procFd,objectGuest) {
     if (alias===undefined) return null;
     // Descriptor numbers are reused and links are removed, so the remembered
     // name still has to lead to this very object.
-    try { return canonicalizeGuestPath(mounts,alias)===objectGuest?alias:null; }
+    try {
+      const resolved=canonicalizeGuestPath(mounts,alias);
+      return mounts.toHost(resolved)===mounts.toHost(objectGuest)?alias:null;
+    }
     catch { return null; }
   };
   if (procFd!==null) {
@@ -698,7 +832,12 @@ function resolveProcLink(taskPid,tasks,guestPath) {
 
 export function traceProcess(pid, mounts, guest = null, { killOnExit = false } = {}) {
   const started=performance.now();
-  const mountinfoPath=posix.join(process.cwd(),`.bunproot-mountinfo-${pid}`);
+  const mountinfoPaths=new Set();
+  const mountinfoPathFor=(taskPid)=>{
+    const path=posix.join(process.env.TMPDIR??tmpdir(),`.bunproot-mountinfo-${pid}-${taskPid}`);
+    mountinfoPaths.add(path);
+    return path;
+  };
   const initial = wait(pid, 2); // WUNTRACED: observe the pre-exec SIGSTOP.
   if ((initial & 0xff) !== 0x7f) throw new Error("tracee did not stop before exec");
   if (call(PTRACE_ATTACH, pid) < 0n) throw new Error("PTRACE_ATTACH failed");
@@ -728,6 +867,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
   const freeScratchSlots=[];
   const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null,
     pendingCwd:null, pendingGetcwd:null, cwd:"/", configured:true, seenStop:true,
+    openedHostFds:new Map(), openedGuestFds:new Map(), mounts,
     scratch:trampoline+4096n+512n, scratchSlot:1n,
     exe:guest===null?null:guest.guestPath??guestPathOf(mounts,guest.executable) }]]);
   tasks.get(pid).trampoline=trampoline;
@@ -777,6 +917,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
     }
     task.running=false;
     task.seenStop=true;
+    mounts=task.mounts;
     if ((status&0x7f)===0) {
       if (verbose) console.error(`[ptrace] tracee ${taskPid} exited status=${(status>>8)&0xff}`);
       if (taskPid===pid && killOnExit) {
@@ -813,6 +954,13 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
           cwd:task.cwd, exe:task.exe, trampoline:task.trampoline, borrowPc:task.borrowPc,
           scratch:task.trampoline+scratchSlot*4096n+512n, scratchSlot, configured:true,
           namespaceEmulated:task.namespaceEmulated, pivoted:task.pivoted };
+        inherited.usernsLimitFaked=task.usernsLimitFaked;
+        inherited.usernsAfterLimit=task.usernsAfterLimit;
+        inherited.openedHostFds=new Map(task.openedHostFds??[]);
+        inherited.openedGuestFds=new Map(task.openedGuestFds??[]);
+        inherited.bwrapFdMounts=new Map(task.bwrapFdMounts??[]);
+        inherited.mounts=task.pendingChildMountNamespace?task.mounts.clone():task.mounts;
+        task.pendingChildMountNamespace=false;
         // The child may already be tracked, having stopped before this event
         // arrived; then it is only missing what it could not know, and its own
         // run state is the accurate one.
@@ -841,10 +989,35 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
         // already past the svc instruction, so supply the emulated success
         // directly, matching the normal handled-on-enter path below.
         const blockedSyscall=getSyscallNumber(stopped.regs);
+        if (blockedSyscall===97 && (getX(stopped.regs,0)&0x10000000n)!==0n &&
+            task.usernsLimitFaked && ++task.usernsAfterLimit>1) {
+          setX(stopped.regs,0,BigInt.asUintN(64,-1n)); putRegisters(taskPid,stopped);
+          task.entering=true;
+          continue;
+        }
         task.namespaceEmulated=true;
+        if (blockedSyscall===97 && (getX(stopped.regs,0)&0x20000n)!==0n) {
+          task.mounts=task.mounts.clone();
+          mounts=task.mounts;
+        }
         if ([39,40,41].includes(blockedSyscall))
           emulateNamespaceFilesystem(taskPid,mounts,task,stopped,blockedSyscall);
         setX(stopped.regs,0,0n); putRegisters(taskPid,stopped);
+        task.entering=true;
+        continue;
+      }
+      if (signal===31 && getSyscallNumber(stopped.regs)===439) { // faccessat2
+        // This syscall is absent from older Android allowlists. Its SIGSYS
+        // frame is already past svc, so perform the access check against the
+        // translated guest pathname and place the result straight in x0.
+        let result=0n;
+        try {
+          const path=readCString(memory,taskPid,getX(stopped.regs,1));
+          const guestPath=resolveGuestPath(taskPid,mounts,task,stopped,path,
+            {dirfd:0,nofollow:{arg:3,mask:0x100n}});
+          accessSync(mounts.toHost(guestPath),Number(getX(stopped.regs,2)));
+        } catch (error) { result=BigInt(error.errno??-13); }
+        setX(stopped.regs,0,BigInt.asUintN(64,result)); putRegisters(taskPid,stopped);
         task.entering=true;
         continue;
       }
@@ -955,8 +1128,9 @@ const exited=registers(), result=exitResult(phase,exited);
               if (guest.startsWith(L2S_OBJS))
                 guest=recallOpenedAlias(mounts,procFd,guest)??guest;
               const encoded=new TextEncoder().encode(guest);
-              writeTraceeBytes(taskPid,buffer,encoded,size);
-              setX(exited.regs,0,BigInt(encoded.length)); putRegisters(taskPid,exited);
+              const length=Math.min(encoded.length,Number(size));
+              writeTraceeBytes(taskPid,buffer,encoded.subarray(0,length),size);
+              setX(exited.regs,0,BigInt(length)); putRegisters(taskPid,exited);
               if (verbose)
                 console.error(`[ptrace] pid=${taskPid} readlink target ${host} -> ${guest}`);
             }
@@ -969,6 +1143,11 @@ const exited=registers(), result=exitResult(phase,exited);
         if (task.pendingOpenAlias!==undefined) {
           if (result>=0n) openedAliases.set(`${taskPid}:${result}`,task.pendingOpenAlias);
           task.pendingOpenAlias=undefined;
+        }
+        if (task.pendingPathSyscall===SYS_OPENAT && result>=0n && task.pendingHostPaths?.length) {
+          task.openedHostFds.set(Number(result),task.pendingHostPaths[0]);
+          if (task.pendingGuestPaths?.length)
+            task.openedGuestFds.set(Number(result),task.pendingGuestPaths[0]);
         }
         if (task.pendingL2sUnlink && result===0n) {
           try { commitEmulatedUnlink(mounts.rootfs,task.pendingL2sUnlink); }
@@ -1010,7 +1189,8 @@ const exited=registers(), result=exitResult(phase,exited);
             setX(exited.regs,0,BigInt.asUintN(64,finalResult)); putRegisters(taskPid,exited);
           }
         }
-        if (task.pendingPathSyscall===34 && finalResult===-17n && task.namespaceEmulated) {
+        if (task.pendingPathSyscall===34 && finalResult<0n && task.namespaceEmulated &&
+            task.pendingHostPaths?.length && existsSync(task.pendingHostPaths[0])) {
           setX(exited.regs,0,0n); putRegisters(taskPid,exited); finalResult=0n;
         }
         if (finalResult<0n && verbose)
@@ -1018,6 +1198,8 @@ const exited=registers(), result=exitResult(phase,exited);
             (task.pendingPaths?.length?` paths=${task.pendingPaths.join(" -> ")}`:""));
         task.pendingPathSyscall=undefined;
         task.pendingPaths=undefined;
+        task.pendingHostPaths=undefined;
+        task.pendingGuestPaths=undefined;
         task.pendingLinkPaths=undefined;
         task.pendingLinkGuestPaths=undefined;
         task.pendingL2sUnlink=undefined;
@@ -1080,9 +1262,53 @@ const exited=registers(), result=exitResult(phase,exited);
       // pathname isolation remains enforced by this tracer's runtime binding
       // table, including mount/pivot/umount transitions.
       task.namespaceEmulated=true;
+      if (syscall===97 && (getX(state.regs,0)&0x10000000n)!==0n &&
+          task.usernsLimitFaked && ++task.usernsAfterLimit>1) {
+        setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+        task.forcedResult=BigInt.asUintN(64,-1n);
+        continue;
+      }
+      if (syscall===97 && (getX(state.regs,0)&0x20000n)!==0n) {
+        task.mounts=task.mounts.clone();
+        mounts=task.mounts;
+      }
       if ([39,40,41].includes(syscall)) emulateNamespaceFilesystem(taskPid,mounts,task,state,syscall);
       setKernelSyscallNumber(taskPid,state,SYS_GETPID);
       task.forcedResult=0n;
+      continue;
+    }
+    if (syscall===SYS_BIND || syscall===SYS_CONNECT) {
+      // Unlike ordinary pathname syscalls, AF_UNIX carries its pathname in a
+      // sockaddr.  The kernel never sees openat-style path translation for
+      // these, so sockets created in a rootfs would otherwise be attempted at
+      // Android's literal /tmp and rejected by SELinux.  Abstract sockets have
+      // a leading NUL and deliberately remain in the host namespace.
+      const address=getX(state.regs,1), supplied=Number(getX(state.regs,2));
+      if (address>=4096n && supplied>=3) {
+        const bytes=readTraceeBytes(taskPid,address,Math.min(supplied,110));
+        const family=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getUint16(0,true);
+        if (family===1 && bytes[2]!==0) { // AF_UNIX, pathname rather than abstract
+          let end=2;
+          while (end<bytes.length && bytes[end]!==0) end++;
+          const pathname=new TextDecoder().decode(bytes.subarray(2,end));
+          const guestPath=pathname.startsWith("/")?posix.normalize(pathname):posix.resolve(task.cwd,pathname);
+          const host=mounts.toHost(guestPath);
+          const encoded=new TextEncoder().encode(host);
+          if (encoded.length>107) {
+            setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+            task.forcedResult=BigInt.asUintN(64,-36n); // ENAMETOOLONG
+          } else {
+            const translated=new Uint8Array(2+encoded.length+1);
+            new DataView(translated.buffer).setUint16(0,1,true);
+            translated.set(encoded,2);
+            writeBytes(memory,taskPid,task.scratch,translated);
+            setX(state.regs,1,task.scratch);
+            setX(state.regs,2,BigInt(translated.length));
+            putRegisters(taskPid,state);
+            if (verbose) console.error(`[ptrace] pid=${taskPid} unix socket ${pathname} -> ${host}`);
+          }
+        }
+      }
       continue;
     }
     if (syscall===SYS_MUNMAP) {
@@ -1148,6 +1374,7 @@ const exited=registers(), result=exitResult(phase,exited);
     }
     if (syscall===220) {
       const flags=getX(state.regs,0), unsafe=0x4100n; // CLONE_VM | CLONE_VFORK
+      if ((flags&0x20000n)!==0n) task.pendingChildMountNamespace=true;
       let translated=flags&~CLONE_NS_MASK;
       if ((flags&0x4000n)!==0n) { // only vfork; CLONE_VM alone is a real thread
         translated&=~unsafe;
@@ -1207,7 +1434,11 @@ const exited=registers(), result=exitResult(phase,exited);
       continue;
     }
     if (syscall===SYS_CLOSE) {
-      openedAliases.delete(`${taskPid}:${Number(BigInt.asIntN(32,getX(state.regs,0)))}`);
+      // Keep the alias record after close: a descriptor can already have been
+      // inherited by a cloned bwrap child. recallOpenedAlias revalidates the
+      // pathname against the backing object, so stale records are harmless.
+      task.openedHostFds?.delete(Number(BigInt.asIntN(32,getX(state.regs,0))));
+      task.openedGuestFds?.delete(Number(BigInt.asIntN(32,getX(state.regs,0))));
       continue;
     }
     if (syscall===SYS_GETDENTS64) {
@@ -1222,13 +1453,33 @@ const exited=registers(), result=exitResult(phase,exited);
       const substitute=linkPath!==null&&linkPath.startsWith("/proc/")
         ?resolveProcLink(taskPid,tasks,linkPath):null;
       const descriptor=linkPath===null?null:PROC_FD_LINK.exec(posix.normalize(linkPath));
+      const descriptorOwner=descriptor===null?null:
+        descriptor[1]==="self"||descriptor[1]==="thread-self"?taskPid:Number(descriptor[1]);
+      let fdSubstitute=null;
+      if (descriptorOwner!==null) {
+        try {
+          const host=readlinkSync(`/proc/${descriptorOwner}/fd/${Number(descriptor[2])}`);
+          const remembered=descriptorOwner===taskPid
+            ?task.openedGuestFds?.get(Number(descriptor[2])):null;
+          const oldRoot=task.pivoted?mounts.entries.find((entry)=>entry.guest==="/oldroot"):null;
+          fdSubstitute=remembered??(oldRoot &&
+            (host===oldRoot.host || host.startsWith(`${oldRoot.host}/`))
+            ?`/oldroot${host.slice(oldRoot.host.length)}`:mounts.toGuest(host));
+          if (fdSubstitute!==null && /(?:^|\/)\.proot\.l2s\/objs\//.test(fdSubstitute))
+            fdSubstitute=recallOpenedAlias(mounts,
+              {pid:descriptorOwner,fd:Number(descriptor[2])},
+              mounts.toGuest(host)??fdSubstitute)??fdSubstitute;
+        } catch {}
+      }
+      const readlinkValue=substitute??fdSubstitute;
       task.pendingReadlink={ buffer:getX(state.regs,2), size:getX(state.regs,3), value:substitute,
         procFd:descriptor===null?null:
           { pid:descriptor[1]==="self"||descriptor[1]==="thread-self"?taskPid:Number(descriptor[1]),
             fd:Number(descriptor[2]) } };
-      if (substitute!==null) {
+      task.pendingReadlink.value=readlinkValue;
+      if (readlinkValue!==null) {
         if (verbose)
-          console.error(`[ptrace] pid=${taskPid} readlink ${linkPath} -> ${substitute}`);
+          console.error(`[ptrace] pid=${taskPid} readlink ${linkPath} -> ${readlinkValue}`);
         setKernelSyscallNumber(taskPid,state,SYS_GETPID);
         continue;
       }
@@ -1275,6 +1526,28 @@ const exited=registers(), result=exitResult(phase,exited);
       let guestPath;
       try { guestPath=readCString(memory,taskPid,address); }
       catch (error) { if (verbose) console.error(`[ptrace] skipped pid=${taskPid} syscall=${syscall}: ${error.message}`); continue; }
+      if (syscall===SYS_OPENAT) {
+        let procMapPath=null;
+        try { procMapPath=resolveGuestInput(taskPid,mounts,task,state,guestPath,spec); } catch {}
+        const namespaceMap=procMapPath!==null &&
+          /^\/proc\/(?:self|thread-self|\d+)\/(?:uid_map|gid_map|setgroups)$/.test(procMapPath);
+        const namespaceLimit=procMapPath==="/proc/sys/user/max_user_namespaces" &&
+          (Number(getX(state.regs,2)&3n)!==0);
+        if (namespaceMap || namespaceLimit) {
+          if (namespaceLimit) {
+            task.usernsLimitFaked=true;
+            task.usernsAfterLimit=0;
+          }
+          const sink="/dev/null";
+          writeCString(memory,taskPid,scratch,sink);
+          setX(state.regs,0,BigInt.asUintN(64,-100n));
+          setX(state.regs,spec.path,scratch);
+          scratch+=16n; changed=true;
+          hostPaths.push(sink); guestPaths.push(procMapPath);
+          if (verbose) console.error(`[ptrace] pid=${taskPid} namespace map ${procMapPath} -> ${sink}`);
+          continue;
+        }
+      }
       // "/proc/<PID>/{exe,cwd,root}" names a guest object, so open(2), stat(2)
       // and execve(2) have to reach it through the mount table rather than through
       // the kernel's view of the Android bootstrap process.
@@ -1300,6 +1573,7 @@ const exited=registers(), result=exitResult(phase,exited);
             .replace(/\t/g,"\\011").replace(/\n/g,"\\012");
           const lines=mounts.entries.map((entry,index)=>
             `${1000+index} 1 0:1 ${escape(entry.host)} ${escape(entry.guest)} rw - bind ${escape(entry.host)} rw`);
+          const mountinfoPath=mountinfoPathFor(taskPid);
           writeFileSync(mountinfoPath,`${lines.join("\n")}\n`);
           hostPaths.push(mountinfoPath); guestPaths.push(guestPath);
           writeCString(memory,taskPid,scratch,mountinfoPath); setX(state.regs,spec.path,scratch);
@@ -1325,6 +1599,7 @@ const exited=registers(), result=exitResult(phase,exited);
           .replace(/\t/g,"\\011").replace(/\n/g,"\\012");
         const lines=mounts.entries.map((entry,index)=>
           `${1000+index} 1 0:1 ${escape(entry.host)} ${escape(entry.guest)} rw - bind ${escape(entry.host)} rw`);
+        const mountinfoPath=mountinfoPathFor(taskPid);
         writeFileSync(mountinfoPath,`${lines.join("\n")}\n`);
         hostPaths.push(mountinfoPath); guestPaths.push(absoluteGuest);
         writeCString(memory,taskPid,scratch,mountinfoPath); setX(state.regs,spec.path,scratch);
@@ -1341,9 +1616,12 @@ const exited=registers(), result=exitResult(phase,exited);
         continue;
       }
       if (syscall===SYS_CHDIR && spec.path===0) task.pendingCwd=absoluteGuest;
-      if (syscall===SYS_OPENAT && absoluteGuest.startsWith(L2S_OBJS))
+      const canonicalHost=mounts.toHost(absoluteGuest);
+      if (syscall===SYS_OPENAT &&
+          (absoluteGuest.startsWith(L2S_OBJS) ||
+           canonicalHost.startsWith(`${mounts.rootfs}${L2S_OBJS}`)))
         task.pendingOpenAlias=canonicalizeGuestPath(mounts,inputGuest,{preserveInternalFinal:true});
-      const host=mounts.toHost(absoluteGuest);
+      const host=canonicalHost;
       if (syscall===SYS_OPENAT && task.pivoted && !host.startsWith(mounts.rootfs) &&
           !host.startsWith("/proc/") && !host.startsWith("/dev/") && !host.startsWith("/sys/"))
         task.lastExternalSourceHost=host;
@@ -1361,6 +1639,16 @@ const exited=registers(), result=exitResult(phase,exited);
     // Kept for the failure line below: a path syscall that returns an error is
     // only diagnosable next to the pathname it was given.
     task.pendingPaths=guestPaths;
+    task.pendingHostPaths=hostPaths;
+    task.pendingGuestPaths=guestPaths;
+    if (syscall===439 && hostPaths.length===1) { // faccessat2
+      let result=0n;
+      try { accessSync(hostPaths[0],Number(getX(state.regs,2))); }
+      catch (error) { result=BigInt(error.errno??-13); }
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+      task.forcedResult=BigInt.asUintN(64,result);
+      continue;
+    }
     if (syscall===37) { task.pendingLinkPaths=hostPaths; task.pendingLinkGuestPaths=guestPaths; }
     if (syscall===35 && hostPaths.length===1)
       task.pendingL2sUnlink=inspectEmulatedAlias(mounts.rootfs,hostPaths[0]);
@@ -1378,6 +1666,6 @@ const exited=registers(), result=exitResult(phase,exited);
     if (changed) putRegisters(taskPid,state);
   }
   report(performance.now()-started);
-  try { unlinkSync(mountinfoPath); } catch {}
+  for (const mountinfoPath of mountinfoPaths) try { unlinkSync(mountinfoPath); } catch {}
   return rootExit;
 }

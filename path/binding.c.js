@@ -115,12 +115,27 @@ export function createBindings(rootfs, specifications = []) {
       active.delete(key); refresh(); return true;
     },
 
+    clone() {
+      const snapshot=[...active.values()];
+      const copy=createBindings(active.get("/").host,
+        snapshot.filter((entry)=>entry.guest!=="/"&&!entry.runtime)
+          .map((entry)=>`${entry.host}:${entry.guest}`));
+      for (const entry of snapshot)
+        if (entry.guest!=="/"&&entry.runtime) copy.bind(entry.host,entry.guest);
+      return copy;
+    },
+
     pivot(newRoot,putOld=null) {
       const prefix=resolve(newRoot), backing=table.toHost(prefix);
       const oldRoot=active.get("/").host;
+      const metadataHost=active.get("/.proot.l2s")?.host??`${oldRoot}/.proot.l2s`;
       const snapshot=[...active.values()];
       active.clear();
       active.set("/",{host:backing,guest:"/",runtime:true});
+      // link2symlink is tracer metadata, not a mount belonging to the guest's
+      // old root. Absolute /.proot.l2s/refs targets embedded in extracted
+      // trees must remain resolvable after bwrap pivots to its staged root.
+      active.set("/.proot.l2s",{host:metadataHost,guest:"/.proot.l2s",runtime:true});
       for (const entry of snapshot) {
         if (entry.guest===prefix || entry.guest==="/") continue;
         if (entry.guest.startsWith(`${prefix}/`)) {

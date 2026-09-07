@@ -59,6 +59,22 @@ Android-unreadable overflow uid/gid sysctls internally, emulates bwrap's
 namespace mounts as runtime bindings, and exposes those bindings through a
 synthetic `/proc/self/mountinfo`.
 
+For an installed Flatpak, exercise the same path without opening a window.
+This deliberately creates a single-use D-Bus session; the interactive README
+example wraps the whole shell so multiple applications share one bus:
+
+```sh
+proot -koe -S "$ROOTFS" /bin/sh -lc \
+  'export XDG_RUNTIME_DIR=/run/user/0
+   mkdir -p "$XDG_RUNTIME_DIR"
+   exec dbus-run-session -- flatpak run --command=true org.gnome.Calculator'
+```
+
+It must return status 0 using the rootfs's unmodified `/usr/bin/bwrap`, with no
+wrapper, `LD_PRELOAD`, or Termux-prefix bind. For the GUI invocation and the
+network-namespace limitation, see
+[Flatpak through stock bwrap](./README.md#flatpak-through-stock-bwrap).
+
 ## Firefox on Termux:X11
 
 With Termux:X11 already listening on TCP display 0, Firefox runs directly:
