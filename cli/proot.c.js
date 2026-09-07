@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { FFIType, ptr } from "bun:ffi";
 import { cString, openLibrary } from "../ffi.js";
@@ -63,6 +63,9 @@ const HELP = `${USAGE}
   -h, --help
       show this message
 
+  --readme
+      render README.md in the terminal, with hyperlinks where it has links
+
   -V, --version
       show the version and exit
 
@@ -101,6 +104,7 @@ export function parseArguments(argv) {
       continue;
     }
     if (argument === "-h" || argument === "--help") return { help: true };
+    if (argument === "--readme") return { readme: true };
     if (argument === "-V" || argument === "--version") return { version: true };
     if (argument === "-koe" || argument === "--kill-on-exit") { killOnExit = true; continue; }
     if (argument === "-S" || argument === "--rootfs") {
@@ -125,6 +129,11 @@ export function run(argv) {
   // Only a --help before the command is ours; after it, it belongs to the guest.
   if (parsed.help) { console.log(HELP); return 0; }
   if (parsed.version) { console.log(`${pkg.name} ${pkg.version}`); return 0; }
+  if (parsed.readme) {
+    const readme = readFileSync(resolve(import.meta.dirname, "../README.md"), "utf8");
+    console.log(Bun.markdown.ansi(readme, { hyperlinks: true }));
+    return 0;
+  }
   const { rootfs, bindings, command, killOnExit } = parsed;
   const compatibilityBindings=[
     "/dev:/dev",
