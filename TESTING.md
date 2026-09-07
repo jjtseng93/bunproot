@@ -67,13 +67,59 @@ example wraps the whole shell so multiple applications share one bus:
 proot -koe -S "$ROOTFS" /bin/sh -lc \
   'export XDG_RUNTIME_DIR=/run/user/0
    mkdir -p "$XDG_RUNTIME_DIR"
-   exec dbus-run-session -- flatpak run --command=true org.gnome.Calculator'
+   exec dbus-run-session -- flatpak run --command=true org.gnome.TextEditor'
 ```
 
 It must return status 0 using the rootfs's unmodified `/usr/bin/bwrap`, with no
 wrapper, `LD_PRELOAD`, or Termux-prefix bind. For the GUI invocation and the
 network-namespace limitation, see
 [Flatpak through stock bwrap](./README.md#flatpak-through-stock-bwrap).
+
+On a fresh rootfs, do not use `--no-gpg-verify`. After `remote-add`, verify
+that the one-shot key import was committed before installing anything:
+
+```sh
+proot -S "$ROOTFS" /bin/sh -lc \
+  'grep -q "^gpg-verify=true" /var/lib/flatpak/repo/config &&
+   grep -q "^gpg-verify-summary=true" /var/lib/flatpak/repo/config &&
+   test -s /var/lib/flatpak/repo/flathub.trustedkeys.gpg'
+```
+
+GPG starts a daemonizing `gpg-agent` during this operation. The check is also
+a regression for fork/exec stops invalidating a pending stat buffer: bunproot
+must never commit fake uid/nlink metadata into an address left over from the
+previous image.
+
+The fake-root identity must be translated in both directions across Unix
+sockets. This checks D-Bus authentication: outgoing `SCM_CREDENTIALS` use the
+real Android ids for the kernel, while `SO_PEERCRED` observed by another
+traced guest is translated back to its guest ids.
+
+```sh
+proot -koe -S "$ROOTFS" /bin/sh -lc \
+  'export XDG_RUNTIME_DIR=/run/user/0
+   mkdir -p "$XDG_RUNTIME_DIR"
+   exec dbus-run-session -- dbus-send --session --print-reply \
+     --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+     org.freedesktop.DBus.ListNames'
+```
+
+It must return a method reply containing `org.freedesktop.DBus`. A document
+portal is a separate check: Android's `/dev/fuse` is commonly inaccessible to
+app UIDs, so its FUSE mount is not provided by bunproot.
+
+GTK's portal backend starts glycin image loaders through a nested
+`bwrap --unshare-all`. Opening a chooser exercises that path: bunproot must
+remove only the implied network namespace, not reject the whole shorthand.
+If it regresses, `xdg-desktop-portal-gtk` aborts while loading
+`image-missing.png`, and Open/Save As appears to do nothing.
+
+Also confirm `fc-list` is nonempty in a freshly populated rootfs (the README
+installs `font-dejavu`). With no host-side font, the chooser may remain alive
+but resize itself to an off-screen height greater than 32767 pixels while GTK
+logs `infinite surface size not supported`. Seeing a window appear briefly is
+therefore not a sufficient test: keep it open, select a known file, and use
+Save As to verify that the requested bytes were actually written.
 
 ## Firefox on Termux:X11
 

@@ -274,21 +274,25 @@ synthetic mountinfo files.
 
 ### Flatpak through stock bwrap
 
-With Flatpak, bubblewrap and D-Bus installed in the rootfs, applications run
-through the distribution's stock `/usr/bin/bwrap`:
+Install Flatpak, bubblewrap, D-Bus and a portal backend in the rootfs. The
+applications then run through the distribution's stock `/usr/bin/bwrap`:
 
 ```sh
 proot -S "$ROOTFS" /bin/sh -lc \
-  'flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo &&
-   flatpak install -y flathub org.gnome.Calculator'
+  'apk add flatpak bubblewrap dbus xdg-desktop-portal xdg-desktop-portal-gtk font-dejavu &&
+   flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo &&
+   flatpak install -y flathub org.gnome.TextEditor'
 
 DISPLAY=127.0.0.1:0 proot -koe -S "$ROOTFS" /bin/sh -lc \
   'export DISPLAY XDG_RUNTIME_DIR=/run/user/0
+   export XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=x11
    mkdir -p "$XDG_RUNTIME_DIR"
    exec dbus-run-session -- /bin/sh'
 
 # Run these at the guest shell prompt. They share one session bus.
-flatpak run org.gnome.Calculator &
+dbus-update-activation-environment \
+  DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+flatpak run --filesystem=/root org.gnome.TextEditor &
 flatpak run ANOTHER.APP
 ```
 
@@ -301,14 +305,31 @@ is required. Wrapping each `flatpak run` separately is suitable for an isolated
 smoke test, but gives every application a different bus and is not a desktop
 session.
 
+Android normally denies app UIDs access to `/dev/fuse`. Consequently
+`xdg-document-portal` cannot create its FUSE export at `$XDG_RUNTIME_DIR/doc`.
+The D-Bus portal frontend and GTK FileChooser backend still work for paths the
+sandbox can already access. The Text Editor example therefore grants its
+trusted sandbox `/root` explicitly; the chooser remains enabled, but its
+selection does not need a FUSE document export. Grant a narrower directory
+instead when possible. This is a filesystem permission tradeoff, not a
+bunproot or bwrap isolation guarantee.
+
+The portal backend runs outside the Flatpak runtime and therefore needs at
+least one font in the rootfs. On a fontless Alpine minirootfs, GTK can briefly
+map the chooser and then resize it to tens of thousands of pixels, making it
+look as though the dialog crashed. `font-dejavu` above supplies the minimal
+host-side font set; application-runtime fonts do not replace it.
+
 The launcher should normally already provide a writable `TMPDIR`; if a
 minimal APK environment does not, set it to that app's cache directory. It
 need not be a Termux path.
 
 Flatpak's payload seccomp filter remains installed. bunproot removes only
-`--unshare-net` from bwrap's internal argument stream because an Android app
-UID cannot configure loopback inside a real network namespace. Consequently
-the emulated sandbox does **not** provide network-namespace isolation.
+the network part of `--unshare-net` or `--unshare-all` from bwrap's argument
+stream because an Android app UID cannot configure loopback inside a real
+network namespace. The other namespaces requested by `--unshare-all` remain
+represented by bunproot. Consequently the emulated sandbox does **not**
+provide network-namespace isolation.
 
 The option belongs before `COMMAND`. A `--kill-on-exit` after `COMMAND` is an
 argument to the guest program instead.

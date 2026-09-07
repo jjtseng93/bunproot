@@ -110,7 +110,8 @@ const TRAMPOLINE_REGION_SIZE = 16n*1024n*1024n;
 const SYS_READ = 63, SYS_LSEEK = 62, SYS_GETPID = 172, SYS_MMAP = 222;
 const SYS_GETCWD = 17, SYS_DUP = 23, SYS_CHDIR = 49, SYS_FCHDIR = 50, SYS_OPENAT = 56, SYS_CLOSE = 57, SYS_MUNMAP=215;
 const SYS_READLINKAT = 78, SYS_GETDENTS64 = 61;
-const SYS_BIND = 200, SYS_CONNECT = 203;
+const SYS_BIND = 200, SYS_CONNECT = 203, SYS_SENDMSG = 211;
+const SYS_GETSOCKOPT = 209;
 const SYS_FCHOWNAT = 54, SYS_FCHOWN = 55;
 const SYS_SIGALTSTACK = 132, SYS_RT_SIGACTION = 134, SYS_PRCTL = 167;
 const PTRACE_EVENT_SECCOMP = 7;
@@ -420,9 +421,12 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
       } else expanded.push(argv[index]);
     }
     // Flatpak normally hides this option in --args, while install triggers
-    // and direct bwrap callers may pass it visibly. Apply the same Android
-    // network-namespace policy to both spellings.
-    argv=expanded.filter((argument)=>argument!=="--unshare-net");
+    // and direct bwrap callers may pass it visibly. --unshare-all includes
+    // the network namespace too (glycin uses this spelling), so expand it to
+    // every bwrap namespace except net. Apply one Android policy to all forms.
+    argv=expanded.flatMap((argument)=>argument==="--unshare-all"
+      ?["--unshare-user","--unshare-ipc","--unshare-pid","--unshare-uts","--unshare-cgroup-try"]
+      :argument==="--unshare-net"?[]:[argument]);
     // Remember bwrap's persistent fd bindings by destination. At mount(2)
     // time the source can be an anonymous /proc/self/fd path whose displayed
     // pathname is not useful; the option list is the stable association and
@@ -563,7 +567,7 @@ const PATH_ARGUMENTS = new Map([
 const HANDLED_ON_ENTER=new Set([...PATH_ARGUMENTS.keys(),
   SYS_MUNMAP, SYS_GETCWD, SYS_CLOSE, SYS_GETDENTS64, SYS_READLINKAT, SYS_FCHDIR,
   SYS_FCHOWNAT, SYS_FCHOWN,
-  SYS_BIND, SYS_CONNECT,
+  SYS_BIND, SYS_CONNECT, SYS_SENDMSG, SYS_GETSOCKOPT,
   39,40,41,97,268,       // umount2, mount, pivot_root, unshare, setns
   79, 80, 291,          // fstat, newfstatat, statx
   144,145,146,147,148,149,150,151,152,158,159, // set*id, getres*id, getgroups
@@ -767,6 +771,39 @@ function readTraceeBytes(pid,address,length) {
       output[offset+byte]=Number((word>>BigInt(byte*8))&0xffn);
   }
   return output;
+}
+
+function translateSendmsgCredentials(pid,task,state) {
+  const headerAddress=getX(state.regs,1);
+  if (headerAddress<4096n) return false;
+  // Native arm64 struct msghdr: msg_control at +32, msg_controllen at +40.
+  const header=readTraceeBytes(pid,headerAddress,56), view=new DataView(header.buffer);
+  const controlAddress=view.getBigUint64(32,true);
+  const controlLength=Number(view.getBigUint64(40,true));
+  if (controlAddress<4096n || controlLength<16 || controlLength>1024) return false;
+  const control=readTraceeBytes(pid,controlAddress,controlLength);
+  const controlView=new DataView(control.buffer), realUid=process.getuid(), realGid=process.getgid();
+  let changed=false;
+  for (let offset=0; offset+16<=control.length;) {
+    const length=Number(controlView.getBigUint64(offset,true));
+    if (length<16 || offset+length>control.length) return false;
+    const level=controlView.getInt32(offset+8,true), type=controlView.getInt32(offset+12,true);
+    if (level===1 && type===2 && length===28) { // SOL_SOCKET / SCM_CREDENTIALS / struct ucred
+      controlView.setUint32(offset+20,realUid,true);
+      controlView.setUint32(offset+24,realGid,true);
+      changed=true;
+    }
+    offset+=(length+7)&~7; // CMSG_ALIGN for native arm64
+  }
+  if (!changed) return false;
+  const copiedHeader=task.scratch, copiedControl=task.scratch+64n;
+  view.setBigUint64(32,copiedControl,true);
+  writeBytes(memory,pid,copiedHeader,header);
+  writeBytes(memory,pid,copiedControl,control);
+  setX(state.regs,1,copiedHeader);
+  putRegisters(pid,state);
+  if (verbose) console.error(`[ptrace] pid=${pid} sendmsg SCM_CREDENTIALS uid/gid -> ${realUid}/${realGid}`);
+  return true;
 }
 
 function readTraceeFd(pid,task,fd,limit=1024*1024) {
@@ -1098,6 +1135,23 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
         }
         task.pendingStat=undefined;
       }
+      if (task.pendingPeerCredentials!==undefined) {
+        const exited=registers(), pending=task.pendingPeerCredentials;
+        if (exitedSyscall===SYS_GETSOCKOPT &&
+            BigInt.asIntN(64,getX(exited.regs,0))===0n &&
+            isMappedRange(taskPid,pending.buffer,12)) {
+          const credentials=readTraceeBytes(taskPid,pending.buffer,12);
+          const peerPid=new DataView(credentials.buffer).getInt32(0,true);
+          const peer=tasks.get(peerPid);
+          if (peer!==undefined) {
+            const view=new DataView(credentials.buffer);
+            view.setUint32(4,0,true); view.setUint32(8,0,true);
+            writeBytes(memory,taskPid,pending.buffer,credentials);
+            if (verbose) console.error(`[ptrace] pid=${taskPid} SO_PEERCRED peer=${peerPid} uid/gid -> 0/0`);
+          }
+        }
+        task.pendingPeerCredentials=undefined;
+      }
       if (task.pendingGetdents!==undefined) {
         // stat(2) already reports an emulated hard link as the regular file it
         // stands for, but getdents64(2) hands out the raw directory entry, so
@@ -1305,6 +1359,21 @@ const exited=registers(), result=exitResult(phase,exited);
       if ([39,40,41].includes(syscall)) emulateNamespaceFilesystem(taskPid,mounts,task,state,syscall);
       setKernelSyscallNumber(taskPid,state,SYS_GETPID);
       task.forcedResult=0n;
+      continue;
+    }
+    if (syscall===SYS_SENDMSG) {
+      // fake_id0 makes the guest report uid/gid 0, and GDBus includes those
+      // values in SCM_CREDENTIALS during authentication. The kernel compares
+      // them with the real Android app uid/gid and rejects sendmsg with EPERM.
+      // Upstream fake_id0/sendmsg.c copies the control data and substitutes
+      // the real ids; do the same without modifying the guest's buffer.
+      const translated=translateSendmsgCredentials(taskPid,task,state);
+      if (verbose && !translated) console.error(`[ptrace] pid=${taskPid} sendmsg without rewritable credentials`);
+      continue;
+    }
+    if (syscall===SYS_GETSOCKOPT) {
+      if (Number(getX(state.regs,1))===1 && Number(getX(state.regs,2))===17) // SOL_SOCKET/SO_PEERCRED
+        task.pendingPeerCredentials={buffer:getX(state.regs,3)};
       continue;
     }
     if (syscall===SYS_BIND || syscall===SYS_CONNECT) {
