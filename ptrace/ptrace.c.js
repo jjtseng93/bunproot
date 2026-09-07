@@ -25,7 +25,13 @@ const native = openLibrary("libc", {
 const call = (request, pid, address=0n, data=0n) => native.ptrace(request, pid, address, data);
 const memory = {
   peek: (pid, address) => call(PTRACE_PEEKDATA, pid, address),
-  poke(pid, address, word) { if (call(PTRACE_POKEDATA, pid, address, word) === -1n) throw new Error("PTRACE_POKEDATA failed"); },
+  poke(pid, address, word) {
+    if (call(PTRACE_POKEDATA, pid, address, word) === -1n) {
+      const error=new Error(`PTRACE_POKEDATA failed for pid ${pid} at 0x${address.toString(16)}`);
+      if (verbose) console.error(error.stack);
+      throw error;
+    }
+  },
   read(pid,address,length) {
     const output=new Uint8Array(length), local=new Uint8Array(16), remote=new Uint8Array(16);
     const localView=new DataView(local.buffer), remoteView=new DataView(remote.buffer);
@@ -192,6 +198,17 @@ function isMapped(pid,address) {
     const match=/^([0-9a-f]+)-([0-9a-f]+)\s/.exec(line);
     return match && BigInt(`0x${match[1]}`)<=address && BigInt(`0x${match[2]}`)>address;
   });
+}
+
+function isMappedRange(pid,address,length) {
+  const end=address+BigInt(length);
+  try {
+    return readFileSync(`/proc/${pid}/maps`,"utf8").split("\n").some((line)=>{
+      const match=/^([0-9a-f]+)-([0-9a-f]+)\s+([r-])([w-])/.exec(line);
+      return match && match[4]==="w" && BigInt(`0x${match[1]}`)<=address &&
+        BigInt(`0x${match[2]}`)>=end;
+    });
+  } catch { return false; }
 }
 
 function closeExecDescriptors(pid,trampoline) {
@@ -402,7 +419,10 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
         expanded.push(...hidden);
       } else expanded.push(argv[index]);
     }
-    argv=expanded;
+    // Flatpak normally hides this option in --args, while install triggers
+    // and direct bwrap callers may pass it visibly. Apply the same Android
+    // network-namespace policy to both spellings.
+    argv=expanded.filter((argument)=>argument!=="--unshare-net");
     // Remember bwrap's persistent fd bindings by destination. At mount(2)
     // time the source can be an anonymous /proc/self/fd path whose displayed
     // pathname is not useful; the option list is the stable association and
@@ -1039,6 +1059,8 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
     const isExit=!seccompStop && (phase===2 || (phase===0 && !task.entering));
     if (isExit) {
       task.entering=true;
+      const exitedSyscall=task.activeSyscall;
+      task.activeSyscall=undefined;
       if (task.forcedResult!==undefined) {
         const exited=registers();
         setX(exited.regs,0,task.forcedResult); putRegisters(taskPid,exited);
@@ -1057,7 +1079,14 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
       }
       if (task.pendingStat!==undefined) {
         const exited=registers();
-        if (BigInt.asIntN(64,getX(exited.regs,0))===0n) {
+        // A fork/daemonize event or signal can interleave the entry and exit
+        // stops. Never commit metadata captured for an earlier stat into the
+        // buffer of the syscall that happens to stop next (gpg-agent exposes
+        // this reliably while importing a Flatpak remote key).
+        const matchingSyscall=exitedSyscall===task.pendingStat.syscall;
+        const outputSize=task.pendingStat.kind==="statx"?256:128;
+        const validOutput=isMappedRange(taskPid,task.pendingStat.buffer,outputSize);
+        if (matchingSyscall && validOutput && BigInt.asIntN(64,getX(exited.regs,0))===0n) {
           const { buffer,kind }=task.pendingStat;
           const uidOffset=kind==="statx"?20n:24n;
           writeBytes(memory,taskPid,buffer+uidOffset,new Uint8Array(8));
@@ -1247,6 +1276,7 @@ const exited=registers(), result=exitResult(phase,exited);
     }
     task.entering=false;
     const syscall=(phase===1||phase===3)?syscallInfoNumber():getSyscallNumber(registers().regs);
+    task.activeSyscall=syscall;
     // Nothing to do for a syscall this tracer does not translate, and by far
     // the most syscalls a guest makes are of that kind: reading the registers
     // for every one of them was the single biggest cost per stop.
@@ -1346,15 +1376,15 @@ const exited=registers(), result=exitResult(phase,exited);
       task.forcedResult=1n;
       continue;
     }
-    if (syscall===79) task.pendingStat={buffer:getX(state.regs,2),kind:"stat"};
+    if (syscall===79) task.pendingStat={syscall,buffer:getX(state.regs,2),kind:"stat"};
     if (syscall===80) {
-      task.pendingStat={buffer:getX(state.regs,1),kind:"stat"};
+      task.pendingStat={syscall,buffer:getX(state.regs,1),kind:"stat"};
       try {
         const object=inspectEmulatedObject(mounts.rootfs,readlinkSync(`/proc/${taskPid}/fd/${Number(getX(state.regs,0))}`));
         if (object) task.pendingStat.nlink=object.nlink;
       } catch {}
     }
-    if (syscall===291) task.pendingStat={buffer:getX(state.regs,4),kind:"statx"};
+    if (syscall===291) task.pendingStat={syscall,buffer:getX(state.regs,4),kind:"statx"};
     if (syscall===SYS_GETCWD) {
       task.pendingGetcwd={ buffer:getX(state.regs,0), size:getX(state.regs,1) };
       continue;
