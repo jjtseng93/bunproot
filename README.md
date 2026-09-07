@@ -60,7 +60,7 @@ Licensed **GPL-2.0-or-later**, inherited as a derivative work of PRoot.
 ## Quick start
 
 bunproot needs a Bun built for Android/bionic, and how you get one depends on
-where you are.
+where you are. Any build will do; prefer 1.4.1 or newer.
 
 ### Route 1: Termux, from the TUR repository
 
@@ -76,24 +76,24 @@ bunx bunproot --help
 ### Route 2: an app built with minapk
 
 An app built with [minapk](https://github.com/jjtseng93/minapk) has no npm and
-no npx, so the Bun that runs bunproot has to be the one the APK was built with.
-Two of them work today:
-
-- the Bun binary from Termux's TUR repository, or
-- the official Bun binary run under the `LD_PRELOAD` shim minapk supplies
-  ([oven-sh/bun#39060](https://github.com/oven-sh/bun/issues/39060)).
-
-Either gives the app a `bunx` that can install:
+no npx, so the Bun that runs bunproot is whichever one the APK was built with.
+Where that Bun came from does not matter — the Termux TUR build, the official
+binary, or the official binary under the `LD_PRELOAD` shim posted in
+[oven-sh/bun#39060](https://github.com/oven-sh/bun/issues/39060), which turns
+the blocked `openat2` and `fchmodat2` into `ENOSYS`.
 
 ```sh
 bunx bunproot --help
 ```
 
-A stock official Bun without that shim cannot, because installing on Android
-runs into the platform's seccomp policy
-([oven-sh/bun#39084](https://github.com/oven-sh/bun/pull/39084)). bunproot
-keeps its own entry point at the package root partly for that reason — see the
-comment at the top of `proot.js`. minapk's documentation covers the build side.
+That succeeds on the first run, and it does so while
+[oven-sh/bun#39084](https://github.com/oven-sh/bun/pull/39084) is still open.
+minapk's `bunx` is really `bun i -g bunproot` followed by running the installed
+entry point with `bun` directly, so it never reaches the bin-linking step whose
+`openat2` Android answers with SIGSYS. bunproot helps from its side by keeping
+its own entry point at the package root, where the containment check that calls
+`openat2` is not reached for its `bin` target — see the comment at the top of
+`proot.js`. minapk's documentation covers the build side.
 
 ### Route 3: an Android shell with npm
 
@@ -104,6 +104,13 @@ through npm:
 npm install -g bun
 npx bunproot --help
 ```
+
+Use `npx` for that first run. An official Bun installed this way also has
+`bunx`, but its first `bunx bunproot` is killed by SIGSYS as it finishes
+installing — [oven-sh/bun#39084](https://github.com/oven-sh/bun/pull/39084)
+again — printing no message of its own. The package is already extracted by
+then, so a second run succeeds and keeps succeeding. `npx` never goes through
+that path, and neither does the TUR build's `bunx`.
 
 Every route leaves you with the same `bunproot` command. On platforms other
 than Android, follow the [official Bun installation
@@ -392,7 +399,20 @@ flatpak run --filesystem=/root org.gnome.TextEditor &
 
 ```
 
-The X server must already accept TCP display 0; bunproot does not start it.
+The X server must already accept TCP display 0; bunproot does not start it. On
+Termux with [Termux:X11](https://github.com/termux/termux-x11) installed, that
+is one command, run on the host side before the guest shell:
+
+```sh
+termux-x11 :0 -listen tcp -ac &
+```
+
+`-listen tcp` is what puts display 0 on TCP, and `-ac` drops X's access
+control, so keep this to a device you trust. Leave it running for as long as
+the guest needs it. The `DISPLAY=:0` above needs no `.X11-unix` binding of its
+own: finding no Unix socket for that display inside the rootfs, it falls back
+to TCP by itself.
+
 `dbus-run-session` wraps the whole guest shell, not each application. Every
 application launched from that shell inherits the same
 `DBUS_SESSION_BUS_ADDRESS` and can communicate with the others. Exiting the
@@ -433,9 +453,10 @@ provide network-namespace isolation.
   normal case; a hardened or work-profile environment may not allow it.
 - Android's 64-bit linker at `/system/bin/linker64`, and bionic — found in the
   Runtime APEX on Android 10 and later, in `/system/lib64` before that.
-- A Bun built for Android/bionic, not a glibc one. `bunproot` uses whatever
-  `bun` is on `PATH`, which every route above provides; the `proot` shell
-  launcher additionally falls back to a `bun-android` beside it.
+- A Bun built for Android/bionic, not a glibc one, preferably 1.4.1 or newer.
+  Where it came from does not matter. `bunproot` uses whatever `bun` is on
+  `PATH`, which every route above provides; the `proot` shell launcher
+  additionally falls back to a `bun-android` beside it.
 - An ARM64 Linux rootfs containing the guest ELF and its `PT_INTERP`.
 
 Native library paths are resolved once in `dlpath.js`, which searches the
