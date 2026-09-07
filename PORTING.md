@@ -61,13 +61,28 @@ What to run to check any of this still holds is in
 6. **Process model.** Complete thread groups, clone sharing flags, ptrace exec
    and exit events, signal delivery, and wait status behavior.
 7. **Seccomp.** Replace the broad SIGSYS-to-ENOSYS fallback with syscall-aware
-   emulation or translation.
+   emulation or translation. The fallback is no longer unconditional: a tracee
+   that installed its own SIGSYS handler is given the signal, so a sandbox
+   brokering the blocked syscall for itself -- Firefox's content sandbox does
+   this -- keeps working. Only the default disposition still gets `ENOSYS`.
 8. **Extensions and CLI.** Port fake-id0, link2symlink, ashmem/memfd,
    mountinfo, hidden-files, port-switch, SysV IPC, and the remaining options.
    `-b`/`--bind` is implemented; what is missing from `src/path/binding.c` is
    the glue filesystem that materialises a mount point the rootfs does not
    already contain (`src/path/glue.c`), asymmetric `--root-id` handling, and
    the induced bindings a sub-reconfiguration adds.
+
+   This item measures the file-by-file port, not what works.
+   `extension/link2symlink/` is the only directory carrying a real
+   implementation; the rest of `extension/` is still placeholders. Several of
+   those extensions' behaviours nevertheless work today, because they are
+   implemented directly in `ptrace/ptrace.c.js` instead of in a module of
+   their own: the fake-id0 identity layer, including the `sendmsg` credential
+   substitution of `src/extension/fake_id0/sendmsg.c`, the `SO_PEERCRED`
+   translation of `getsockopt.c`, and the `/proc/self/fd/N`-to-`dup(N)`
+   substitution of `fake_id0.c`; and a synthesized `/proc/self/mountinfo`.
+   What remains for those is moving each into its own module, not making it
+   work.
 9. **Architectures.** Add ELF32/AArch32 and other ABIs after ARM64 behavior is
    stable.
 
@@ -300,6 +315,14 @@ status 0:
 ```sh
 bun i -g --backend=copyfile cowsay
 ```
+
+An `AF_UNIX` pathname never reaches the kernel as a syscall pathname argument:
+it travels inside a `sockaddr`, which openat-style translation never sees.
+`bind` and `connect` therefore translate it separately, out of the sockaddr the
+tracee supplied. Without that, a socket the guest creates under its own `/tmp`
+is attempted at Android's literal `/tmp` and refused by SELinux, which is where
+a D-Bus session bus would otherwise fail. An abstract socket carries a leading
+NUL rather than a pathname and deliberately stays in the host namespace.
 
 Hard-link pathname translation is correct, but Android rejects the underlying
 app-data `linkat` with `EACCES`. Apk's special `/proc/self/fd/N` source form

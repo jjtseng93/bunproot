@@ -34,7 +34,7 @@ function spawnTracee(argv, env) {
   if (status !== 0) throw new Error(`posix_spawn failed: ${status}`);
   return new DataView(pidBytes.buffer).getInt32(0, true);
 }
-const USAGE = "usage: bunproot [-koe|--kill-on-exit] [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]";
+const USAGE = "Usage: bunproot [OPTION ...] -S ROOTFS COMMAND [ARG ...]";
 // Nothing about the usage line says where the rest is, and the rest includes
 // the debug environment variables, so every way of getting the invocation
 // wrong ends by naming --help.

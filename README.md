@@ -221,11 +221,34 @@ by copying five files, with no distribution to download, unpack or trust.
 ## Usage
 
 ```text
-bunproot [-koe|--kill-on-exit] [-b HOST[:GUEST]]... -S ROOTFS COMMAND [ARG ...]
+bunproot [OPTION ...] -S ROOTFS COMMAND [ARG ...]
 ```
+
+Every option belongs before `COMMAND`. Parsing stops at the first argument that
+is not an option, so a `--kill-on-exit` or a `--help` written after `COMMAND`
+is an argument to the guest program instead.
+
+| Option | Effect |
+| --- | --- |
+| `-S`, `--rootfs ROOTFS` | Run `COMMAND` with `ROOTFS` as its root directory. Required |
+| `-b`, `--bind HOST[:GUEST]` | Make a host path visible inside the guest; repeatable. `--bind=SPEC` says the same thing |
+| `-m`, `--mount` | Another name for `--bind`, not a different thing |
+| `--dns MODE` | Which resolver the guest gets: `auto` (default), `simple` or `off`. `--dns=MODE` says the same thing |
+| `-koe`, `--kill-on-exit` | Kill whatever is left of the guest when `COMMAND` exits |
+| `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
+| `-h`, `--help` | The options and the debug environment variables |
+| `-V`, `--version` | The version, then exit |
+
+`PROOT_BUN_VERBOSE`, `PROOT_BUN_PROFILE`, `PROOT_NO_SECCOMP` and
+`PROOT_IGNORE_MISSING_BINDINGS` are environment variables rather than options;
+[Debugging](#debugging) is where they are described.
+
+### The rootfs
 
 `ROOTFS` may be relative. It is resolved to an absolute path before the
 bootstrap changes its working directory.
+
+### Bindings
 
 `-b`/`--bind` (`-m`/`--mount`) makes a host path visible inside the guest, and
 may be repeated. `-b HOST` binds it at the same pathname; `-b HOST:GUEST` binds
@@ -243,6 +266,36 @@ upstream does; `PROOT_IGNORE_MISSING_BINDINGS` silences the report but still
 drops it. `/proc`, `/dev` and `/sys` reach the host kernel filesystems without
 needing a binding.
 
+### The resolver
+
+A rootfs straight from a distribution tarball often carries no
+`/etc/resolv.conf` at all — Alpine's minirootfs does not ship one — so nothing
+inside it can resolve a name until somebody writes one by hand. `--dns` binds
+one in instead, which also keeps a read-only or throwaway rootfs usable without
+editing it. This is not an upstream PRoot feature.
+
+| Mode | What it binds |
+| --- | --- |
+| `auto` | The default: the bundled resolver, but only where the rootfs has none of its own |
+| `simple` | The bundled resolver everywhere, overriding whatever the rootfs carries |
+| `off` | Nothing at all; the rootfs answers for itself, with or without a resolver. `no` and `false` say the same thing |
+
+Both `/etc/resolv.conf` and `/tmp/resolv.conf` are covered — the second is
+where a guest with no writable `/etc` is left writing its own. Binding a file
+needs no file at the guest end: the mount table answers for the pathname
+whether or not the rootfs has it.
+
+`--dns` is expanded where it is written, so it takes part in the same
+last-one-wins rule as any other binding, and your own `-b` on the same pathname
+beats it by coming after:
+
+```sh
+bunproot -S ./alpine --dns=simple /bin/sh -c 'cat /etc/resolv.conf'
+bunproot -S ./alpine --dns=off -b ./my-resolv.conf:/etc/resolv.conf /bin/sh
+```
+
+### Waiting for the guest
+
 Like upstream PRoot, bunproot normally waits for every descendant of `COMMAND`
 to exit. A browser or daemon may leave detached processes behind after an
 interactive shell exits; use `-koe`/`--kill-on-exit` when leaving that shell
@@ -252,7 +305,37 @@ should terminate the whole guest session immediately:
 bunproot -koe -S ./alpine /bin/sh
 ```
 
-### Native bubblewrap
+### The guest's own tools
+
+The guest is a real distribution, so its own tools work:
+
+```sh
+bunproot -S ./alpine /bin/sh -c 'apk add npm && npm i -g bun'
+bunproot -S ./alpine /bin/sh -c 'bun x cowsay hello'
+bunproot -S ./alpine /usr/bin/git clone https://github.com/jjtseng93/jsmdcui /tmp/jsmdcui
+```
+
+[TESTING.md](./TESTING.md) collects these as the regression checks, with what
+each one tells you when it fails.
+
+## Android compatibility
+
+Some of what a Linux guest expects is refused by Android's own policy rather
+than by the kernel, and the guest has no second way to ask. bunproot answers
+those in the tracer, so nothing in the rootfs needs a wrapper, a host helper
+process or an `LD_PRELOAD`.
+
+Android SELinux denies a Linux guest's `NETLINK_ROUTE` queries. bunproot
+substitutes a harmless datagram descriptor and synthesizes the link/address
+dump from the tracer's native `os.networkInterfaces()` result. Consequently a
+guest Bun can use `os.networkInterfaces()` without a wrapper, host Node helper,
+or `LD_PRELOAD`.
+
+`-S` also supplies `/dev`, maps `/dev/udmabuf` to `/dev/null` when a device
+node is unavailable, and provides Android-hidden overflow uid/gid values. These
+are built-in compatibility bindings; no Termux prefix bind is required.
+
+## Native bubblewrap
 
 The guest's real, unmodified `bwrap` can run inside bunproot, without a wrapper
 or `LD_PRELOAD`. Android does not grant the app real mount or user namespaces,
@@ -266,19 +349,10 @@ This is compatibility, not a kernel security boundary: a bwrap payload is
 still protected only by bunproot's ptrace pathname isolation. See the native
 one-file-root regression in [TESTING.md](./TESTING.md#native-bubblewrap).
 
-`proot -S` also supplies `/dev`, maps `/dev/udmabuf` to `/dev/null` when a
-device node is unavailable, and provides Android-hidden overflow uid/gid
-values. These are built-in compatibility bindings; no Termux prefix bind is
-required. A writable `TMPDIR` is required for temporary sandbox roots and
+A writable `TMPDIR` is required, for bwrap's temporary sandbox roots and the
 synthetic mountinfo files.
 
-Android SELinux also denies a Linux guest's `NETLINK_ROUTE` queries. bunproot
-substitutes a harmless datagram descriptor and synthesizes the link/address
-dump from the tracer's native `os.networkInterfaces()` result. Consequently a
-guest Bun can use `os.networkInterfaces()` without a wrapper, host Node helper,
-or `LD_PRELOAD`.
-
-### Flatpak through stock bwrap
+## Flatpak through stock bwrap
 
 Install Flatpak, bubblewrap, D-Bus and a portal backend in the rootfs. The
 applications then run through the distribution's stock `/usr/bin/bwrap`:
@@ -286,7 +360,7 @@ applications then run through the distribution's stock `/usr/bin/bwrap`:
 ```sh
 # 1. Setup {
 
-proot -S "$ROOTFS" /bin/sh
+bunproot -S "$ROOTFS" /bin/sh
 
 apk add fish flatpak xdg-desktop-portal-gtk font-dejavu
 # apk add font-noto-cjk
@@ -353,20 +427,6 @@ network namespace. The other namespaces requested by `--unshare-all` remain
 represented by bunproot. Consequently the emulated sandbox does **not**
 provide network-namespace isolation.
 
-The option belongs before `COMMAND`. A `--kill-on-exit` after `COMMAND` is an
-argument to the guest program instead.
-
-The guest is a real distribution, so its own tools work:
-
-```sh
-bunproot -S ./alpine /bin/sh -c 'apk add npm && npm i -g bun'
-bunproot -S ./alpine /bin/sh -c 'bun x cowsay hello'
-bunproot -S ./alpine /usr/bin/git clone https://github.com/jjtseng93/jsmdcui /tmp/jsmdcui
-```
-
-[TESTING.md](./TESTING.md) collects these as the regression checks, with what
-each one tells you when it fails.
-
 ## What it needs
 
 - An Android device where `ptrace` is permitted for app processes. That is the
@@ -408,10 +468,11 @@ have no upstream counterpart.
 | `PROOT_BUN_VERBOSE=1` | Trace ELF loading, process events, signals, guest exec replacement and pathname rewriting. A memory fault also reports `si_code`, `si_addr`, and the mappings the faulting address and the faulting PC belong to. |
 | `PROOT_BUN_PROFILE=1` | On exit, report how many times the tracer stopped, how many of those stops it handled, how many pathnames it translated, and where the wall clock went. |
 | `PROOT_NO_SECCOMP` | Set to any value to stop on every syscall instead of filtering. Upstream's variable, with upstream's semantics: presence is what counts. This is also the automatic fallback when the filter cannot be installed. |
+| `PROOT_IGNORE_MISSING_BINDINGS` | Set to any value to drop a binding whose host path does not exist without reporting it. The binding is dropped either way; this silences the report. |
 
 ```sh
 PROOT_BUN_VERBOSE=1 PATH="$PWD:$PATH" LD_PRELOAD= \
-  proot -S "$ROOTFS" /bin/ls /
+  bunproot -S "$ROOTFS" /bin/ls /
 ```
 
 Reading a profile: `stops` is what the tracer paid for and `handled` is what it
@@ -420,7 +481,7 @@ with it, two per syscall the *port translates*. A large gap between them means
 the filter is off or is tracing more than it needs to.
 
 ```sh
-PROOT_BUN_PROFILE=1 proot -S "$ROOTFS" /bin/sh -c 'bunx cowsay hello'
+PROOT_BUN_PROFILE=1 bunproot -S "$ROOTFS" /bin/sh -c 'bunx cowsay hello'
 ```
 
 Tests involving FFI must run as a native Android process. Bun inside a glibc
@@ -451,12 +512,21 @@ that cost more time than the bugs did.
   Alpine `apk update` to install downloaded repository indexes. Ordinary
   failed hard links use the relocatable `refs/objs/mets` emulation described
   in [link2symlink.md](./link2symlink.md).
+- An `AF_UNIX` pathname travels in a `sockaddr` rather than as a syscall
+  pathname argument, so `bind` and `connect` are translated separately.
+  Abstract sockets stay in the host namespace.
 - `/proc/<PID>/{exe,cwd,root}` is answered from tracer state rather than from
   the kernel, which still describes the Android bootstrap process because the
   guest image is mapped in instead of `execve`d.
+- Reopening a descriptor through `/proc/self/fd/N` is denied by Android under
+  ptrace, so the open becomes `dup(N)` as in upstream fake_id0, except for an
+  `O_PATH` descriptor, which needs the access mode the open asked for.
 - The emulated `execve` resets signal dispositions and the alternate signal
   stack the way the real one does, so signals -- SIGCHLD in particular -- can be
   forwarded to the guest. Node's `child_process` depends on it.
+- Android's app seccomp policy reports a blocked syscall as SIGSYS. With the
+  default disposition the guest gets `ENOSYS` to fall back on; a sandbox that
+  installed a handler to broker the syscall is given the signal instead.
 - The initial stack reproduces the kernel's string layout, including the
   ascending order within the argv and environment blocks that libuv measures
   `process.title` against.
@@ -471,6 +541,21 @@ that cost more time than the bugs did.
 - `-S` resolves a relative rootfs before changing cwd and enables the current
   fake-id0 layer (`uid=0`, `gid=0`, root supplementary group, and root ownership
   in common stat results).
+- That identity is translated in both directions across a Unix socket: real
+  ids go out in `SCM_CREDENTIALS`, guest ids come back from `SO_PEERCRED`.
+  D-Bus authentication needs both halves.
+- A `NETLINK_ROUTE` socket is emulated rather than opened; see
+  [Android compatibility](#android-compatibility).
+- Mount and user namespaces are emulated in a per-process runtime mount table,
+  with `/proc/self/mountinfo` synthesized from it; see
+  [Native bubblewrap](#native-bubblewrap).
+- A write into a tracee is checked against its writable mappings first: a fork
+  or exec between a syscall's entry and its exit invalidates the buffer the
+  entry remembered.
+- Scratch slots are pooled and returned when a task exits, so a guest with
+  hundreds of simultaneous tasks does not exhaust them.
+- `--kill-on-exit` stops tracing as soon as the root guest exits;
+  `PTRACE_O_EXITKILL` takes the remaining tracees with the tracer.
 - Regenerate missing one-to-one placeholders with:
 
 ```sh
