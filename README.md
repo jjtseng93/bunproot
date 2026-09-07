@@ -284,22 +284,38 @@ Install Flatpak, bubblewrap, D-Bus and a portal backend in the rootfs. The
 applications then run through the distribution's stock `/usr/bin/bwrap`:
 
 ```sh
-proot -S "$ROOTFS" /bin/sh -lc \
-  'apk add flatpak bubblewrap dbus xdg-desktop-portal xdg-desktop-portal-gtk font-dejavu &&
-   flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo &&
-   flatpak install -y flathub org.gnome.TextEditor'
+# 1. Setup {
 
-DISPLAY=127.0.0.1:0 proot -koe -S "$ROOTFS" /bin/sh -lc \
-  'export DISPLAY XDG_RUNTIME_DIR=/run/user/0
-   export XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=x11
-   mkdir -p "$XDG_RUNTIME_DIR"
-   exec dbus-run-session -- /bin/sh'
+proot -S "$ROOTFS" /bin/sh
 
-# Run these at the guest shell prompt. They share one session bus.
-dbus-update-activation-environment \
-  DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+apk add fish flatpak xdg-desktop-portal-gtk font-dejavu
+# apk add font-noto-cjk
+
+fish
+
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+
+flatpak install org.gnome.TextEditor
+
+mkdir -p /run/user/0
+
+# }
+
+
+# 2. Run { (under fish)
+
+export DISPLAY=:0
+export XDG_SESSION_TYPE=x11
+export XDG_RUNTIME_DIR=/run/user/0
+
+dbus-run-session fish
+
 flatpak run --filesystem=/root org.gnome.TextEditor &
-flatpak run ANOTHER.APP
+
+# }
+
+# flatpak run ANOTHER.APP
+
 ```
 
 The X server must already accept TCP display 0; bunproot does not start it.
