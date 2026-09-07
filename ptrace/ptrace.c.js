@@ -1,7 +1,7 @@
 import { FFIType, ptr } from "bun:ffi";
 import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { posix } from "node:path";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { openLibrary } from "../ffi.js";
 import { getPc, getSp, getSyscallNumber, getX, makeIovec, makeRegisterSet, NT_PRSTATUS, setPc, setX } from "../tracee/reg.c.js";
 import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
@@ -110,7 +110,8 @@ const TRAMPOLINE_REGION_SIZE = 16n*1024n*1024n;
 const SYS_READ = 63, SYS_LSEEK = 62, SYS_GETPID = 172, SYS_MMAP = 222;
 const SYS_GETCWD = 17, SYS_DUP = 23, SYS_CHDIR = 49, SYS_FCHDIR = 50, SYS_OPENAT = 56, SYS_CLOSE = 57, SYS_MUNMAP=215;
 const SYS_READLINKAT = 78, SYS_GETDENTS64 = 61;
-const SYS_BIND = 200, SYS_CONNECT = 203, SYS_SENDMSG = 211;
+const SYS_SOCKET = 198, SYS_BIND = 200, SYS_CONNECT = 203, SYS_GETSOCKNAME = 204, SYS_GETPEERNAME=205;
+const SYS_SENDTO = 206, SYS_RECVFROM = 207, SYS_SENDMSG = 211, SYS_RECVMSG = 212;
 const SYS_GETSOCKOPT = 209;
 const SYS_FCHOWNAT = 54, SYS_FCHOWN = 55;
 const SYS_SIGALTSTACK = 132, SYS_RT_SIGACTION = 134, SYS_PRCTL = 167;
@@ -118,6 +119,11 @@ const PTRACE_EVENT_SECCOMP = 7;
 const PR_SET_NO_NEW_PRIVS = 38, PR_SET_SECCOMP = 22, SECCOMP_MODE_FILTER = 2, PR_SET_NAME = 15;
 const TASK_COMM_LEN = 16;
 const DT_REG = 8, DT_LNK = 10;
+const AF_UNIX=1, AF_INET=2, AF_INET6=10, AF_NETLINK=16, NETLINK_ROUTE=0;
+const SOCK_DGRAM=2, SOCK_CLOEXEC=0x80000;
+const MSG_PEEK=2, MSG_TRUNC=0x20;
+const NLM_F_MULTI=2, NLM_F_REQUEST=1, NLM_F_DUMP=0x300;
+const NLMSG_DONE=3, RTM_NEWLINK=16, RTM_GETLINK=18, RTM_NEWADDR=20, RTM_GETADDR=22;
 // Keep this in sync with the original src/syscall/enter.c.  Android commonly
 // rejects namespace creation, while the process/thread creation itself is OK.
 const CLONE_NS_MASK=0x7e020080n;
@@ -544,6 +550,104 @@ const O_NOFOLLOW = 0x8000n;
 // the flag for them -- so they stay REGULAR here too.
 const AT_SYMLINK_NOFOLLOW = 0x100n;
 
+const align4=(value)=>(value+3)&~3;
+function netlinkAttribute(type,data) {
+  const output=new Uint8Array(align4(4+data.length)), view=new DataView(output.buffer);
+  view.setUint16(0,4+data.length,true); view.setUint16(2,type,true); output.set(data,4);
+  return output;
+}
+function netlinkMessage(type,flags,seq,payload,attributes=[]) {
+  const bodyLength=payload.length+attributes.reduce((n,a)=>n+a.length,0);
+  const output=new Uint8Array(align4(16+bodyLength)), view=new DataView(output.buffer);
+  view.setUint32(0,16+bodyLength,true); view.setUint16(4,type,true);
+  view.setUint16(6,flags,true); view.setUint32(8,seq,true); view.setUint32(12,process.pid,true);
+  output.set(payload,16); let offset=16+payload.length;
+  for (const attribute of attributes) { output.set(attribute,offset); offset+=attribute.length; }
+  return output;
+}
+function ipBytes(address,family) {
+  if (family==="IPv4") return Uint8Array.from(address.split(".").map(Number));
+  let [left,right=""]=address.split("::"), lhs=left?left.split(":"):[], rhs=right?right.split(":"):[];
+  const expand=(part)=>part.includes(".")
+    ?[...part.split(".").map(Number)].reduce((a,n,i)=>(i%2?a[a.length-1]|=n:a.push(n<<8),a),[])
+    :[parseInt(part||"0",16)];
+  lhs=lhs.flatMap(expand); rhs=rhs.flatMap(expand);
+  const words=[...lhs,...Array(Math.max(0,8-lhs.length-rhs.length)).fill(0),...rhs].slice(0,8);
+  const output=new Uint8Array(16), view=new DataView(output.buffer);
+  words.forEach((word,index)=>view.setUint16(index*2,word,false)); return output;
+}
+function prefixLength(netmask,family) {
+  return [...ipBytes(netmask,family)].reduce((sum,byte)=>sum+byte.toString(2).split("1").length-1,0);
+}
+function interfaceSnapshot() {
+  const source=networkInterfaces(), indices=new Map(), used=new Set([1]);
+  indices.set("lo",1);
+  for (const [name,addresses] of Object.entries(source)) {
+    if (indices.has(name)) continue;
+    const scoped=addresses.find((item)=>Number(item.scopeid)>0)?.scopeid;
+    if (scoped) { indices.set(name,Number(scoped)); used.add(Number(scoped)); }
+  }
+  let next=2;
+  for (const name of Object.keys(source)) if (!indices.has(name)) {
+    while (used.has(next)) next++; indices.set(name,next); used.add(next++);
+  }
+  return {source,indices};
+}
+function buildNetlinkReply(request) {
+  if (request.length<16) return null;
+  const input=new DataView(request.buffer,request.byteOffset,request.byteLength);
+  const type=input.getUint16(4,true), flags=input.getUint16(6,true), seq=input.getUint32(8,true);
+  const dump=(flags&NLM_F_DUMP)===NLM_F_DUMP, messages=[], {source,indices}=interfaceSnapshot();
+  if (type===RTM_GETLINK) {
+    for (const [name,addresses] of Object.entries(source)) {
+      const internal=addresses.some((item)=>item.internal), payload=new Uint8Array(16), p=new DataView(payload.buffer);
+      payload[0]=0; p.setUint16(2,internal?772:1,true); p.setInt32(4,indices.get(name),true);
+      p.setUint32(8,internal?0x49:0x1043,true); p.setUint32(12,0xffffffff,true);
+      const nameBytes=new TextEncoder().encode(`${name}\0`), mtu=new Uint8Array(4);
+      new DataView(mtu.buffer).setUint32(0,internal?65536:1500,true);
+      const mac=(addresses.find((item)=>item.mac&&item.mac!=="00:00:00:00:00:00")?.mac??"00:00:00:00:00:00")
+        .split(":").map((part)=>parseInt(part,16));
+      messages.push(netlinkMessage(RTM_NEWLINK,dump?NLM_F_MULTI:0,seq,payload,[
+        netlinkAttribute(3,nameBytes),netlinkAttribute(4,mtu),netlinkAttribute(1,Uint8Array.from(mac))]));
+    }
+  } else if (type===RTM_GETADDR) {
+    const wanted=request.length>16?request[16]:0;
+    for (const [name,addresses] of Object.entries(source)) for (const item of addresses) {
+      const family=item.family==="IPv4"?AF_INET:item.family==="IPv6"?AF_INET6:0;
+      if (!family || (wanted!==0 && wanted!==family)) continue;
+      const address=ipBytes(item.address,item.family), payload=new Uint8Array(8), p=new DataView(payload.buffer);
+      payload[0]=family; payload[1]=prefixLength(item.netmask,item.family); payload[3]=item.internal?254:
+        (family===AF_INET6&&item.address.toLowerCase().startsWith("fe80:"))?253:0;
+      p.setUint32(4,indices.get(name),true);
+      messages.push(netlinkMessage(RTM_NEWADDR,dump?NLM_F_MULTI:0,seq,payload,[
+        netlinkAttribute(1,address),netlinkAttribute(2,address),
+        netlinkAttribute(3,new TextEncoder().encode(`${name}\0`))]));
+    }
+  }
+  const done=new Uint8Array(16), doneView=new DataView(done.buffer);
+  doneView.setUint32(0,16,true); doneView.setUint16(4,NLMSG_DONE,true); doneView.setUint32(8,seq,true);
+  messages.push(done);
+  const total=messages.reduce((n,message)=>n+message.length,0), output=new Uint8Array(total);
+  let offset=0; for (const message of messages) { output.set(message,offset); offset+=message.length; }
+  return output;
+}
+function msghdrIov(pid,address) {
+  if (address<4096n) return null;
+  const header=readTraceeBytes(pid,address,32), view=new DataView(header.buffer,header.byteOffset,header.byteLength);
+  const iov=view.getBigUint64(16,true), count=view.getBigUint64(24,true);
+  if (iov<4096n || count===0n) return null;
+  const entry=readTraceeBytes(pid,iov,16), iv=new DataView(entry.buffer,entry.byteOffset,entry.byteLength);
+  return {base:iv.getBigUint64(0,true),length:iv.getBigUint64(8,true)};
+}
+function writeNetlinkAddress(pid,address,lengthAddress,length) {
+  if (address<4096n || lengthAddress<4096n) return;
+  const available=new DataView(readTraceeBytes(pid,lengthAddress,4).buffer).getUint32(0,true);
+  const sockaddr=new Uint8Array(12); new DataView(sockaddr.buffer).setUint16(0,AF_NETLINK,true);
+  writeTraceeBytes(pid,address,sockaddr.subarray(0,Math.min(available,12)),BigInt(available));
+  const size=new Uint8Array(4); new DataView(size.buffer).setUint32(0,12,true);
+  writeTraceeBytes(pid,lengthAddress,size,4n);
+}
+
 // Linux arm64 syscall -> pathname registers. Symlink targets are intentionally
 // not translated; only the directory entry being created is a host pathname.
 const PATH_ARGUMENTS = new Map([
@@ -567,7 +671,8 @@ const PATH_ARGUMENTS = new Map([
 const HANDLED_ON_ENTER=new Set([...PATH_ARGUMENTS.keys(),
   SYS_MUNMAP, SYS_GETCWD, SYS_CLOSE, SYS_GETDENTS64, SYS_READLINKAT, SYS_FCHDIR,
   SYS_FCHOWNAT, SYS_FCHOWN,
-  SYS_BIND, SYS_CONNECT, SYS_SENDMSG, SYS_GETSOCKOPT,
+  SYS_SOCKET, SYS_BIND, SYS_CONNECT, SYS_GETSOCKNAME, SYS_GETPEERNAME,
+  SYS_SENDTO, SYS_RECVFROM, SYS_SENDMSG, SYS_RECVMSG, SYS_GETSOCKOPT,
   39,40,41,97,268,       // umount2, mount, pivot_root, unshare, setns
   79, 80, 291,          // fstat, newfstatat, statx
   144,145,146,147,148,149,150,151,152,158,159, // set*id, getres*id, getgroups
@@ -925,6 +1030,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
   const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null,
     pendingCwd:null, pendingGetcwd:null, cwd:"/", configured:true, seenStop:true,
     openedHostFds:new Map(), openedGuestFds:new Map(), mounts,
+    fakeNetlink:new Map(),
     scratch:trampoline+4096n+512n, scratchSlot:1n,
     exe:guest===null?null:guest.guestPath??guestPathOf(mounts,guest.executable) }]]);
   tasks.get(pid).trampoline=trampoline;
@@ -1015,6 +1121,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
         inherited.usernsAfterLimit=task.usernsAfterLimit;
         inherited.openedHostFds=new Map(task.openedHostFds??[]);
         inherited.openedGuestFds=new Map(task.openedGuestFds??[]);
+        inherited.fakeNetlink=new Map([...task.fakeNetlink??[]].map(([fd])=>[fd,null]));
         inherited.bwrapFdMounts=new Map(task.bwrapFdMounts??[]);
         inherited.mounts=task.pendingChildMountNamespace?task.mounts.clone():task.mounts;
         task.pendingChildMountNamespace=false;
@@ -1102,6 +1209,14 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
         const exited=registers();
         setX(exited.regs,0,task.forcedResult); putRegisters(taskPid,exited);
         task.forcedResult=undefined;
+      }
+      if (task.pendingFakeNetlinkSocket!==undefined) {
+        const exited=registers(), result=BigInt.asIntN(64,getX(exited.regs,0));
+        if (exitedSyscall===SYS_SOCKET && result>=0n) {
+          task.fakeNetlink??=new Map(); task.fakeNetlink.set(Number(result),null);
+          if (verbose) console.error(`[ptrace] pid=${taskPid} emulated NETLINK_ROUTE fd=${result}`);
+        }
+        task.pendingFakeNetlinkSocket=undefined;
       }
       if (task.idWrites!==undefined) {
         // A uid_t is four bytes and PTRACE_POKEDATA writes eight, so these
@@ -1361,6 +1476,65 @@ const exited=registers(), result=exitResult(phase,exited);
       task.forcedResult=0n;
       continue;
     }
+    if (syscall===SYS_SOCKET && Number(getX(state.regs,0))===AF_NETLINK &&
+        Number(getX(state.regs,2))===NETLINK_ROUTE) {
+      const type=Number(getX(state.regs,1));
+      setX(state.regs,0,BigInt(AF_UNIX));
+      setX(state.regs,1,BigInt(SOCK_DGRAM|(type&SOCK_CLOEXEC)));
+      setX(state.regs,2,0n); putRegisters(taskPid,state);
+      task.pendingFakeNetlinkSocket=true;
+      continue;
+    }
+    const socketFd=Number(BigInt.asIntN(32,getX(state.regs,0)));
+    const fakeNetlink=task.fakeNetlink?.has(socketFd);
+    if (fakeNetlink && (syscall===SYS_BIND || syscall===SYS_CONNECT)) {
+      if (verbose) console.error(`[ptrace] pid=${taskPid} netlink ${syscall===SYS_BIND?"bind":"connect"}`);
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID); task.forcedResult=0n; continue;
+    }
+    if (fakeNetlink && (syscall===SYS_GETSOCKNAME || syscall===SYS_GETPEERNAME)) {
+      if (verbose) console.error(`[ptrace] pid=${taskPid} netlink ${syscall===SYS_GETSOCKNAME?"getsockname":"getpeername"}`);
+      writeNetlinkAddress(taskPid,getX(state.regs,1),getX(state.regs,2));
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID); task.forcedResult=0n; continue;
+    }
+    if (fakeNetlink && (syscall===SYS_SENDTO || syscall===SYS_SENDMSG)) {
+      let base=getX(state.regs,1), length=getX(state.regs,2);
+      if (syscall===SYS_SENDMSG) {
+        const iov=msghdrIov(taskPid,base); base=iov?.base??0n; length=iov?.length??0n;
+      }
+      const request=base>=4096n?readTraceeBytes(taskPid,base,Number(length)):new Uint8Array();
+      task.fakeNetlink.set(socketFd,buildNetlinkReply(request));
+      if (verbose) console.error(`[ptrace] pid=${taskPid} netlink send syscall=${syscall} bytes=${length}`);
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID); task.forcedResult=length; continue;
+    }
+    if (fakeNetlink && (syscall===SYS_RECVFROM || syscall===SYS_RECVMSG)) {
+      const reply=task.fakeNetlink.get(socketFd);
+      if (reply) {
+        let base=getX(state.regs,1), capacity=getX(state.regs,2), name=0n, nameLength=0n;
+        const receiveFlags=Number(getX(state.regs,syscall===SYS_RECVMSG?2:3));
+        if (verbose) console.error(`[ptrace] pid=${taskPid} netlink recv syscall=${syscall} reply=${reply.length} capacity=${capacity} flags=${receiveFlags}`);
+        if (syscall===SYS_RECVMSG) {
+          const header=readTraceeBytes(taskPid,base,56), headerView=new DataView(header.buffer,header.byteOffset,header.byteLength);
+          name=headerView.getBigUint64(0,true);
+          const iov=msghdrIov(taskPid,base); base=iov?.base??0n; capacity=iov?.length??0n;
+          if (name>=4096n) {
+            const available=headerView.getUint32(8,true), sockaddr=new Uint8Array(12);
+            new DataView(sockaddr.buffer).setUint16(0,AF_NETLINK,true);
+            writeTraceeBytes(taskPid,name,sockaddr.subarray(0,Math.min(available,12)),BigInt(available));
+            const updated=new Uint8Array(4); new DataView(updated.buffer).setUint32(0,12,true);
+            writeTraceeBytes(taskPid,getX(state.regs,1)+8n,updated,4n);
+          }
+          const messageFlags=new Uint8Array(4);
+          new DataView(messageFlags.buffer).setUint32(0,reply.length>Number(capacity)?MSG_TRUNC:0,true);
+          writeTraceeBytes(taskPid,getX(state.regs,1)+48n,messageFlags,4n);
+        } else { name=getX(state.regs,4); nameLength=getX(state.regs,5); }
+        const copied=Math.min(reply.length,Number(capacity));
+        if (base>=4096n && copied>0) writeTraceeBytes(taskPid,base,reply.subarray(0,copied),capacity);
+        if (syscall===SYS_RECVFROM) writeNetlinkAddress(taskPid,name,nameLength);
+        if ((receiveFlags&MSG_PEEK)===0) task.fakeNetlink.set(socketFd,null);
+        const received=(receiveFlags&MSG_TRUNC)!==0?reply.length:copied;
+        setKernelSyscallNumber(taskPid,state,SYS_GETPID); task.forcedResult=BigInt(received); continue;
+      }
+    }
     if (syscall===SYS_SENDMSG) {
       // fake_id0 makes the guest report uid/gid 0, and GDBus includes those
       // values in SCM_CREDENTIALS during authentication. The kernel compares
@@ -1538,6 +1712,7 @@ const exited=registers(), result=exitResult(phase,exited);
       // pathname against the backing object, so stale records are harmless.
       task.openedHostFds?.delete(Number(BigInt.asIntN(32,getX(state.regs,0))));
       task.openedGuestFds?.delete(Number(BigInt.asIntN(32,getX(state.regs,0))));
+      task.fakeNetlink?.delete(Number(BigInt.asIntN(32,getX(state.regs,0))));
       continue;
     }
     if (syscall===SYS_GETDENTS64) {

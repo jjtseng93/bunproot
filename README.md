@@ -272,6 +272,12 @@ values. These are built-in compatibility bindings; no Termux prefix bind is
 required. A writable `TMPDIR` is required for temporary sandbox roots and
 synthetic mountinfo files.
 
+Android SELinux also denies a Linux guest's `NETLINK_ROUTE` queries. bunproot
+substitutes a harmless datagram descriptor and synthesizes the link/address
+dump from the tracer's native `os.networkInterfaces()` result. Consequently a
+guest Bun can use `os.networkInterfaces()` without a wrapper, host Node helper,
+or `LD_PRELOAD`.
+
 ### Flatpak through stock bwrap
 
 Install Flatpak, bubblewrap, D-Bus and a portal backend in the rootfs. The

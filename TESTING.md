@@ -34,6 +34,7 @@ Each line names what breaks when it fails, so a red one points somewhere.
 | `proot -S "$ROOTFS" /usr/bin/wget -q -O- https://example.com` | An absolute guest symlink (`/usr/bin/wget -> /bin/busybox`), TLS, and `ssl_client`'s completion path |
 | `proot -S "$ROOTFS" /sbin/apk fix` | Archive extraction and ownership. Must print `OK: … in N packages` with **no** error count. It repairs what a first install got wrong, so run [the fresh-rootfs check](#a-rootfs-nothing-has-touched-yet) too |
 | `proot -S "$ROOTFS" /usr/bin/node -e 'require("child_process").execSync("echo hi")'` | SIGCHLD forwarding, which needs the signal dispositions an emulated exec resets |
+| `proot -S "$ROOTFS" bun -e 'console.log(require("node:os").networkInterfaces())'` | Android-denied `NETLINK_ROUTE`: the guest result must contain the same IPv4/IPv6 interface set as native Bun, not throw `getifaddrs` errno 13 |
 | `proot -S "$ROOTFS" /bin/sh -c 'npm --version && npm root -g'` | Environment hygiene: the answer must be a guest path, never a host one |
 | `proot -S "$ROOTFS" -b /some/dir:/mnt /bin/sh -c 'cat /mnt/f; cd /mnt && pwd'` | Bindings in both directions, including `getcwd` detranslation |
 | `proot -S "$ROOTFS" /bin/sh -c 'readlink /proc/self/exe; cat /proc/$$/comm; :'` | The state a mapped-in image cannot inherit from `execve`. The trailing `:` matters: without it the shell execs itself away into the last command, and `$$` names that command instead |
