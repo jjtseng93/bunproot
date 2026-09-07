@@ -23,6 +23,30 @@ export function openLibrary(name, symbols = definitions[name]) {
   return handles.get(cacheKey);
 }
 
+/**
+ * The same library, opened at first use instead of at import time.
+ *
+ * A module that binds its symbols at the top level makes importing it depend
+ * on Android's bionic being present, which is how `--version`, `--help` and
+ * `--readme` came to fail on a host where dlopen cannot succeed -- before
+ * `run()` was ever called, so the CLI could not even report the problem in its
+ * own words. Symbol lookups still happen on first access, so a real tracer run
+ * fails exactly where it used to.
+ */
+export function lazySymbols(name, symbols) {
+  let loaded = null;
+  return new Proxy(Object.create(null), {
+    get(_, property) {
+      // Only a named symbol loads the library: an inspector reaching for
+      // Symbol.toStringTag must not trigger a dlopen the caller never asked
+      // for.
+      if (typeof property !== "string") return undefined;
+      loaded ??= openLibrary(name, symbols).symbols;
+      return loaded[property];
+    },
+  });
+}
+
 export function cString(value) {
   return new TextEncoder().encode(`${value}\0`);
 }

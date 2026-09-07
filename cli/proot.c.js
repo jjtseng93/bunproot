@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { FFIType, ptr } from "bun:ffi";
-import { cString, openLibrary } from "../ffi.js";
+import { cString, lazySymbols } from "../ffi.js";
 import { readElfInterpreter } from "../execve/elf.c.js";
 import { expandShebang, makeGuestPaths } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
@@ -13,9 +13,9 @@ import { parseDnsMode, resolverBindings } from "../dns.js";
 
 const OVERFLOW_ID = resolve(import.meta.dir,"../fakeid.txt");
 
-const { posix_spawn } = openLibrary("libc", {
+const libc = lazySymbols("libc", {
   posix_spawn: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
-}).symbols;
+});
 
 function pointerVector(strings) {
   const storage = strings.map(cString);
@@ -30,7 +30,7 @@ function spawnTracee(argv, env) {
   const args = pointerVector(argv);
   const environment = pointerVector(Object.entries(env).map(([key, value]) => `${key}=${value}`));
   const pidBytes = new Uint8Array(4);
-  const status = posix_spawn(ptr(pidBytes), ptr(path), null, null, ptr(args.vector), ptr(environment.vector));
+  const status = libc.posix_spawn(ptr(pidBytes), ptr(path), null, null, ptr(args.vector), ptr(environment.vector));
   if (status !== 0) throw new Error(`posix_spawn failed: ${status}`);
   return new DataView(pidBytes.buffer).getInt32(0, true);
 }

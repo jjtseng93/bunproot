@@ -2,7 +2,7 @@ import { FFIType, ptr } from "bun:ffi";
 import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { posix } from "node:path";
 import { networkInterfaces, tmpdir } from "node:os";
-import { openLibrary } from "../ffi.js";
+import { lazySymbols } from "../ffi.js";
 import { getPc, getSp, getSyscallNumber, getX, makeIovec, makeRegisterSet, NT_PRSTATUS, setPc, setX } from "../tracee/reg.c.js";
 import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
 import { readElfLoadInfo, relocateElf } from "../execve/elf.c.js";
@@ -17,11 +17,11 @@ const PTRACE_PEEKTEXT=1, PTRACE_PEEKDATA=2, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5
 const PTRACE_CONT=7, PTRACE_ATTACH=16, PTRACE_SYSCALL=24;
 const PTRACE_GETREGSET=0x4204, PTRACE_SETREGSET=0x4205, PTRACE_SETOPTIONS=0x4200;
 const PTRACE_GET_SYSCALL_INFO=0x420e, PTRACE_GETSIGINFO=0x4202;
-const native = openLibrary("libc", {
+const native = lazySymbols("libc", {
   ptrace: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.u64], returns: FFIType.i64 },
   waitpid: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
   process_vm_readv: { args: [FFIType.i32,FFIType.ptr,FFIType.u64,FFIType.ptr,FFIType.u64,FFIType.u64], returns:FFIType.i64 },
-}).symbols;
+});
 const call = (request, pid, address=0n, data=0n) => native.ptrace(request, pid, address, data);
 const memory = {
   peek: (pid, address) => call(PTRACE_PEEKDATA, pid, address),
