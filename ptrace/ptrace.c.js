@@ -1,5 +1,5 @@
 import { FFIType, ptr } from "bun:ffi";
-import { constants as fsConstants, copyFileSync, existsSync, readFileSync, readdirSync, readlinkSync } from "node:fs";
+import { constants as fsConstants, copyFileSync, existsSync, readFileSync, readdirSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { posix } from "node:path";
 import { openLibrary } from "../ffi.js";
 import { getPc, getSp, getSyscallNumber, getX, makeIovec, makeRegisterSet, NT_PRSTATUS, setPc, setX } from "../tracee/reg.c.js";
@@ -503,6 +503,7 @@ const PATH_ARGUMENTS = new Map([
 const HANDLED_ON_ENTER=new Set([...PATH_ARGUMENTS.keys(),
   SYS_MUNMAP, SYS_GETCWD, SYS_CLOSE, SYS_GETDENTS64, SYS_READLINKAT, SYS_FCHDIR,
   SYS_FCHOWNAT, SYS_FCHOWN,
+  39,40,41,97,268,       // umount2, mount, pivot_root, unshare, setns
   79, 80, 291,          // fstat, newfstatat, statx
   144,145,146,147,148,149,150,151,152,158,159, // set*id, getres*id, getgroups
   174,175,176,177,      // getuid, geteuid, getgid, getegid
@@ -530,6 +531,10 @@ function fdGuestBase(pid,mounts,task,fd) {
   if (fd===-100) return task.cwd;
   const host=readlinkSync(`/proc/${pid}/fd/${fd}`);
   const guest=mounts.toGuest(host);
+  // Descriptors for the pass-through kernel trees deliberately point outside
+  // the rootfs.  They still name the same absolute path in the guest, and may
+  // be used as dirfds for a more-specific explicit binding below that tree.
+  if (guest===null && isKernelFilesystem(host)) return host;
   if (guest===null) throw new Error(`dirfd ${fd} points outside the guest namespace: ${host}`);
   return guest;
 }
@@ -547,8 +552,65 @@ function resolveGuestPath(pid,mounts,task,state,path,spec) {
     {derefFinal:spec.deref!==false&&!flagSaysNoFollow,preserveInternalFinal:spec.preserveL2s===true});
 }
 
+function emulateNamespaceFilesystem(pid,mounts,task,state,syscall) {
+  if (syscall===40) { // mount(source, target, fstype, flags, data)
+    const sourceAddress=getX(state.regs,0), targetAddress=getX(state.regs,1);
+    if (targetAddress<4096n) return;
+    const target=resolveGuestInput(pid,mounts,task,state,readCString(memory,pid,targetAddress),{});
+    const flags=getX(state.regs,3);
+    if ((flags&0x1000n)!==0n && sourceAddress>=4096n) { // MS_BIND
+      const source=resolveGuestPath(pid,mounts,task,state,readCString(memory,pid,sourceAddress),{});
+      const oldKernel=/^\/oldroot(\/proc|\/dev|\/sys)(?:\/|$)/.exec(source);
+      let host=oldKernel?source.slice("/oldroot".length):mounts.toHost(source);
+      if (target==="/newroot" && task.lastExternalSourceHost) host=task.lastExternalSourceHost;
+      if (target.startsWith("/proc/self/fd/")) return;
+      mounts.bind(host,target);
+      if (verbose) console.error(`[ptrace] pid=${pid} emulated bind ${source} -> ${target}`);
+    } else {
+      const fstypeAddress=getX(state.regs,2);
+      const fstype=fstypeAddress>=4096n?readCString(memory,pid,fstypeAddress):"";
+      const host={proc:"/proc",sysfs:"/sys",devtmpfs:"/dev",devpts:"/dev/pts"}[fstype];
+      if (host) {
+        mounts.bind(host,target);
+        if (verbose) console.error(`[ptrace] pid=${pid} emulated ${fstype} ${host} -> ${target}`);
+      }
+    }
+    return;
+  }
+  if (syscall===41) { // pivot_root(new_root, put_old)
+    const newRoot=resolveGuestInput(pid,mounts,task,state,readCString(memory,pid,getX(state.regs,0)),{});
+    const oldArg=readCString(memory,pid,getX(state.regs,1));
+    const oldAbsolute=oldArg.startsWith("/")?oldArg:posix.resolve(newRoot,oldArg);
+    const putOld=oldArg===readCString(memory,pid,getX(state.regs,0))?null:
+      (oldAbsolute===newRoot?"/":oldAbsolute.startsWith(`${newRoot}/`)
+        ?oldAbsolute.slice(newRoot.length):oldAbsolute);
+    mounts.pivot(newRoot,putOld);
+    task.pivoted=true;
+    task.cwd=task.cwd===newRoot?"/":task.cwd.startsWith(`${newRoot}/`)?task.cwd.slice(newRoot.length):task.cwd;
+    if (verbose) console.error(`[ptrace] pid=${pid} emulated pivot_root ${newRoot} -> /`);
+    return;
+  }
+  if (syscall===39) { // umount2(target, flags)
+    const address=getX(state.regs,0);
+    if (address>=4096n) {
+      const target=resolveGuestInput(pid,mounts,task,state,readCString(memory,pid,address),{});
+      mounts.unbind(target);
+    }
+  }
+}
+
 function isKernelFilesystem(path) {
   return ["/proc","/dev","/sys"].some((prefix)=>path===prefix||path.startsWith(`${prefix}/`));
+}
+
+// Kernel filesystems normally stay in the host namespace, but an explicit
+// binding below /proc, /dev or /sys must still win.  enter_rootfs uses this
+// for Android's unreadable overflowuid/overflowgid sysctls, and upstream
+// PRoot likewise resolves the most-specific binding before its /proc special
+// handling.
+function hasKernelFilesystemBinding(mounts,path) {
+  return mounts.entries.some(({guest})=>guest!=="/" &&
+    (path===guest || path.startsWith(`${guest}/`)));
 }
 
 // writeBytes() stores whole 8-byte words. A readlink(2) result lands in a
@@ -636,6 +698,7 @@ function resolveProcLink(taskPid,tasks,guestPath) {
 
 export function traceProcess(pid, mounts, guest = null, { killOnExit = false } = {}) {
   const started=performance.now();
+  const mountinfoPath=posix.join(process.cwd(),`.bunproot-mountinfo-${pid}`);
   const initial = wait(pid, 2); // WUNTRACED: observe the pre-exec SIGSTOP.
   if ((initial & 0xff) !== 0x7f) throw new Error("tracee did not stop before exec");
   if (call(PTRACE_ATTACH, pid) < 0n) throw new Error("PTRACE_ATTACH failed");
@@ -748,7 +811,8 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
         if (scratchSlot*4096n>=TRAMPOLINE_REGION_SIZE) throw new Error("tracee scratch space exhausted");
         const inherited={ pendingExec:null, pendingCwd:null, pendingGetcwd:null,
           cwd:task.cwd, exe:task.exe, trampoline:task.trampoline, borrowPc:task.borrowPc,
-          scratch:task.trampoline+scratchSlot*4096n+512n, scratchSlot, configured:true };
+          scratch:task.trampoline+scratchSlot*4096n+512n, scratchSlot, configured:true,
+          namespaceEmulated:task.namespaceEmulated, pivoted:task.pivoted };
         // The child may already be tracked, having stopped before this event
         // arrived; then it is only missing what it could not know, and its own
         // run state is the accurate one.
@@ -771,6 +835,19 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
       }
       if (verbose)
         console.error(`[ptrace] pid=${taskPid} signal=${signal} pc=0x${getPc(stopped.regs).toString(16)} syscall=${getSyscallNumber(stopped.regs)}${describeFault(taskPid,signal,getPc(stopped.regs),getX(stopped.regs,30))}`);
+      if (signal===31 && [39,40,41,97,268].includes(getSyscallNumber(stopped.regs))) {
+        // Android's platform seccomp can reject namespace syscalls before our
+        // SECCOMP_RET_TRACE filter gets an entry stop.  A consumed SIGSYS is
+        // already past the svc instruction, so supply the emulated success
+        // directly, matching the normal handled-on-enter path below.
+        const blockedSyscall=getSyscallNumber(stopped.regs);
+        task.namespaceEmulated=true;
+        if ([39,40,41].includes(blockedSyscall))
+          emulateNamespaceFilesystem(taskPid,mounts,task,stopped,blockedSyscall);
+        setX(stopped.regs,0,0n); putRegisters(taskPid,stopped);
+        task.entering=true;
+        continue;
+      }
       // Android's app seccomp reports blocked syscalls as SIGSYS.  A guest
       // with the default disposition needs ENOSYS so libc can fall back, but
       // sandboxes such as Firefox's deliberately install a SIGSYS handler to
@@ -933,6 +1010,9 @@ const exited=registers(), result=exitResult(phase,exited);
             setX(exited.regs,0,BigInt.asUintN(64,finalResult)); putRegisters(taskPid,exited);
           }
         }
+        if (task.pendingPathSyscall===34 && finalResult===-17n && task.namespaceEmulated) {
+          setX(exited.regs,0,0n); putRegisters(taskPid,exited); finalResult=0n;
+        }
         if (finalResult<0n && verbose)
           console.error(`[ptrace] pid=${taskPid} syscall=${task.pendingPathSyscall} result=${finalResult}`+
             (task.pendingPaths?.length?` paths=${task.pendingPaths.join(" -> ")}`:""));
@@ -994,6 +1074,17 @@ const exited=registers(), result=exitResult(phase,exited);
     // then fall back to running free until the filter traps the next one.
     if (seccompStop) task.restart=PTRACE_SYSCALL;
     const state=registers();
+    if ([39,40,41,97,268].includes(syscall)) {
+      // Android denies unprivileged namespaces and mounts.  Like the upstream
+      // Android PRoot branch, keep bwrap's setup state machine moving while
+      // pathname isolation remains enforced by this tracer's runtime binding
+      // table, including mount/pivot/umount transitions.
+      task.namespaceEmulated=true;
+      if ([39,40,41].includes(syscall)) emulateNamespaceFilesystem(taskPid,mounts,task,state,syscall);
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+      task.forcedResult=0n;
+      continue;
+    }
     if (syscall===SYS_MUNMAP) {
       const start=getX(state.regs,0), end=start+getX(state.regs,1);
       const protectedEnd=task.trampoline+TRAMPOLINE_REGION_SIZE;
@@ -1197,9 +1288,29 @@ const exited=registers(), result=exitResult(phase,exited);
         scratch+=BigInt((new TextEncoder().encode(host).length+8)&~7); changed=true;
         continue;
       }
-      if (isKernelFilesystem(guestPath)||guestPath.startsWith(`${mounts.rootfs}/`)) {
+      if ((isKernelFilesystem(guestPath)&&!task.pivoted&&!hasKernelFilesystemBinding(mounts,guestPath))||
+          guestPath.startsWith(`${mounts.rootfs}/`)) {
         if (syscall===37)
           hostPaths.push(guestPath.replace(/^\/proc\/self(?=\/|$)/,`/proc/${taskPid}`));
+        continue;
+      }
+      if (isKernelFilesystem(guestPath)&&hasKernelFilesystemBinding(mounts,guestPath)) {
+        if (/^\/proc\/(?:self|thread-self|\d+)\/mountinfo$/.test(guestPath)) {
+          const escape=(value)=>value.replace(/\\/g,"\\134").replace(/ /g,"\\040")
+            .replace(/\t/g,"\\011").replace(/\n/g,"\\012");
+          const lines=mounts.entries.map((entry,index)=>
+            `${1000+index} 1 0:1 ${escape(entry.host)} ${escape(entry.guest)} rw - bind ${escape(entry.host)} rw`);
+          writeFileSync(mountinfoPath,`${lines.join("\n")}\n`);
+          hostPaths.push(mountinfoPath); guestPaths.push(guestPath);
+          writeCString(memory,taskPid,scratch,mountinfoPath); setX(state.regs,spec.path,scratch);
+          scratch+=BigInt((new TextEncoder().encode(mountinfoPath).length+8)&~7); changed=true;
+          continue;
+        }
+        const kernelGuest=guestPath.replace(/^\/proc\/self(?=\/|$)/,`/proc/${taskPid}`);
+        const host=mounts.toHost(kernelGuest);
+        hostPaths.push(host); guestPaths.push(guestPath);
+        writeCString(memory,taskPid,scratch,host); setX(state.regs,spec.path,scratch);
+        scratch+=BigInt((new TextEncoder().encode(host).length+8)&~7); changed=true;
         continue;
       }
       let inputGuest, absoluteGuest;
@@ -1209,10 +1320,33 @@ const exited=registers(), result=exitResult(phase,exited);
         absoluteGuest=timed("canon",()=>resolveGuestPath(taskPid,mounts,task,state,guestPath,spec));
       }
       catch (error) { throw new Error(`pid ${taskPid} syscall ${syscall}: ${error.message}`); }
+      if (/^\/proc\/(?:self|thread-self|\d+)\/mountinfo$/.test(absoluteGuest)) {
+        const escape=(value)=>value.replace(/\\/g,"\\134").replace(/ /g,"\\040")
+          .replace(/\t/g,"\\011").replace(/\n/g,"\\012");
+        const lines=mounts.entries.map((entry,index)=>
+          `${1000+index} 1 0:1 ${escape(entry.host)} ${escape(entry.guest)} rw - bind ${escape(entry.host)} rw`);
+        writeFileSync(mountinfoPath,`${lines.join("\n")}\n`);
+        hostPaths.push(mountinfoPath); guestPaths.push(absoluteGuest);
+        writeCString(memory,taskPid,scratch,mountinfoPath); setX(state.regs,spec.path,scratch);
+        scratch+=BigInt((new TextEncoder().encode(mountinfoPath).length+8)&~7); changed=true;
+        continue;
+      }
+      // A relative pathname below a /proc, /dev or /sys dirfd reaches this
+      // point without looking like a kernel path until the dirfd is resolved.
+      // Keep it literal unless a more-specific binding intentionally replaces
+      // it (for example /proc/sys/kernel/overflowuid).
+      if (isKernelFilesystem(absoluteGuest)&&!task.pivoted&&!hasKernelFilesystemBinding(mounts,absoluteGuest)) {
+        hostPaths.push(absoluteGuest);
+        guestPaths.push(absoluteGuest);
+        continue;
+      }
       if (syscall===SYS_CHDIR && spec.path===0) task.pendingCwd=absoluteGuest;
       if (syscall===SYS_OPENAT && absoluteGuest.startsWith(L2S_OBJS))
         task.pendingOpenAlias=canonicalizeGuestPath(mounts,inputGuest,{preserveInternalFinal:true});
       const host=mounts.toHost(absoluteGuest);
+      if (syscall===SYS_OPENAT && task.pivoted && !host.startsWith(mounts.rootfs) &&
+          !host.startsWith("/proc/") && !host.startsWith("/dev/") && !host.startsWith("/sys/"))
+        task.lastExternalSourceHost=host;
       hostPaths.push(host);
       guestPaths.push(absoluteGuest);
       if ((syscall===79 || syscall===291) && task.pendingStat) {
@@ -1244,5 +1378,6 @@ const exited=registers(), result=exitResult(phase,exited);
     if (changed) putRegisters(taskPid,state);
   }
   report(performance.now()-started);
+  try { unlinkSync(mountinfoPath); } catch {}
   return rootExit;
 }

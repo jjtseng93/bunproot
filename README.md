@@ -252,6 +252,18 @@ should terminate the whole guest session immediately:
 bunproot -koe -S ./alpine /bin/sh
 ```
 
+### Native bubblewrap
+
+The guest's real `bwrap` can run inside bunproot. Android does not grant the
+app real mount or user namespaces, so bunproot strips namespace flags and
+represents bind mounts, unmounts and `pivot_root` transitions in its own
+runtime mount table. `/proc/self/mountinfo` is synthesized from that table so
+bwrap validates the same filesystem view that pathname translation enforces.
+
+This is compatibility, not a kernel security boundary: a bwrap payload is
+still protected only by bunproot's ptrace pathname isolation. See the native
+one-file-root regression in [TESTING.md](./TESTING.md#native-bubblewrap).
+
 The option belongs before `COMMAND`. A `--kill-on-exit` after `COMMAND` is an
 argument to the guest program instead.
 

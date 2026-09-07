@@ -85,3 +85,19 @@ test("the most specific binding wins in both directions", () => {
 
   rmSync(base, { recursive: true, force: true });
 });
+
+test("runtime bindings move with a pivot and keep the old root reachable", () => {
+  const base=mkdtempSync(join(tmpdir(),"bunproot-pivot-"));
+  const root=join(base,"root"), staged=join(root,"stage"), source=join(base,"source");
+  for (const directory of [root,staged,source]) mkdirSync(directory);
+  const mounts=createBindings(root,[`${source}:/source`]);
+  mounts.bind(staged,"/newroot");
+  mounts.pivot("/newroot","/oldroot");
+
+  expect(mounts.rootfs).toBe(staged);
+  expect(mounts.toHost("/oldroot/source")).toBe(source);
+  expect(mounts.toGuest(source)).toBe("/oldroot/source");
+  expect(mounts.unbind("/oldroot/source")).toBe(true);
+
+  rmSync(base,{recursive:true,force:true});
+});

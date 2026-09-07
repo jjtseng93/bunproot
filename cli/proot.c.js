@@ -11,6 +11,8 @@ import { bootstrapEnvironment, guestEnvironment } from "../env.js";
 import pkg from "../package.json" with { type: "json" };
 import { parseDnsMode, resolverBindings } from "../dns.js";
 
+const OVERFLOW_ID = resolve(import.meta.dir,"../fakeid.txt");
+
 const { posix_spawn } = openLibrary("libc", {
   posix_spawn: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 }).symbols;
@@ -124,8 +126,12 @@ export function run(argv) {
   if (parsed.help) { console.log(HELP); return 0; }
   if (parsed.version) { console.log(`${pkg.name} ${pkg.version}`); return 0; }
   const { rootfs, bindings, command, killOnExit } = parsed;
-  const mounts = createBindings(rootfs, bindings.flatMap((entry) =>
-    typeof entry === "string" ? [entry] : resolverBindings(rootfs, entry.dns)));
+  const compatibilityBindings=[
+    `${OVERFLOW_ID}:/proc/sys/kernel/overflowuid`,
+    `${OVERFLOW_ID}:/proc/sys/kernel/overflowgid`,
+  ];
+  const mounts = createBindings(rootfs, [...compatibilityBindings,...bindings.flatMap((entry) =>
+    typeof entry === "string" ? [entry] : resolverBindings(rootfs, entry.dns))]);
   let guestExecutable=command[0].startsWith("/")
     ? canonicalizeGuestPath(mounts,command[0],{preserveInternalFinal:true})
     : command[0];

@@ -63,11 +63,19 @@ export function createBindings(rootfs, specifications = []) {
         `"${entry.guest}", only the last binding is active`);
     active.set(entry.guest, entry);
   }
-  const entries = [...active.values()];
-  const byGuest = [...entries].sort((a, b) => b.guest.length - a.guest.length);
-  const byHost = [...entries].sort((a, b) => b.host.length - a.host.length);
+  let entries = [...active.values()];
+  let byGuest = [...entries].sort((a, b) => b.guest.length - a.guest.length);
+  let byHost = [...entries].sort((a, b) => b.host.length - a.host.length);
 
-  return {
+  const refresh = () => {
+    entries=[...active.values()];
+    byGuest=[...entries].sort((a,b)=>b.guest.length-a.guest.length);
+    byHost=[...entries].sort((a,b)=>b.host.length-a.host.length);
+    table.entries=entries;
+    table.rootfs=active.get("/").host;
+  };
+
+  const table = {
     rootfs: root.host,
     entries,
 
@@ -94,5 +102,38 @@ export function createBindings(rootfs, specifications = []) {
       }
       return null;
     },
+
+    /** Runtime bindings back emulated mount(2). */
+    bind(host,guest) {
+      active.set(resolve(guest),{host:resolveHost(host),guest:resolve(guest),runtime:true});
+      refresh();
+    },
+
+    unbind(guest) {
+      const key=resolve(guest), entry=active.get(key);
+      if (key==="/" || !entry?.runtime) return false;
+      active.delete(key); refresh(); return true;
+    },
+
+    pivot(newRoot,putOld=null) {
+      const prefix=resolve(newRoot), backing=table.toHost(prefix);
+      const oldRoot=active.get("/").host;
+      const snapshot=[...active.values()];
+      active.clear();
+      active.set("/",{host:backing,guest:"/",runtime:true});
+      for (const entry of snapshot) {
+        if (entry.guest===prefix || entry.guest==="/") continue;
+        if (entry.guest.startsWith(`${prefix}/`)) {
+          const rebased=entry.guest.slice(prefix.length) || "/";
+          active.set(rebased,{...entry,guest:rebased});
+        } else {
+          if (putOld) active.set(`${resolve(putOld)}${entry.guest}`,
+            {...entry,guest:`${resolve(putOld)}${entry.guest}`,runtime:true});
+        }
+      }
+      if (putOld) active.set(resolve(putOld),{host:oldRoot,guest:resolve(putOld),runtime:true});
+      refresh();
+    },
   };
+  return table;
 }

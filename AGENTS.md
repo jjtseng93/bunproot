@@ -1,6 +1,7 @@
 # Overview
 - Read README.md first to get a big picture of the project
 - PRoot is something like chroot but uses ptrace without needing root access.
+- The upstream project was cloned at ../prbun . Take a look when the current problem should already be solved upstream.
 # How to test bunproot
 - Don't run it directly in proot
 - Where you are currently in right now running as fake uid 0

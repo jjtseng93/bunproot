@@ -40,6 +40,25 @@ Each line names what breaks when it fails, so a red one points somewhere.
 | `proot -S "$ROOTFS" /usr/bin/python3 -c 'import os; f=os.memfd_create("p", 11); print(os.open(f"/proc/self/fd/{f}", os.O_RDONLY))'` | Reopening an existing descriptor on Android. `/proc/self/fd/N` must be substituted with `dup(N)` rather than passed to the kernel, which rejects it with `EACCES` under ptrace |
 | `proot -koe -S "$ROOTFS" /bin/sh -c 'sleep 300 &'` | `-koe`/`--kill-on-exit` detached-child cleanup. It must return immediately with status 0; without the option, waiting for the background child is upstream-compatible behaviour |
 
+### Native bubblewrap
+
+Install Alpine's real bubblewrap package, then run the one-file-root check:
+
+```sh
+proot -S "$ROOTFS" /sbin/apk add bubblewrap
+test/bwrap-native/run.sh "$ROOTFS"
+```
+
+Success is the musl dynamic loader banner and a Usage line naming the deliberately
+nonstandard `/proof-bwrap-root/loader-from-private-root` path. Its underlying
+exit status is 1 because no program was supplied to the loader; the test script
+validates that output and exits 0. Since that pathname does not exist in the
+outer rootfs, the output proves bwrap built and pivoted into the new root and
+executed its payload without leaking the outer `/lib`. bunproot supplies the
+Android-unreadable overflow uid/gid sysctls internally, emulates bwrap's
+namespace mounts as runtime bindings, and exposes those bindings through a
+synthetic `/proc/self/mountinfo`.
+
 ## Firefox on Termux:X11
 
 With Termux:X11 already listening on TCP display 0, Firefox runs directly:
@@ -198,12 +217,12 @@ PROOT_NO_SECCOMP=1 proot -S "$ROOTFS" /bin/sh -c 'echo ok'
 
 ## GTK3/WebKit and glycin on Android
 
-Recent Alpine `gdk-pixbuf` uses glycin to decode images.  Glycin normally
-starts each loader through bubblewrap with a user namespace and seccomp
-sandbox.  Android app processes cannot create that user namespace.  PRoot can
-make the capability probe appear successful by removing namespace flags, but
-the real loader then fails or hangs when the first PNG is requested.  GTK may
-report this later as an assertion in `gtkiconhelper.c`.
+Recent Alpine `gdk-pixbuf` uses glycin to decode images. Glycin normally starts
+each loader through bubblewrap with a user namespace and seccomp sandbox.
+Android app processes cannot create that user namespace. The native-bwrap
+regression above covers its filesystem setup, but the full glycin/WebKit path
+has additional process-lifetime integration constraints. GTK may report those
+later as an assertion in `gtkiconhelper.c`.
 
 For a rootfs used only in a trusted test environment, install the included
 pass-through wrapper:
