@@ -19,7 +19,18 @@ export const ignoreMissingBindings = process.env.PROOT_IGNORE_MISSING_BINDINGS !
  *  stop per syscall the guest makes and one stop per syscall this port
  *  translates; turn it off to compare behaviour, or on a kernel whose filter
  *  behaves unexpectedly. */
-export const noSeccomp = process.env.PROOT_NO_SECCOMP !== undefined;
+export const noSeccomp = process.env.PROOT_NO_SECCOMP !== undefined ||
+  process.env.PROOT_BUN_STRACE === "1";
+
+/** Report every system call the guest makes, the way strace does.
+ *
+ * PROOT_BUN_VERBOSE reports what the port *handles*; a call it passes through
+ * untouched leaves no trace at all, which is the blind spot whenever a guest
+ * dies on something the port does not translate. This turns the seccomp
+ * filter off by itself, since a filtered run never stops on those calls in
+ * the first place and there would be nothing to report.
+ */
+export const strace = process.env.PROOT_BUN_STRACE === "1";
 
 // What the guest is told about itself, whatever the caller happened to export.
 // PATH is the guest's own, not the caller's: a host PATH names host binaries.

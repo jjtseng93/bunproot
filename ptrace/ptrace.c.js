@@ -10,7 +10,8 @@ import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
 import { readElfLoadInfo, relocateElf } from "../execve/elf.c.js";
 import { expandShebang, makeGuestPaths } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
-import { guestEnvironment, noSeccomp, verbose } from "../env.js";
+import { guestEnvironment, noSeccomp, strace, verbose } from "../env.js";
+import { formatCall, formatResult } from "../syscall/strace.c.js";
 import { count, report, timed } from "../profile.js";
 import { buildFilter, buildProgramHeader } from "../syscall/seccomp.c.js";
 import { commitEmulatedDirectoryRename, commitEmulatedRename, commitEmulatedUnlink, emulateHardLink, hasEmulatedDirectory, inspectEmulatedAlias, inspectEmulatedObject, isEmulatedAlias } from "../extension/link2symlink/link2symlink.c.js";
@@ -1420,6 +1421,12 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
       task.entering=true;
       const exitedSyscall=task.activeSyscall;
       task.activeSyscall=undefined;
+      // Deferred until after the port has had its say below, so the result
+      // shown is the one the guest actually sees.
+      const straceCall=strace?task.straceCall:undefined;
+      const straceKernel=straceCall===undefined?0n:BigInt.asUintN(64,getX(registers().regs,0));
+      let stracePaths=null;
+      task.straceCall=undefined;
       if (task.forcedResult!==undefined) {
         const exited=registers();
         setX(exited.regs,0,task.forcedResult); putRegisters(taskPid,exited);
@@ -1632,6 +1639,8 @@ const exited=registers(), result=exitResult(phase,exited);
             (task.pendingPaths?.length?` paths=${task.pendingPaths.join(" -> ")}`:""));
         task.pendingPathSyscall=undefined;
         task.pendingPaths=undefined;
+        if (straceCall!==undefined)
+          stracePaths=task.pendingHostPaths?.filter((path)=>path!==null) ?? null;
         task.pendingHostPaths=undefined;
         task.pendingGuestPaths=undefined;
         task.pendingLinkPaths=undefined;
@@ -1677,11 +1686,30 @@ const exited=registers(), result=exitResult(phase,exited);
         task.borrowPc=nextImages.interpreter?.entry??nextImages.main.entry;
         task.exe=next.guestPath??guestPathOf(mounts,next.executable);
       }
+      if (straceCall!==undefined) {
+        const seen=BigInt.asUintN(64,getX(registers().regs,0));
+        // A result this port replaced is worth showing as the swap it is.
+        const outcome=seen===straceKernel?formatResult(seen)
+          :`${formatResult(seen)} (kernel ${formatResult(straceKernel)})`;
+        console.error(`[strace] ${taskPid} ${straceCall} = ${outcome}` +
+          (stracePaths?.length>0?`  [${stracePaths.join(", ")}]`:""));
+      }
       continue;
     }
     task.entering=false;
     const syscall=(phase===1||phase===3)?syscallInfoNumber():getSyscallNumber(registers().regs);
     task.activeSyscall=syscall;
+    if (strace) {
+      const entered=registers().regs;
+      const read=(address)=>{
+        if (address<4096n) return null;
+        try { return readCString(memory,taskPid,address); } catch { return null; }
+      };
+      // The host pathname is only known once the arguments below are
+      // translated, so it is filled in at exit from what the port recorded.
+      task.straceCall=formatCall(syscall,
+        [0,1,2,3,4,5].map((index)=>getX(entered,index)),read,()=>null);
+    }
     // Nothing to do for a syscall this tracer does not translate, and by far
     // the most syscalls a guest makes are of that kind: reading the registers
     // for every one of them was the single biggest cost per stop.

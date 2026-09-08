@@ -22,6 +22,16 @@ a fork of it. The port itself begins at `bun proot 1st iteration`
 (`2289ef2ce0edc69628e72bb9cf9ee490f397cf6b`, 2026-09-03), which is the first
 commit of this repository's history.
 
+## The system call name table
+
+`syscall/names.js` is generated from `asm-generic/unistd.h`, the Linux uapi
+header that arm64 takes its system call numbering from, as carried by bionic.
+That header is `GPL-2.0 WITH Linux-syscall-note` upstream; the exception is
+what allows userspace to use these definitions without becoming a derived work
+of the kernel, and this port is GPL-2.0-or-later in any case. The table holds
+numbers and names only -- it is regenerated rather than edited, by
+`tools/generate-syscall-names.mjs`.
+
 ## Reading a `src/...` citation
 
 A path like `src/path/binding.c:new_binding` names a file in **termux/proot**,
