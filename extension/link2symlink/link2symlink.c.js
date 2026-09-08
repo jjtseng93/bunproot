@@ -1,4 +1,5 @@
 import { mkdirSync, lstatSync, readdirSync, readlinkSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
+import { readlink as readlinkAsync } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { dirname, posix } from "node:path";
 
@@ -155,4 +156,78 @@ export function commitEmulatedRename(rootfs,link,targetHost,targetGuest,replaced
   const newRef=host(rootfs,newRefGuest);
   ensureParent(newRef); renameSync(oldRef,newRef);
   replaceSymlink(targetHost,newRefGuest);
+}
+
+/** How many descriptors to keep in flight while reading the store.
+ *
+ * Measured on an Android app uid over 97037 refs: serially, a warm store costs
+ * 6.6us per ref and a cold one 19.6us. Batched, both land near 3.5us -- the
+ * concurrency hides the cold-cache stalls almost entirely, which matters more
+ * than the raw speedup because a store is usually read once and cold. A batch
+ * of 16 is no better than serial, and 256 is no better than 64.
+ */
+const SCAN_BATCH = 64;
+
+/**
+ * Read the whole store and report what it holds.
+ *
+ * The symlinks are the only authority here: whether a store is pinned, and to
+ * what, is derived from the targets themselves rather than from any recorded
+ * state, so a copied, moved, half-converted or hand-edited store still
+ * reports what it actually is. Nothing is written.
+ */
+export async function scanStore(rootfs) {
+  const refsRoot = host(rootfs, REFS);
+  try { if (!lstatSync(refsRoot).isDirectory()) return null; } catch { return null; }
+
+  const relatives = [];
+  const pending = [""];
+  while (pending.length > 0) {
+    const relative = pending.pop();
+    let entries;
+    try { entries = readdirSync(refsRoot + relative, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const child = `${relative}/${entry.name}`;
+      if (entry.isDirectory()) pending.push(child);
+      else if (entry.isSymbolicLink()) relatives.push(child);
+    }
+  }
+
+  const report = { refs: relatives.length, portable: 0, pinned: 0, malformed: 0,
+    live: 0, stale: 0, prefixes: new Map(), objects: new Set() };
+  const objectMarker = `${OBJS}/`;
+  for (let index = 0; index < relatives.length; index += SCAN_BATCH) {
+    const batch = relatives.slice(index, index + SCAN_BATCH);
+    const targets = await Promise.all(batch.flatMap((relative) => [
+      readlinkAsync(refsRoot + relative).catch(() => null),   // ref -> object
+      readlinkAsync(host(rootfs, relative)).catch(() => null), // guest alias -> ref
+    ]));
+    for (let offset = 0; offset < batch.length; offset++) {
+      const relative = batch[offset];
+      const object = targets[offset * 2], alias = targets[offset * 2 + 1];
+      // Leg two says which form the store is in. A guest-absolute target is
+      // the portable form; anything else carries a host prefix, and what
+      // precedes the store path is that prefix.
+      if (object === null) report.malformed++;
+      else if (OBJECT_RE.test(object)) {
+        report.portable++;
+        report.objects.add(object.slice(objectMarker.length));
+      } else {
+        const at = object.indexOf(objectMarker);
+        const id = at < 0 ? null : object.slice(at + objectMarker.length);
+        if (at <= 0 || !/^[0-9a-f]{32}$/.test(id)) report.malformed++;
+        else {
+          report.pinned++;
+          report.objects.add(id);
+          const prefix = object.slice(0, at);
+          report.prefixes.set(prefix, (report.prefixes.get(prefix) ?? 0) + 1);
+        }
+      }
+      // Leg one is what a reader actually starts from: a ref whose guest name
+      // no longer points back at it describes a file that is no longer there.
+      if (alias !== null && alias.endsWith(`${REFS}${relative}`)) report.live++;
+      else report.stale++;
+    }
+  }
+  return report;
 }

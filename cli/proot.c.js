@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { FFIType, ptr } from "bun:ffi";
 import { cString, lazySymbols } from "../ffi.js";
@@ -66,6 +66,10 @@ const HELP = `${USAGE}
   --readme
       render README.md in the terminal, with hyperlinks where it has links
 
+  --l2s-status ROOTFS
+      report the state of a rootfs's emulated hard-link store, and exit.
+      Reads only; takes a rootfs of its own and needs no -S
+
   -V, --version
       show the version and exit
 
@@ -105,6 +109,28 @@ export function parseArguments(argv) {
     }
     if (argument === "-h" || argument === "--help") return { help: true };
     if (argument === "--readme") return { readme: true };
+    if (argument === "--l2s-status" || argument.startsWith("--l2s-status=")) {
+      // A whole command line of its own: `bunproot --l2s-status ROOTFS` and
+      // nothing besides. It enters no rootfs and honours no binding, so any
+      // other argument means the caller expected something this does not do
+      // -- running a command in that rootfs, or reading the one -S names.
+      // Both are worse discovered here than silently ignored.
+      const inline = argument.startsWith("--l2s-status=");
+      let target;
+      if (inline) target = argument.slice(13);
+      else if ((target = argv[++index]) === undefined)
+        throw new Error(`--l2s-status needs a rootfs\n${USAGE}\n${TRY_HELP}`);
+      // The rootfs they meant is the one they passed to -S, not whatever
+      // happened to follow --l2s-status.
+      if (rootfs !== null) throw new Error(
+        "--l2s-status takes its own rootfs; it does not combine with -S\n" +
+        `try \`bunproot --l2s-status ${rootfs}\``);
+      if ((inline ? index : index - 1) !== 0 || index + 1 !== argv.length)
+        throw new Error(
+          "--l2s-status is a command of its own and takes nothing else:\n" +
+          `  bunproot --l2s-status ${target}`);
+      return { l2sStatus: resolve(target) };
+    }
     if (argument === "-V" || argument === "--version") return { version: true };
     if (argument === "-koe" || argument === "--kill-on-exit") { killOnExit = true; continue; }
     if (argument === "-S" || argument === "--rootfs") {
@@ -124,11 +150,57 @@ export function parseArguments(argv) {
   if (!sawDns) bindings.unshift({ dns: "auto" });
   return { rootfs, bindings, command, killOnExit };
 }
+/**
+ * `--l2s-status`: what state a rootfs's emulated hard-link store is in.
+ *
+ * Deliberately free of the tracer: it opens no library, starts no guest, and
+ * writes nothing, so it answers on a host where the Android bionic this port
+ * normally loads cannot be opened at all.
+ */
+async function reportLinkStore(rootfs) {
+  try {
+    if (!statSync(rootfs).isDirectory()) throw new Error("not a directory");
+  } catch { throw new Error(`cannot read rootfs: ${rootfs}`); }
+
+  const { scanStore } = await import("../extension/link2symlink/link2symlink.c.js");
+  const report = await scanStore(rootfs);
+  if (report === null) {
+    console.log(`${rootfs}\n\n  no link2symlink store -- nothing here emulates a hard link\n`);
+    return 0;
+  }
+
+  const lines = [`${rootfs}/.proot.l2s`, ""];
+  lines.push(`  refs      ${report.refs} across ${report.objects.size} objects`);
+
+  // The prefixes are read back out of the symlinks, so a store that was
+  // converted halfway, or moved after being pinned, describes itself.
+  const prefixes = [...report.prefixes].sort((a, b) => b[1] - a[1]);
+  if (report.pinned === 0)
+    lines.push(`  paths     portable -- guest-absolute, so the rootfs can still be moved`);
+  else if (report.portable === 0 && prefixes.length === 1)
+    lines.push(`  paths     pinned to ${prefixes[0][0]}`,
+      `            host tools can follow these; moving the rootfs breaks every one`);
+  else {
+    lines.push(`  paths     mixed -- ${report.portable} portable, ${report.pinned} pinned`);
+    for (const [prefix, count] of prefixes) lines.push(`            ${count} to ${prefix}`);
+    lines.push(`            an unfinished conversion; running it again completes it`);
+  }
+
+  lines.push(`  aliases   ${report.live} live, ${report.stale} stale`);
+  if (report.malformed > 0) lines.push(`  malformed ${report.malformed} refs point at no readable object`);
+  if (report.stale > 0)
+    lines.push("", `  A stale ref is one whose guest pathname no longer points back at it:`,
+      `  the file was replaced or removed. It costs space, not correctness.`);
+  console.log(lines.join("\n") + "\n");
+  return 0;
+}
+
 export function run(argv) {
   const parsed = parseArguments(argv);
   // Only a --help before the command is ours; after it, it belongs to the guest.
   if (parsed.help) { console.log(HELP); return 0; }
   if (parsed.version) { console.log(`${pkg.name} ${pkg.version}`); return 0; }
+  if (parsed.l2sStatus !== undefined) return reportLinkStore(parsed.l2sStatus);
   if (parsed.readme) {
     const readme = readFileSync(resolve(import.meta.dirname, "../README.md"), "utf8");
     console.log(Bun.markdown.ansi(readme, { hyperlinks: true }));

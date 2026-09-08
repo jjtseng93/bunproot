@@ -43,6 +43,7 @@ Each line names what breaks when it fails, so a red one points somewhere.
 | `proot -S "$ROOTFS" /bin/sh -c 'adduser -D u; su u -c id'` | fake-id0 credentials. Must report the new user rather than `uid=0(root)`: `setgroups` and the set*id family are blocked by Android's seccomp and answered by the tracer. A `can't set groups: Function not implemented` here means that path regressed |
 | `proot -S "$ROOTFS" /bin/sh -c 'su u -c "su root -c id"'` | The capability model. Must refuse: a permanent drop out of root takes `CAP_SETUID` with it, as `MAYBE_DROP_CAPS` does upstream |
 | `proot --readme \| head -1` | The `--readme` renderer, and with it that no FFI symbol is bound at import time |
+| `proot --l2s-status "$ROOTFS"` | The link2symlink store report. `paths` must read `portable` for a rootfs only ever opened by this port. It must also refuse `-S`, a trailing command, or any other option: it enters nothing, so an extra argument means the caller expected something else |
 | `proot --version` **on a host without Android bionic** | The same thing from the other side. It must print the version rather than a `libc.so not found` stack trace -- run it from inside a glibc PRoot, where dlopen cannot succeed |
 
 ### System V shared memory
