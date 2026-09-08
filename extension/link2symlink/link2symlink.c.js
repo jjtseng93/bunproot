@@ -231,3 +231,54 @@ export async function scanStore(rootfs) {
   }
   return report;
 }
+
+// The original PRoot's store, which this port deliberately cannot read. Its
+// names are `<PREFIX><basename><NNNN>` for the intermediate link and the same
+// plus `.<NNNN>` for the file holding the data, where those last four digits
+// are the emulated link count. PROOT_L2S_DIR collects them in one directory --
+// proot-distro sets it to /.l2s -- and without it they sit beside each file
+// they emulate.
+const UPSTREAM_STORE = "/.l2s", UPSTREAM_PREFIX = ".l2s.";
+const UPSTREAM_COUNT = /\.(\d{4})$/;
+
+/**
+ * Report on an original-format store, without walking the rootfs.
+ *
+ * Only the collected form is counted: one readdir of /.l2s. The scattered form
+ * would need a full-tree walk to tally, which costs far more than the answer
+ * is worth, so it is reported as present and left uncounted.
+ */
+export function scanUpstreamStore(rootfs) {
+  const storeHost = host(rootfs, UPSTREAM_STORE);
+  let entries = null;
+  try { if (lstatSync(storeHost).isDirectory()) entries = readdirSync(storeHost); } catch {}
+  if (entries === null) {
+    // One readdir of the rootfs root, not a walk: enough to notice the
+    // scattered form when it reaches the top level, and cheap when it does not.
+    try {
+      if (readdirSync(rootfs).some((name) => name.startsWith(UPSTREAM_PREFIX)))
+        return { collected: false, intermediates: 0, finals: 0, links: 0, prefix: null };
+    } catch {}
+    return null;
+  }
+
+  let intermediates = 0, finals = 0, links = 0, sample = null;
+  for (const name of entries) {
+    if (!name.startsWith(UPSTREAM_PREFIX)) continue;
+    const count = UPSTREAM_COUNT.exec(name);
+    if (count !== null) { finals++; links += Number(count[1]); }
+    else { intermediates++; sample ??= name; }
+  }
+
+  // Where the store believes it lives. Upstream writes host-absolute targets,
+  // so this is what decides whether any of it is still reachable.
+  let prefix = null;
+  if (sample !== null) {
+    try {
+      const target = readlinkSync(`${storeHost}/${sample}`);
+      const at = target.indexOf(`${UPSTREAM_STORE}/`);
+      if (at > 0) prefix = target.slice(0, at);
+    } catch {}
+  }
+  return { collected: true, intermediates, finals, links, prefix };
+}

@@ -38,7 +38,9 @@ thing this depends on.
 > Tell the two formats apart by the store at the rootfs root: `/.l2s` is the
 > original's, `/.proot.l2s` is this port's. A fresh rootfs, or one only ever
 > opened with bunproot, needs nothing. `bunproot --l2s-status ./that-rootfs`
-> reports what is there without entering it.
+> reports which store is there without entering it, and for an original-format
+> one says whether the bind above can still reach it -- which depends on the
+> rootfs not having moved since those pathnames were written into it.
 >
 > The bind only works while the rootfs has not been moved or renamed away from the original path.
 > What it recovers is a host path recorded at the time the symlink was made. That is the
@@ -246,7 +248,7 @@ is an argument to the guest program instead.
 | `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
 | `-h`, `--help` | The options and the debug environment variables |
 | `--readme` | Render this README in the terminal, with links where it has them |
-| `--l2s-status ROOTFS` | Report what state a rootfs's emulated hard-link store is in, then exit. Reads only, takes a rootfs of its own, and combines with nothing else |
+| `--l2s-status ROOTFS` | Report what state a rootfs's emulated hard-link store is in, then exit. Recognises the original PRoot's format too. Reads only, takes a rootfs of its own, and combines with nothing else |
 | `-V`, `--version` | The version, then exit |
 
 `PROOT_BUN_VERBOSE`, `PROOT_BUN_PROFILE`, `PROOT_NO_SECCOMP` and
@@ -566,7 +568,9 @@ that cost more time than the bugs did.
 - `--l2s-status` reads the store and derives everything from the symlink
   targets themselves, so a rootfs that was copied, moved or half-converted
   still describes what it actually is. Its concurrency is what makes a cold
-  store cost about what a warm one does.
+  store cost about what a warm one does. It recognises an original-format
+  `/.l2s` as well, and answers the one question that store cannot answer for
+  itself: whether the host pathnames baked into it still lead anywhere.
 - An `AF_UNIX` pathname travels in a `sockaddr` rather than as a syscall
   pathname argument, so `bind` and `connect` are translated separately.
   Abstract sockets stay in the host namespace.

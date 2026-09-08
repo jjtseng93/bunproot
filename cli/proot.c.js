@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, realpathSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { FFIType, ptr } from "bun:ffi";
 import { cString, lazySymbols } from "../ffi.js";
@@ -12,6 +12,19 @@ import pkg from "../package.json" with { type: "json" };
 import { parseDnsMode, resolverBindings } from "../dns.js";
 
 const OVERFLOW_ID = resolve(import.meta.dir,"../fakeid.txt");
+/** Render markdown at the terminal's own width.
+ *
+ * Bun's renderer wraps near 79 and never asks the terminal how wide it is --
+ * not even on a TTY that reports 30 columns -- so the width has to be handed
+ * to it. Off a TTY there is nothing to ask, and its default is as good as any.
+ */
+function renderMarkdown(markdown) {
+  const columns = process.stdout.columns;
+  return Bun.markdown.ansi(markdown,
+    columns ? { hyperlinks: true, columns } : { hyperlinks: true });
+}
+const FORMAT_DOCUMENTATION =
+  "https://github.com/jjtseng93/bunproot/blob/main/link2symlink.md";
 
 const libc = lazySymbols("libc", {
   posix_spawn: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
@@ -162,37 +175,118 @@ async function reportLinkStore(rootfs) {
     if (!statSync(rootfs).isDirectory()) throw new Error("not a directory");
   } catch { throw new Error(`cannot read rootfs: ${rootfs}`); }
 
-  const { scanStore } = await import("../extension/link2symlink/link2symlink.c.js");
+  const { scanStore, scanUpstreamStore } =
+    await import("../extension/link2symlink/link2symlink.c.js");
   const report = await scanStore(rootfs);
-  if (report === null) {
-    console.log(`${rootfs}\n\n  no link2symlink store -- nothing here emulates a hard link\n`);
-    return 0;
-  }
+  const upstream = scanUpstreamStore(rootfs);
 
-  const lines = [`${rootfs}/.proot.l2s`, ""];
-  lines.push(`  refs      ${report.refs} across ${report.objects.size} objects`);
+  // A long pathname inside inline code gets hard-wrapped mid-word; in a code
+  // block it stays whole and stays copyable.
+  const blocks = [`# ${basename(rootfs) || rootfs}`, `    ${rootfs}`];
 
-  // The prefixes are read back out of the symlinks, so a store that was
-  // converted halfway, or moved after being pinned, describes itself.
-  const prefixes = [...report.prefixes].sort((a, b) => b[1] - a[1]);
-  if (report.pinned === 0)
-    lines.push(`  paths     portable -- guest-absolute, so the rootfs can still be moved`);
-  else if (report.portable === 0 && prefixes.length === 1)
-    lines.push(`  paths     pinned to ${prefixes[0][0]}`,
-      `            host tools can follow these; moving the rootfs breaks every one`);
+  if (report === null && upstream === null)
+    blocks.push("No link2symlink store here. Nothing in this rootfs emulates a hard link.");
+  else if (report === null) blocks.push(...describeUpstream(rootfs, upstream));
   else {
-    lines.push(`  paths     mixed -- ${report.portable} portable, ${report.pinned} pinned`);
-    for (const [prefix, count] of prefixes) lines.push(`            ${count} to ${prefix}`);
-    lines.push(`            an unfinished conversion; running it again completes it`);
+    blocks.push(...describePort(report));
+    if (upstream !== null) {
+      // Both stores in one rootfs is the case worth shouting about: neither
+      // knows the other exists, so a file written through one is invisible
+      // to the other.
+      blocks.push("# An original store is here too",
+        ...describeUpstream(rootfs, upstream),
+        "## Why that matters",
+        "The two stores do not know about each other. A file written through one is invisible to the other, and neither repairs the other.");
+    }
+  }
+  if (report !== null || upstream !== null)
+    blocks.push("## Format reference", `- [link2symlink.md](${FORMAT_DOCUMENTATION})`);
+  console.log(renderMarkdown(blocks.join("\n\n")));
+  return 0;
+}
+
+/** A bulleted list of name/value pairs. Lighter than a table, and it does not
+ *  carry a frame that a narrow terminal has to fit. */
+const bullets = (rows) =>
+  rows.map(([name, value]) => `- **${name}:** ${value}`).join("\n");
+
+/** This port's store. Everything is read back out of the symlinks, so a
+ *  rootfs that was copied, moved or half-converted describes what it is. */
+function describePort(report) {
+  const prefixes = [...report.prefixes].sort((a, b) => b[1] - a[1]);
+  const form = report.pinned === 0 ? "portable"
+    : report.portable === 0 ? "pinned" : "mixed";
+  const blocks = ["## Format", bullets([
+    ["store", ".proot.l2s, this port's own"],
+    ["paths", form],
+  ])];
+
+  if (form === "portable")
+    blocks.push("Every target is guest-absolute, so this rootfs can still be moved and the store follows it.");
+  else if (form === "pinned")
+    blocks.push("Targets carry a host prefix, so tools outside the rootfs can follow them. Moving the rootfs breaks every one.",
+      "### Pinned to", `    ${prefixes[0][0]}`);
+  else {
+    blocks.push("A conversion stopped partway. Running it again completes it.", "### Pinned to");
+    // Not a bullet: an indented pathname after one is read as that bullet's
+    // continuation and gets reflowed, which breaks the path in half.
+    for (const [prefix, count] of prefixes) blocks.push(`${count} refs to:`, `    ${prefix}`);
   }
 
-  lines.push(`  aliases   ${report.live} live, ${report.stale} stale`);
-  if (report.malformed > 0) lines.push(`  malformed ${report.malformed} refs point at no readable object`);
+  const rows = [["refs", report.refs], ["objects", report.objects.size]];
+  if (report.pinned > 0 && report.portable > 0)
+    rows.push(["portable", report.portable], ["pinned", report.pinned]);
+  rows.push(["live aliases", report.live]);
+  if (report.stale > 0) rows.push(["stale refs", report.stale]);
+  if (report.malformed > 0) rows.push(["broken refs", report.malformed]);
+  blocks.push("## Counts", bullets(rows));
+
   if (report.stale > 0)
-    lines.push("", `  A stale ref is one whose guest pathname no longer points back at it:`,
-      `  the file was replaced or removed. It costs space, not correctness.`);
-  console.log(lines.join("\n") + "\n");
-  return 0;
+    blocks.push("## Stale refs",
+      "A stale ref is one whose guest name no longer points back at it: the file was replaced or removed. It costs space, not correctness.");
+  return blocks;
+}
+
+/** The original PRoot's store: how big, and whether any of it is still
+ *  reachable. Upstream bakes host pathnames into its targets, so that is
+ *  decided by where the rootfs actually is now. */
+function describeUpstream(rootfs, upstream) {
+  const blocks = ["## Format", bullets([
+    ["store", ".l2s, the original PRoot's"],
+    ["paths", "host-absolute"],
+  ]), "This port cannot read that format. Its targets carry host pathnames, which is also why moving such a rootfs breaks it."];
+  if (!upstream.collected) {
+    blocks.push("## Counts",
+      "Its entries are not collected under /.l2s, so they sit beside the files they emulate. Counting them would mean walking the whole rootfs, which this does not do.");
+    return blocks;
+  }
+
+  const rows = [["objects", upstream.finals], ["links", upstream.links]];
+  if (upstream.intermediates !== upstream.finals)
+    rows.push(["dangling", `${upstream.intermediates} inter.`]);
+  blocks.push("## Counts", bullets(rows));
+
+  if (upstream.prefix === null) {
+    blocks.push("## Where it was written", "No target says where this store was made.");
+    return blocks;
+  }
+  blocks.push("## Where it was written", `    ${upstream.prefix}`);
+  // Through symlinks: a rootfs reached by another name has not moved, and its
+  // files are perfectly reachable.
+  const resolvePath = (path) => { try { return realpathSync(path); } catch { return path; } };
+  if (resolvePath(upstream.prefix) === resolvePath(rootfs)) {
+    const top = `/${upstream.prefix.split("/")[1] ?? ""}`;
+    blocks.push(bullets([["status", "still there, so its files are reachable"]]),
+      "### Reading it",
+      "Bind that pathname back in and the targets resolve:", `    -b ${upstream.prefix}`);
+    if (top !== upstream.prefix && top !== "/")
+      blocks.push("or the mount point holding it:", `    -b ${top}`);
+    blocks.push("> Read-only: writing through this port lays a second store beside the first.");
+  } else {
+    blocks.push(bullets([["status", "the rootfs has moved since"]]),
+      "Those targets resolve to nothing now. The original PRoot cannot read it here either: the pathnames are baked into the store.");
+  }
+  return blocks;
 }
 
 export function run(argv) {
@@ -203,7 +297,7 @@ export function run(argv) {
   if (parsed.l2sStatus !== undefined) return reportLinkStore(parsed.l2sStatus);
   if (parsed.readme) {
     const readme = readFileSync(resolve(import.meta.dirname, "../README.md"), "utf8");
-    console.log(Bun.markdown.ansi(readme, { hyperlinks: true }));
+    console.log(renderMarkdown(readme));
     return 0;
   }
   const { rootfs, bindings, command, killOnExit } = parsed;
