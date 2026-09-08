@@ -2169,12 +2169,23 @@ const exited=registers(), result=exitResult(phase,exited);
     if ((syscall===38 || syscall===276) && hostPaths.length===2) {
       const source=inspectEmulatedAlias(mounts.rootfs,hostPaths[0]);
       const replaced=inspectEmulatedAlias(mounts.rootfs,hostPaths[1]);
+      // renameat2 can be asked to swap the two names instead of overwriting,
+      // and then nothing is removed.
+      const exchanged=syscall===276 && (Number(getX(state.regs,4))&2)!==0;
       if (source && replaced?.id===source.id) {
         setKernelSyscallNumber(taskPid,state,SYS_GETPID); task.forcedResult=0n;
       } else if (source) {
         task.pendingL2sRename={source,replaced,targetHost:hostPaths[1],targetGuest:guestPaths[1]};
       } else if (hasEmulatedDirectory(mounts.rootfs,guestPaths[0])) {
         task.pendingL2sDirectoryRename={sourceGuest:guestPaths[0],targetGuest:guestPaths[1]};
+      } else if (replaced && !exchanged) {
+        // An ordinary file renamed over an emulated link removes that link as
+        // surely as unlink would, and its ref and count have to go with it.
+        // Writing a temporary file and renaming it into place is how most
+        // things edit a file at all -- adduser rewriting /etc/passwd, flatpak
+        // rewriting an exported .desktop -- so leaving this out strands a ref
+        // and leaks the object it still claims to hold.
+        task.pendingL2sUnlink=replaced;
       }
     }
     if (changed) putRegisters(taskPid,state);
