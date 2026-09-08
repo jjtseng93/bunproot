@@ -176,7 +176,7 @@ const SCAN_BATCH = 64;
  * state, so a copied, moved, half-converted or hand-edited store still
  * reports what it actually is. Nothing is written.
  */
-export async function scanStore(rootfs) {
+export async function scanStore(rootfs, { listStale = false } = {}) {
   const refsRoot = host(rootfs, REFS);
   try { if (!lstatSync(refsRoot).isDirectory()) return null; } catch { return null; }
 
@@ -194,7 +194,10 @@ export async function scanStore(rootfs) {
   }
 
   const report = { refs: relatives.length, portable: 0, pinned: 0, malformed: 0,
-    live: 0, stale: 0, prefixes: new Map(), objects: new Set() };
+    live: 0, stale: 0, prefixes: new Map(), objects: new Set(),
+    // Named only when asked: a store can hold tens of thousands of refs, and
+    // the count alone is what a normal report needs.
+    stalePaths: listStale ? [] : null };
   const objectMarker = `${OBJS}/`;
   for (let index = 0; index < relatives.length; index += SCAN_BATCH) {
     const batch = relatives.slice(index, index + SCAN_BATCH);
@@ -226,7 +229,7 @@ export async function scanStore(rootfs) {
       // Leg one is what a reader actually starts from: a ref whose guest name
       // no longer points back at it describes a file that is no longer there.
       if (alias !== null && alias.endsWith(`${REFS}${relative}`)) report.live++;
-      else report.stale++;
+      else { report.stale++; report.stalePaths?.push(relative); }
     }
   }
   return report;

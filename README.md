@@ -586,6 +586,9 @@ that cost more time than the bugs did.
   never decrement its object. The check samples a few refs on startup, which
   also catches a store left halfway through a conversion; `--l2s-ignore-pin`
   overrides it.
+- `--l2s-status` names every stale ref under `PROOT_BUN_VERBOSE=1`, and only
+  counts them otherwise: a store can hold tens of thousands, and the count is
+  what a normal report needs.
 - `--l2s-status` reads the store and derives everything from the symlink
   targets themselves, so a rootfs that was copied, moved or half-converted
   still describes what it actually is. Its concurrency is what makes a cold

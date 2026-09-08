@@ -8,7 +8,7 @@ import { canonicalizeGuestPath } from "../path/canon.c.js";
 import { createBindings } from "../path/binding.c.js";
 import { storeIsPinned } from "../extension/link2symlink/link2symlink.c.js";
 import { traceProcess } from "../ptrace/ptrace.c.js";
-import { bootstrapEnvironment, guestEnvironment } from "../env.js";
+import { bootstrapEnvironment, guestEnvironment, verbose } from "../env.js";
 import pkg from "../package.json" with { type: "json" };
 import { parseDnsMode, resolverBindings } from "../dns.js";
 
@@ -220,7 +220,7 @@ async function runStoreCommand(rootfs, action) {
     if (converted === null) throw new Error(`no .proot.l2s store in ${rootfs}`);
   }
 
-  const report = await scanStore(rootfs);
+  const report = await scanStore(rootfs, { listStale: verbose });
   const upstream = scanUpstreamStore(rootfs);
 
   // A long pathname inside inline code gets hard-wrapped mid-word; in a code
@@ -306,9 +306,15 @@ function describePort(report) {
   if (report.malformed > 0) rows.push(["broken refs", report.malformed]);
   blocks.push("## Counts", bullets(rows));
 
-  if (report.stale > 0)
+  if (report.stale > 0) {
     blocks.push("## Stale refs",
       "A stale ref is one whose guest name no longer points back at it: the file was replaced or removed. It costs space, not correctness.");
+    // The guest pathnames themselves, which is what a verbose run is for.
+    if (report.stalePaths !== null)
+      blocks.push("### Which ones",
+        report.stalePaths.map((path) => `    ${path}`).join("\n"));
+    else blocks.push("Set PROOT_BUN_VERBOSE=1 to list them.");
+  }
   return blocks;
 }
 
