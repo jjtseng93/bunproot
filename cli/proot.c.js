@@ -104,16 +104,16 @@ run:
   --l2s-ignore-pin
       enter a rootfs whose store is pinned, which is otherwise refused
 
-These report and exit:
+These run without entering a rootfs, then exit:
 
   --download-alpine
       download and verify an Alpine minirootfs
 
-  -h, --help
-      show this message
-
   --readme
       render README.md in the terminal, with hyperlinks where it has links
+
+  -h, --help
+      show this message
 
   -V, --version
       show the version
