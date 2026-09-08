@@ -40,6 +40,47 @@ Each line names what breaks when it fails, so a red one points somewhere.
 | `proot -S "$ROOTFS" /bin/sh -c 'readlink /proc/self/exe; cat /proc/$$/comm; :'` | The state a mapped-in image cannot inherit from `execve`. The trailing `:` matters: without it the shell execs itself away into the last command, and `$$` names that command instead |
 | `proot -S "$ROOTFS" /usr/bin/python3 -c 'import os; f=os.memfd_create("p", 11); print(os.open(f"/proc/self/fd/{f}", os.O_RDONLY))'` | Reopening an existing descriptor on Android. `/proc/self/fd/N` must be substituted with `dup(N)` rather than passed to the kernel, which rejects it with `EACCES` under ptrace |
 | `proot -koe -S "$ROOTFS" /bin/sh -c 'sleep 300 &'` | `-koe`/`--kill-on-exit` detached-child cleanup. It must return immediately with status 0; without the option, waiting for the background child is upstream-compatible behaviour |
+| `proot -S "$ROOTFS" /bin/sh -c 'adduser -D u; su u -c id'` | fake-id0 credentials. Must report the new user rather than `uid=0(root)`: `setgroups` and the set*id family are blocked by Android's seccomp and answered by the tracer. A `can't set groups: Function not implemented` here means that path regressed |
+| `proot -S "$ROOTFS" /bin/sh -c 'su u -c "su root -c id"'` | The capability model. Must refuse: a permanent drop out of root takes `CAP_SETUID` with it, as `MAYBE_DROP_CAPS` does upstream |
+| `proot --readme \| head -1` | The `--readme` renderer, and with it that no FFI symbol is bound at import time |
+| `proot --version` **on a host without Android bionic** | The same thing from the other side. It must print the version rather than a `libc.so not found` stack trace -- run it from inside a glibc PRoot, where dlopen cannot succeed |
+
+### System V shared memory
+
+Android denies the SysV IPC syscalls outright, so `shmget`, `shmat`, `shmdt`
+and `shmctl` are emulated. Two guest processes holding the same key must see
+one another's writes -- a private copy each would pass a naive test and fail
+every real user of shared memory.
+
+PostgreSQL is the check worth keeping, because it exercises all four calls plus
+the `shm_nattch` a postmaster reads to decide whether another one is already
+running. It also refuses to run as root, so it covers the fake-id0 credentials
+at the same time:
+
+```sh
+proot -S "$ROOTFS" /bin/sh -c 'apk add postgresql'
+proot -koe -S "$ROOTFS" /bin/sh -c '
+  mkdir -p /run/postgresql && chown postgres:postgres /run/postgresql
+  su postgres -c "initdb -D /var/lib/postgresql/data"
+  su postgres -c "postgres -D /var/lib/postgresql/data" &
+  sleep 8
+  su postgres -c "psql -d postgres -c \"select version()\""'
+```
+
+`initdb` must reach `Success.`, and the server must answer the query. Three
+failures each mean something different:
+
+- `initdb: error: cannot be run as root` -- the credential emulation regressed.
+- `data directory ... has wrong ownership` -- the stat owner override
+  regressed; it must report the saved set-user-ID, not a hard 0.
+- `could not create shared memory segment: Function not implemented` -- the shm
+  emulation regressed. `could not accept new connection` with the same errno is
+  the `accept`-to-`accept4` reissue instead.
+
+Backing files live in `$TMPDIR/bunproot-shm-<pid>` and are removed when the
+tracer exits. A tracer that is killed outright cannot clean up, so the next run
+sweeps the directories of pids that no longer exist; after a normal run
+`ls -d $TMPDIR/bunproot-shm-*` must find nothing.
 
 ### Native bubblewrap
 

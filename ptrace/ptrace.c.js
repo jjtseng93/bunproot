@@ -3,6 +3,8 @@ import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdtemp
 import { posix } from "node:path";
 import { networkInterfaces, tmpdir } from "node:os";
 import { lazySymbols } from "../ffi.js";
+import { shmGet, shmSegment, shmAttached, shmDetached, shmStat, shmRemove, shmCleanup }
+  from "../extension/sysvipc/sysvipc_shm.c.js";
 import { getPc, getSp, getSyscallNumber, getX, makeIovec, makeRegisterSet, NT_PRSTATUS, setPc, setX } from "../tracee/reg.c.js";
 import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
 import { readElfLoadInfo, relocateElf } from "../execve/elf.c.js";
@@ -1144,6 +1146,8 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
   const deleteTask=(taskPid)=>{
     const removed=tasks.get(taskPid);
     if (removed?.scratchSlot!==undefined) freeScratchSlots.push(removed.scratchSlot);
+    if (removed?.shmAttachments!==undefined)
+      for (const { shmid } of removed.shmAttachments.values()) shmDetached(shmid,taskPid);
     tasks.delete(taskPid);
   };
   let rootExit=1;
@@ -1225,6 +1229,9 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
           scratch:task.trampoline+scratchSlot*4096n+512n, scratchSlot, configured:true,
           namespaceEmulated:task.namespaceEmulated, pivoted:task.pivoted };
         inherited.ids={ ...task.ids??rootCredentials() };
+        // fork keeps the mappings, so the child holds the same attachments.
+        inherited.shmAttachments=new Map(task.shmAttachments??[]);
+        for (const { shmid } of inherited.shmAttachments.values()) shmAttached(shmid,child);
         inherited.usernsLimitFaked=task.usernsLimitFaked;
         inherited.usernsAfterLimit=task.usernsAfterLimit;
         inherited.openedHostFds=new Map(task.openedHostFds??[]);
@@ -1275,6 +1282,92 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
         if ([39,40,41].includes(blockedSyscall))
           emulateNamespaceFilesystem(taskPid,mounts,task,stopped,blockedSyscall);
         setX(stopped.regs,0,0n); putRegisters(taskPid,stopped);
+        task.entering=true;
+        continue;
+      }
+      if (signal===31 && getSyscallNumber(stopped.regs)===202) { // accept
+        // musl issues SYS_accept directly, and Android's seccomp allowlist
+        // carries only accept4 -- bionic's own accept() is a wrapper around
+        // it. Answering ENOSYS here leaves a server spinning on a listening
+        // socket it can never drain: PostgreSQL logs "could not accept new
+        // connection: Function not implemented" a hundred times a second.
+        // Rewind to the svc and reissue it as accept4 with no flags, so the
+        // tracee blocks in the kernel the way it means to; running it through
+        // remoteCall would block the tracer instead.
+        setX(stopped.regs,3,0n); // accept4's extra flags argument
+        setX(stopped.regs,8,242n);
+        setPc(stopped.regs,getPc(stopped.regs)-4n);
+        putRegisters(taskPid,stopped);
+        task.entering=true;
+        continue;
+      }
+      if (signal===31 && [194,195,196,197].includes(getSyscallNumber(stopped.regs))) {
+        // System V shared memory. Android's seccomp denies these outright, so
+        // they never reach our filter's entry stop -- the frame is already
+        // past svc and the result has to be supplied here. On a kernel that
+        // allows them there is no SIGSYS and they simply run, which is what
+        // should happen: only Android needs the emulation.
+        const blocked=getSyscallNumber(stopped.regs);
+        const EINVAL=BigInt.asUintN(64,-22n);
+        let result;
+        if (blocked===194) { // shmget
+          result=BigInt.asUintN(64,BigInt(shmGet(
+            Number(BigInt.asIntN(32,getX(stopped.regs,0))),
+            Number(getX(stopped.regs,1)),
+            Number(getX(stopped.regs,2)),
+            { uid:task.ids.euid, gid:task.ids.egid, pid:taskPid })));
+        } else if (blocked===196) { // shmat
+          const shmid=Number(BigInt.asIntN(32,getX(stopped.regs,0)));
+          const segment=shmSegment(shmid);
+          if (segment===null) result=EINVAL;
+          else {
+            // The tracer cannot hand a descriptor over, so it has the guest
+            // open the backing file and map it: the same shared object every
+            // other attacher gets. Upstream needs a helper process and
+            // SCM_RIGHTS for this, which is the part that fails on Android.
+            const pathAddress=task.scratch+2048n;
+            writeCString(memory,taskPid,pathAddress,segment.path);
+            const fd=remoteCall(taskPid,task.trampoline,SYS_OPENAT,[-100n,pathAddress,2n,0n]);
+            if (fd<0n) result=BigInt.asUintN(64,fd);
+            else {
+              const length=BigInt((segment.size+4095)&~4095);
+              const mapped=remoteCall(taskPid,task.trampoline,SYS_MMAP,
+                [0n,length,3n,1n,fd,0n]); // PROT_READ|PROT_WRITE, MAP_SHARED
+              remoteCall(taskPid,task.trampoline,SYS_CLOSE,[fd]);
+              if (mapped<0n) result=BigInt.asUintN(64,mapped);
+              else {
+                task.shmAttachments??=new Map();
+                task.shmAttachments.set(mapped,{shmid,length});
+                shmAttached(shmid,taskPid);
+                result=BigInt.asUintN(64,mapped);
+              }
+            }
+          }
+        } else if (blocked===197) { // shmdt
+          const address=getX(stopped.regs,0);
+          const attachment=task.shmAttachments?.get(address);
+          if (attachment===undefined) result=EINVAL;
+          else {
+            remoteCall(taskPid,task.trampoline,SYS_MUNMAP,[address,attachment.length]);
+            shmDetached(attachment.shmid,taskPid);
+            task.shmAttachments.delete(address);
+            result=0n;
+          }
+        } else { // shmctl
+          const shmid=Number(BigInt.asIntN(32,getX(stopped.regs,0)));
+          // glibc and musl both fold IPC_64 into the command.
+          const command=Number(BigInt.asIntN(32,getX(stopped.regs,1)))&~0x100;
+          const buffer=getX(stopped.regs,2);
+          if (command===0) result=BigInt.asUintN(64,BigInt(shmRemove(shmid))); // IPC_RMID
+          else if (command===2) { // IPC_STAT
+            const stat=shmStat(shmid);
+            if (stat===null) result=EINVAL;
+            else { writeTraceeBytes(taskPid,buffer,stat,BigInt(stat.length)); result=0n; }
+          } else result=EINVAL;
+        }
+        if (verbose)
+          console.error(`[ptrace] pid=${taskPid} sysvipc syscall=${blocked} -> 0x${result.toString(16)}`);
+        setX(stopped.regs,0,result); putRegisters(taskPid,stopped);
         task.entering=true;
         continue;
       }
@@ -2088,5 +2181,6 @@ const exited=registers(), result=exitResult(phase,exited);
   }
   report(performance.now()-started);
   for (const mountinfoPath of mountinfoPaths) try { unlinkSync(mountinfoPath); } catch {}
+  shmCleanup();
   return rootExit;
 }

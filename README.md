@@ -244,6 +244,7 @@ is an argument to the guest program instead.
 | `-koe`, `--kill-on-exit` | Kill whatever is left of the guest when `COMMAND` exits |
 | `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
 | `-h`, `--help` | The options and the debug environment variables |
+| `--readme` | Render this README in the terminal, with links where it has them |
 | `-V`, `--version` | The version, then exit |
 
 `PROOT_BUN_VERBOSE`, `PROOT_BUN_PROFILE`, `PROOT_NO_SECCOMP` and
@@ -341,6 +342,33 @@ or `LD_PRELOAD`.
 `-S` also supplies `/dev`, maps `/dev/udmabuf` to `/dev/null` when a device
 node is unavailable, and provides Android-hidden overflow uid/gid values. These
 are built-in compatibility bindings; no Termux prefix bind is required.
+
+### Syscalls Android refuses to run
+
+Android's seccomp policy is a second kind of refusal, and a harsher one: it
+does not fail the call, it kills the caller with SIGSYS. The tracer catches
+those and answers in the guest's place. What that answer is depends on what was
+blocked.
+
+The **id-setting family** -- `setuid`, `setgid`, `setregid`, `setresuid`,
+`setfsuid`, `setgroups` and the rest -- can never be granted to an app uid, so
+fake-id0 answers them from its own credentials instead. Without it `su` stops
+at `can't set groups: Function not implemented`.
+
+**`accept(2)`** is missing from the allowlist; only `accept4(2)` is there,
+which is what bionic's own `accept()` wraps. musl calls `accept` directly, so
+the tracer rewinds the guest to its `svc` and reissues the call as `accept4`.
+The guest then blocks in the kernel as it means to. Without this a musl server
+spins on a socket it can never drain -- PostgreSQL logs `could not accept new
+connection: Function not implemented` about ten times a second.
+
+**System V shared memory** is denied outright, so `shmget`, `shmat`, `shmdt`
+and `shmctl` are emulated. Segments are backed by files under `TMPDIR` that the
+guest maps itself with `MAP_SHARED`, so two guest processes holding the same
+key really do share memory rather than each getting a private copy. PostgreSQL
+needs this even with `shared_memory_type=mmap`, because it still creates a
+small SysV segment as its postmaster interlock. Semaphores and message queues
+are not emulated; nothing tested has needed them.
 
 ## Native bubblewrap
 
@@ -562,9 +590,23 @@ that cost more time than the bugs did.
 - `-S` resolves a relative rootfs before changing cwd and enables the current
   fake-id0 layer (`uid=0`, `gid=0`, root supplementary group, and root ownership
   in common stat results).
+- That identity is not fixed at root: the set*id family moves a per-task
+  credential set, so a guest that drops privilege is seen to have dropped it,
+  and `getuid`/`geteuid` answer accordingly. A stat result hands back the saved
+  set-user-ID for files the tracer's own uid owns, leaving everything else
+  alone. PostgreSQL will not run as root, nor with a data directory it does not
+  own, so it needs both halves.
 - That identity is translated in both directions across a Unix socket: real
   ids go out in `SCM_CREDENTIALS`, guest ids come back from `SO_PEERCRED`.
   D-Bus authentication needs both halves.
+- System V shared memory is emulated over files under `TMPDIR` that the guest
+  maps itself, so the tracer never has to pass a descriptor; upstream needs a
+  helper process and `SCM_RIGHTS` for that, and it is the part of its sysvipc
+  extension that does not work on Android.
+- A syscall Android blocks arrives as SIGSYS, already past `svc`. Some are
+  answered outright, and `accept` is reissued as `accept4` by rewinding the
+  guest one instruction; see
+  [Syscalls Android refuses to run](#syscalls-android-refuses-to-run).
 - A `NETLINK_ROUTE` socket is emulated rather than opened; see
   [Android compatibility](#android-compatibility).
 - Mount and user namespaces are emulated in a per-process runtime mount table,
@@ -577,6 +619,9 @@ that cost more time than the bugs did.
   hundreds of simultaneous tasks does not exhaust them.
 - `--kill-on-exit` stops tracing as soon as the root guest exits;
   `PTRACE_O_EXITKILL` takes the remaining tracees with the tracer.
+- FFI symbols are bound at first use, not at import. Binding them at the top
+  of a module made `--version`, `--help` and `--readme` depend on Android's
+  bionic being loadable, which they have no need of.
 - Regenerate missing one-to-one placeholders with:
 
 ```sh

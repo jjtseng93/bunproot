@@ -73,16 +73,18 @@ What to run to check any of this still holds is in
    the induced bindings a sub-reconfiguration adds.
 
    This item measures the file-by-file port, not what works.
-   `extension/link2symlink/` is the only directory carrying a real
-   implementation; the rest of `extension/` is still placeholders. Several of
-   those extensions' behaviours nevertheless work today, because they are
-   implemented directly in `ptrace/ptrace.c.js` instead of in a module of
-   their own: the fake-id0 identity layer, including the `sendmsg` credential
-   substitution of `src/extension/fake_id0/sendmsg.c`, the `SO_PEERCRED`
+   `extension/link2symlink/` and `extension/sysvipc/sysvipc_shm.c.js` are the
+   directories carrying a real implementation; the rest of `extension/` is
+   still placeholders. Several of those extensions' behaviours nevertheless
+   work today, because they are implemented directly in `ptrace/ptrace.c.js`
+   instead of in a module of their own: the fake-id0 identity layer -- the
+   `SETXID`/`SETREXID`/`SETRESXID`/`SETFSXID` semantics of `fake_id0.c`
+   including its `caps_active` model, the owner override of `stat.c`, the
+   `sendmsg` credential substitution of `sendmsg.c`, the `SO_PEERCRED`
    translation of `getsockopt.c`, and the `/proc/self/fd/N`-to-`dup(N)`
-   substitution of `fake_id0.c`; and a synthesized `/proc/self/mountinfo`.
+   substitution of `fake_id0.c` -- and a synthesized `/proc/self/mountinfo`.
    What remains for those is moving each into its own module, not making it
-   work.
+   work. SysV semaphores and message queues are not implemented at all.
 9. **Architectures.** Add ELF32/AArch32 and other ABIs after ARM64 behavior is
    stable.
 
@@ -315,6 +317,33 @@ status 0:
 ```sh
 bun i -g --backend=copyfile cowsay
 ```
+
+System V shared memory is emulated for a narrower reason than upstream's: on
+Android the syscalls are not merely namespaced, they are denied. The platform's
+seccomp policy answers `shmget` with SIGSYS, so a guest gets no shared memory
+at all unless the tracer provides it. `shmget`, `shmat`, `shmdt` and `shmctl`
+are handled; semaphores and message queues are not, and nothing tested has
+asked for them.
+
+The segment table, the `shmid64_ds` layout and the deferred `IPC_RMID` follow
+`src/extension/sysvipc/sysvipc_shm.c`. How the memory reaches the guest does
+not. Upstream cannot map on a tracee's behalf from inside its own ptrace loop,
+so it forks a helper process, has the tracee connect to it over `AF_UNIX` and
+passes the descriptor with `SCM_RIGHTS`. That helper is also the part that does
+not survive Android: its re-exec of `/proc/self/exe --shm-helper` is parsed as
+a rootfs argument, the helper never reports its socket back, and every shm
+request then falls through to the `-EIO` at `sysvipc_shm.c:210`. Termux's own
+proot shows this directly -- `semget` and `msgget` answer normally there while
+`shmget` returns `-EIO`, which is why PostgreSQL has never started under it.
+
+Here the tracer can make a tracee run a syscall directly, so the descriptor
+never has to travel: a segment is a file under `TMPDIR`, and the guest opens
+and maps it itself with `MAP_SHARED`. Two guest processes attached to one key
+share memory, which a private mapping each would not. The blocked calls arrive
+as SIGSYS rather than at the filter's entry stop, past `svc`, so the results
+are supplied from the signal stop; a kernel that permits these syscalls raises
+no SIGSYS and runs them itself, which is the wanted behaviour everywhere but
+Android.
 
 An `AF_UNIX` pathname never reaches the kernel as a syscall pathname argument:
 it travels inside a `sockaddr`, which openat-style translation never sees.
