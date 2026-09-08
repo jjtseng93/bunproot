@@ -282,3 +282,123 @@ export function scanUpstreamStore(rootfs) {
   }
   return { collected: true, intermediates, finals, links, prefix };
 }
+
+/** A rootfs whose own pathname contains a `.proot.l2s` segment cannot be
+ *  pinned: the recorded prefix and the store path would then be
+ *  indistinguishable, and unpinning could not tell where one ends and the
+ *  other begins. Refusing is cheaper than guessing wrong on someone's data. */
+export function pinnableRootfs(rootfs) {
+  return !rootfs.split("/").includes(STORE.slice(1));
+}
+
+/**
+ * Rewrite every target in the store to the pinned or the portable form.
+ *
+ * Both legs move: the guest alias that names a ref, and the ref that names an
+ * object. Following an emulated link from outside the rootfs breaks at
+ * whichever leg is still guest-absolute, so converting one is the same as
+ * converting neither.
+ *
+ * Each target is judged on its own, so the work is idempotent -- an
+ * interrupted run is finished by running it again -- and unpinning locates
+ * the store by its own path segment rather than by any recorded prefix, so a
+ * rootfs that moved after being pinned can still be brought back.
+ */
+export async function convertStore(rootfs, pin) {
+  const refsRoot = host(rootfs, REFS);
+  try { if (!lstatSync(refsRoot).isDirectory()) return null; } catch { return null; }
+
+  const relatives = [];
+  const pending = [""];
+  while (pending.length > 0) {
+    const relative = pending.pop();
+    let entries;
+    try { entries = readdirSync(refsRoot + relative, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const child = `${relative}/${entry.name}`;
+      if (entry.isDirectory()) pending.push(child);
+      else if (entry.isSymbolicLink()) relatives.push(child);
+    }
+  }
+
+  const report = { refs: relatives.length, changed: 0, already: 0, skipped: 0 };
+  // The last occurrence, not the first: a prefix may itself contain the
+  // segment, and only the final one starts the store's own path.
+  const portable = (target) => {
+    const at = target.lastIndexOf(`${STORE}/`);
+    return at < 0 ? null : target.slice(at);
+  };
+  const wanted = (target) => {
+    const guest = portable(target);
+    if (guest === null) return null;
+    return pin ? `${rootfs}${guest}` : guest;
+  };
+
+  for (let index = 0; index < relatives.length; index += SCAN_BATCH) {
+    const batch = relatives.slice(index, index + SCAN_BATCH);
+    const targets = await Promise.all(batch.flatMap((relative) => [
+      readlinkAsync(refsRoot + relative).catch(() => null),
+      readlinkAsync(host(rootfs, relative)).catch(() => null),
+    ]));
+    for (let offset = 0; offset < batch.length; offset++) {
+      const relative = batch[offset];
+      const legs = [
+        { path: refsRoot + relative, target: targets[offset * 2] },
+        { path: host(rootfs, relative), target: targets[offset * 2 + 1] },
+      ];
+      let changed = false, skipped = false;
+      for (const { path, target } of legs) {
+        if (target === null) { skipped = true; continue; }
+        const next = wanted(target);
+        if (next === null) { skipped = true; continue; }
+        if (next === target) continue;
+        try { replaceSymlink(path, next); changed = true; } catch { skipped = true; }
+      }
+      if (skipped) report.skipped++;
+      else if (changed) report.changed++;
+      else report.already++;
+    }
+  }
+  return report;
+}
+
+/**
+ * Is this store pinned? Cheap enough to ask on every launch.
+ *
+ * A handful of refs decides it. The cost is in walking to the first leaf, not
+ * in reading targets, so once there it reads a few rather than one: a store
+ * caught halfway through a conversion would otherwise answer with whichever
+ * form its first ref happens to be in, and a guest let into that state finds
+ * some of its hard links unrecognised. Any pinned ref is enough to refuse.
+ *
+ * Both budgets are needed: the refs mirror the guest tree, so a store whose
+ * first branches are deep directories can cost more readdir calls to reach a
+ * leaf than it costs to read every target once there.
+ *
+ * It is still a sample, not a survey -- `--l2s-status` is what reports a store
+ * properly, and the refusal names it.
+ *
+ * Returns true, false, or null when the rootfs carries no store at all.
+ */
+const PIN_SAMPLE = 8, PIN_DIRECTORIES = 12;
+export function storeIsPinned(rootfs) {
+  const refsRoot = host(rootfs, REFS);
+  try { if (!lstatSync(refsRoot).isDirectory()) return null; } catch { return null; }
+  const pending = [""];
+  let seen = 0, visited = 0;
+  while (pending.length > 0 && seen < PIN_SAMPLE && visited < PIN_DIRECTORIES) {
+    const relative = pending.pop();
+    let entries;
+    try { entries = readdirSync(refsRoot + relative, { withFileTypes: true }); visited++; } catch { continue; }
+    for (const entry of entries) {
+      const child = `${relative}/${entry.name}`;
+      if (entry.isDirectory()) { pending.push(child); continue; }
+      if (!entry.isSymbolicLink()) continue;
+      let target;
+      try { target = readlinkSync(refsRoot + child); } catch { continue; }
+      if (!target.startsWith(`${OBJS}/`)) return true;
+      if (++seen >= PIN_SAMPLE) break;
+    }
+  }
+  return seen > 0 ? false : null;
+}

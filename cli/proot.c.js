@@ -6,6 +6,7 @@ import { readElfInterpreter } from "../execve/elf.c.js";
 import { expandShebang, makeGuestPaths } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
 import { createBindings } from "../path/binding.c.js";
+import { storeIsPinned } from "../extension/link2symlink/link2symlink.c.js";
 import { traceProcess } from "../ptrace/ptrace.c.js";
 import { bootstrapEnvironment, guestEnvironment } from "../env.js";
 import pkg from "../package.json" with { type: "json" };
@@ -23,6 +24,12 @@ function renderMarkdown(markdown) {
   return Bun.markdown.ansi(markdown,
     columns ? { hyperlinks: true, columns } : { hyperlinks: true });
 }
+const DOCUMENT_FLAGS = {
+  "--readme": "../README.md", "--l2s-docs": "../link2symlink.md",
+};
+const STORE_COMMANDS = {
+  "--l2s-status": "status", "--l2s-pin": "pin", "--l2s-unpin": "unpin",
+};
 const FORMAT_DOCUMENTATION =
   "https://github.com/jjtseng93/bunproot/blob/main/link2symlink.md";
 
@@ -70,8 +77,31 @@ const HELP = `${USAGE}
   -koe, --kill-on-exit
       kill all remaining guest processes when COMMAND exits
 
+Emulated hard links. The first four take a rootfs of their own, run nothing
+inside it, and combine with nothing else; the last is an option to a normal
+run:
+
+  --l2s-status ROOTFS
+      report the state of that rootfs's emulated hard-link store
+
+  --l2s-pin ROOTFS
+      rewrite the store so tools outside the rootfs can follow its
+      emulated hard links. The rootfs can no longer be moved, and the
+      guest cannot use them until it is unpinned
+
+  --l2s-unpin ROOTFS
+      rewrite it back to the portable form
+
+  --l2s-docs
+      render link2symlink.md, the on-disk format, in the terminal
+
+  --l2s-ignore-pin
+      enter a rootfs whose store is pinned, which is otherwise refused
+
+These report and exit:
+
   --download-alpine
-      download and verify an Alpine minirootfs, then exit
+      download and verify an Alpine minirootfs
 
   -h, --help
       show this message
@@ -79,12 +109,8 @@ const HELP = `${USAGE}
   --readme
       render README.md in the terminal, with hyperlinks where it has links
 
-  --l2s-status ROOTFS
-      report the state of a rootfs's emulated hard-link store, and exit.
-      Reads only; takes a rootfs of its own and needs no -S
-
   -V, --version
-      show the version and exit
+      show the version
 
 Either half of a binding may be relative to the current directory, and the
 first colon separates them. The most specific binding wins; the rootfs is the
@@ -99,7 +125,7 @@ export function parseArguments(argv) {
   // A binding is a specification string; --dns contributes a token expanded
   // once the rootfs is known, in the place it was written.
   const bindings = [];
-  let rootfs = null, sawDns = false, killOnExit = false, index = 0;
+  let rootfs = null, sawDns = false, killOnExit = false, ignorePin = false, index = 0;
   for (; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === "-b" || argument === "--bind" || argument === "-m" || argument === "--mount") {
@@ -121,31 +147,34 @@ export function parseArguments(argv) {
       continue;
     }
     if (argument === "-h" || argument === "--help") return { help: true };
-    if (argument === "--readme") return { readme: true };
-    if (argument === "--l2s-status" || argument.startsWith("--l2s-status=")) {
+    if (DOCUMENT_FLAGS[argument] !== undefined) return { document: DOCUMENT_FLAGS[argument] };
+    const storeAction = STORE_COMMANDS[argument.split("=")[0]];
+    if (storeAction !== undefined) {
       // A whole command line of its own: `bunproot --l2s-status ROOTFS` and
       // nothing besides. It enters no rootfs and honours no binding, so any
       // other argument means the caller expected something this does not do
       // -- running a command in that rootfs, or reading the one -S names.
       // Both are worse discovered here than silently ignored.
-      const inline = argument.startsWith("--l2s-status=");
+      const flag = argument.split("=")[0];
+      const inline = argument.includes("=");
       let target;
-      if (inline) target = argument.slice(13);
+      if (inline) target = argument.slice(argument.indexOf("=") + 1);
       else if ((target = argv[++index]) === undefined)
-        throw new Error(`--l2s-status needs a rootfs\n${USAGE}\n${TRY_HELP}`);
+        throw new Error(`${flag} needs a rootfs\n${USAGE}\n${TRY_HELP}`);
       // The rootfs they meant is the one they passed to -S, not whatever
       // happened to follow --l2s-status.
       if (rootfs !== null) throw new Error(
-        "--l2s-status takes its own rootfs; it does not combine with -S\n" +
-        `try \`bunproot --l2s-status ${rootfs}\``);
+        `${flag} takes its own rootfs; it does not combine with -S\n` +
+        `try \`bunproot ${flag} ${rootfs}\``);
       if ((inline ? index : index - 1) !== 0 || index + 1 !== argv.length)
         throw new Error(
-          "--l2s-status is a command of its own and takes nothing else:\n" +
-          `  bunproot --l2s-status ${target}`);
-      return { l2sStatus: resolve(target) };
+          `${flag} is a command of its own and takes nothing else:\n` +
+          `  bunproot ${flag} ${target}`);
+      return { storeAction, storeRootfs: resolve(target) };
     }
     if (argument === "-V" || argument === "--version") return { version: true };
     if (argument === "-koe" || argument === "--kill-on-exit") { killOnExit = true; continue; }
+    if (argument === "--l2s-ignore-pin") { ignorePin = true; continue; }
     if (argument === "-S" || argument === "--rootfs") {
       if (argv[++index] === undefined) throw new Error(`${argument} needs a rootfs\n${USAGE}\n${TRY_HELP}`);
       // Resolve this before the bootstrap changes cwd to the rootfs. Otherwise
@@ -161,7 +190,7 @@ export function parseArguments(argv) {
   // The default sits ahead of everything the caller wrote, so any binding of
   // theirs on the same pathname is the later one and wins.
   if (!sawDns) bindings.unshift({ dns: "auto" });
-  return { rootfs, bindings, command, killOnExit };
+  return { rootfs, bindings, command, killOnExit, ignorePin };
 }
 /**
  * `--l2s-status`: what state a rootfs's emulated hard-link store is in.
@@ -170,13 +199,27 @@ export function parseArguments(argv) {
  * writes nothing, so it answers on a host where the Android bionic this port
  * normally loads cannot be opened at all.
  */
-async function reportLinkStore(rootfs) {
+async function runStoreCommand(rootfs, action) {
   try {
     if (!statSync(rootfs).isDirectory()) throw new Error("not a directory");
   } catch { throw new Error(`cannot read rootfs: ${rootfs}`); }
 
-  const { scanStore, scanUpstreamStore } =
+  const { scanStore, scanUpstreamStore, convertStore, pinnableRootfs } =
     await import("../extension/link2symlink/link2symlink.c.js");
+
+  let converted = null;
+  if (action !== "status") {
+    // A rootfs whose own pathname carries the store's segment would produce
+    // targets nothing could take apart again.
+    if (action === "pin" && !pinnableRootfs(rootfs)) throw new Error(
+      `cannot pin this rootfs: its pathname contains a .proot.l2s segment\n` +
+      `  ${rootfs}\n` +
+      "A pinned target would be indistinguishable from the store's own path,\n" +
+      "and unpinning could not tell where the prefix ends.");
+    converted = await convertStore(rootfs, action === "pin");
+    if (converted === null) throw new Error(`no .proot.l2s store in ${rootfs}`);
+  }
+
   const report = await scanStore(rootfs);
   const upstream = scanUpstreamStore(rootfs);
 
@@ -188,6 +231,7 @@ async function reportLinkStore(rootfs) {
     blocks.push("No link2symlink store here. Nothing in this rootfs emulates a hard link.");
   else if (report === null) blocks.push(...describeUpstream(rootfs, upstream));
   else {
+    if (converted !== null) blocks.push(...describeConversion(action, converted));
     blocks.push(...describePort(report));
     if (upstream !== null) {
       // Both stores in one rootfs is the case worth shouting about: neither
@@ -203,6 +247,25 @@ async function reportLinkStore(rootfs) {
     blocks.push("## Format reference", `- [link2symlink.md](${FORMAT_DOCUMENTATION})`);
   console.log(renderMarkdown(blocks.join("\n\n")));
   return 0;
+}
+
+/** What a pin or unpin actually did. Every target is judged on its own, so a
+ *  second run is harmless and finishes an interrupted first one. */
+function describeConversion(action, converted) {
+  const rows = [["refs", converted.refs], ["rewritten", converted.changed]];
+  if (converted.already > 0)
+    rows.push([action === "pin" ? "already pinned" : "already portable", converted.already]);
+  if (converted.skipped > 0) rows.push(["skipped", converted.skipped]);
+  const blocks = [`## ${action === "pin" ? "Pinned" : "Unpinned"}`, bullets(rows)];
+  // The two readabilities are exclusive, and that is the whole trade: a
+  // pinned store is for tools outside the rootfs, and costs the guest its
+  // own hard links until it is unpinned again.
+  blocks.push(action === "pin"
+    ? "> Unpin before entering this rootfs again. The tracer identifies an emulated hard link by its guest-absolute target, so while it is pinned it recognises none of them."
+    : "> Emulated hard links work inside the guest again, and no longer from outside it.");
+  if (converted.skipped > 0)
+    blocks.push("A skipped ref could not be read or rewritten: a stale alias, or a store this process cannot write to.");
+  return blocks;
 }
 
 /** A bulleted list of name/value pairs. Lighter than a table, and it does not
@@ -224,7 +287,9 @@ function describePort(report) {
   if (form === "portable")
     blocks.push("Every target is guest-absolute, so this rootfs can still be moved and the store follows it.");
   else if (form === "pinned")
-    blocks.push("Targets carry a host prefix, so tools outside the rootfs can follow them. Moving the rootfs breaks every one.",
+    blocks.push("Targets carry a host prefix, which is what lets tools outside the rootfs follow them. Moving the rootfs breaks every one.",
+      "### Unpin before entering",
+      "The tracer identifies an emulated hard link by its guest-absolute target, so it recognises none of these. They do not resolve inside the guest, and binding the rootfs onto itself only makes that worse: the files become readable while still not being hard links, reporting a link count of 1 and listing as symlinks. Anything that trusts either -- git, apk -- is then working from a false picture.",
       "### Pinned to", `    ${prefixes[0][0]}`);
   else {
     blocks.push("A conversion stopped partway. Running it again completes it.", "### Pinned to");
@@ -300,13 +365,25 @@ export function run(argv) {
   // Only a --help before the command is ours; after it, it belongs to the guest.
   if (parsed.help) { console.log(HELP); return 0; }
   if (parsed.version) { console.log(`${pkg.name} ${pkg.version}`); return 0; }
-  if (parsed.l2sStatus !== undefined) return reportLinkStore(parsed.l2sStatus);
-  if (parsed.readme) {
-    const readme = readFileSync(resolve(import.meta.dirname, "../README.md"), "utf8");
-    console.log(renderMarkdown(readme));
+  if (parsed.storeAction !== undefined)
+    return runStoreCommand(parsed.storeRootfs, parsed.storeAction);
+  if (parsed.document !== undefined) {
+    const markdown = readFileSync(resolve(import.meta.dirname, parsed.document), "utf8");
+    console.log(renderMarkdown(markdown));
     return 0;
   }
-  const { rootfs, bindings, command, killOnExit } = parsed;
+  const { rootfs, bindings, command, killOnExit, ignorePin } = parsed;
+  // A pinned store is not merely unreadable from in here: the tracer
+  // identifies an emulated hard link by its guest-absolute target, so while
+  // it is pinned it recognises none of them. Reads fail, and writes are
+  // worse -- a new link is written in the portable form beside the pinned
+  // ones, and unlinking a pinned alias never decrements its object. Refuse,
+  // rather than let a guest damage the store one operation at a time.
+  if (!ignorePin && storeIsPinned(rootfs) === true) throw new Error(
+    `this rootfs's link store is pinned, so its emulated hard links do not work\n` +
+    `  bunproot --l2s-unpin ${rootfs}\n` +
+    "puts it back; --l2s-status reports it in full, and --l2s-ignore-pin\n" +
+    "enters anyway.");
   const compatibilityBindings=[
     "/dev:/dev",
     // Android exposes /dev/udmabuf in directory listings but SELinux denies

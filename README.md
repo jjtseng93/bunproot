@@ -245,10 +245,14 @@ is an argument to the guest program instead.
 | `-m`, `--mount` | Another name for `--bind`, not a different thing |
 | `--dns MODE` | Which resolver the guest gets: `auto` (default), `simple` or `off`. `--dns=MODE` says the same thing |
 | `-koe`, `--kill-on-exit` | Kill whatever is left of the guest when `COMMAND` exits |
+| `--l2s-ignore-pin` | Enter a rootfs whose link store is pinned, which is otherwise refused. Its emulated hard links do not work while it is pinned |
 | `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
 | `-h`, `--help` | The options and the debug environment variables |
 | `--readme` | Render this README in the terminal, with links where it has them |
 | `--l2s-status ROOTFS` | Report what state a rootfs's emulated hard-link store is in, then exit. Recognises the original PRoot's format too. Reads only, takes a rootfs of its own, and combines with nothing else |
+| `--l2s-pin ROOTFS` | Rewrite that store so tools outside the rootfs can follow its emulated hard links. The guest loses them for as long as it is pinned, and the rootfs can no longer be moved |
+| `--l2s-unpin ROOTFS` | Rewrite it back, so the guest can follow them again and the rootfs can move |
+| `--l2s-docs` | Render [link2symlink.md](./link2symlink.md), the on-disk format, in the terminal |
 | `-V`, `--version` | The version, then exit |
 
 `PROOT_BUN_VERBOSE`, `PROOT_BUN_PROFILE`, `PROOT_NO_SECCOMP` and
@@ -565,6 +569,23 @@ that cost more time than the bugs did.
   Alpine `apk update` to install downloaded repository indexes. Ordinary
   failed hard links use the relocatable `refs/objs/mets` emulation described
   in [link2symlink.md](./link2symlink.md).
+- `--l2s-pin` rewrites both legs of every emulated hard link to carry the
+  rootfs's own pathname, which is what a backup or sync tool outside the guest
+  needs to follow them; `--l2s-unpin` puts them back. Unpin before entering a
+  pinned rootfs: the tracer identifies an emulated hard link by its
+  guest-absolute target, so it recognises none of them while they are pinned,
+  and binding the rootfs onto itself only hides that -- the files read back
+  while reporting a link count of 1 and listing as symlinks. Every target is
+  judged on its own, so either direction is idempotent and an interrupted run
+  is finished by repeating it. A rootfs whose own pathname contains a
+  `.proot.l2s` segment is refused: nothing could tell the recorded prefix from
+  the store path afterwards.
+- Entering a pinned rootfs is refused outright, because the damage is not
+  limited to the reads that fail: a new hard link would be written in the
+  portable form beside the pinned ones, and unlinking a pinned alias would
+  never decrement its object. The check samples a few refs on startup, which
+  also catches a store left halfway through a conversion; `--l2s-ignore-pin`
+  overrides it.
 - `--l2s-status` reads the store and derives everything from the symlink
   targets themselves, so a rootfs that was copied, moved or half-converted
   still describes what it actually is. Its concurrency is what makes a cold
