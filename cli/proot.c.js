@@ -54,7 +54,7 @@ function spawnTracee(argv, env) {
   if (status !== 0) throw new Error(`posix_spawn failed: ${status}`);
   return new DataView(pidBytes.buffer).getInt32(0, true);
 }
-const USAGE = "Usage: bunproot [OPTION ...] -S ROOTFS COMMAND [ARG ...]";
+const USAGE = "Usage: bunproot [OPTION ...] (-S ROOTFS | --android-container ROOTFS) [COMMAND [ARG ...]]";
 // Nothing about the usage line says where the rest is, and the rest includes
 // the debug environment variables, so every way of getting the invocation
 // wrong ends by naming --help.
@@ -63,7 +63,13 @@ const TRY_HELP = "try `bunproot --help` for the options and the debug environmen
 const HELP = `${USAGE}
 
   -S, --rootfs ROOTFS
-      run COMMAND with ROOTFS as its root directory
+      run COMMAND with ROOTFS as its root directory; COMMAND defaults to
+      /bin/sh
+
+  --android-container ROOTFS
+      use ROOTFS, which may be an empty directory, with Android's system,
+      APEX, linker configuration and this Bun bound in; COMMAND defaults to
+      /system/bin/sh
 
   -b, --bind HOST[:GUEST]
       bind HOST at GUEST, or at the same path; repeatable
@@ -125,7 +131,7 @@ export function parseArguments(argv) {
   // A binding is a specification string; --dns contributes a token expanded
   // once the rootfs is known, in the place it was written.
   const bindings = [];
-  let rootfs = null, sawDns = false, killOnExit = false, ignorePin = false, index = 0;
+  let rootfs = null, androidContainer = false, sawDns = false, killOnExit = false, ignorePin = false, index = 0;
   for (; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === "-b" || argument === "--bind" || argument === "-m" || argument === "--mount") {
@@ -175,8 +181,16 @@ export function parseArguments(argv) {
     if (argument === "-V" || argument === "--version") return { version: true };
     if (argument === "-koe" || argument === "--kill-on-exit") { killOnExit = true; continue; }
     if (argument === "--l2s-ignore-pin") { ignorePin = true; continue; }
+    if (argument === "--android-container" || argument.startsWith("--android-container=")) {
+      if (rootfs !== null) throw new Error(`--android-container does not combine with -S\n${USAGE}\n${TRY_HELP}`);
+      const target=argument.includes("=")?argument.slice(argument.indexOf("=")+1):argv[++index];
+      if (!target) throw new Error(`--android-container needs a rootfs\n${USAGE}\n${TRY_HELP}`);
+      rootfs=resolve(target); androidContainer=true;
+      continue;
+    }
     if (argument === "-S" || argument === "--rootfs") {
       if (argv[++index] === undefined) throw new Error(`${argument} needs a rootfs\n${USAGE}\n${TRY_HELP}`);
+      if (androidContainer) throw new Error(`${argument} does not combine with --android-container\n${USAGE}\n${TRY_HELP}`);
       // Resolve this before the bootstrap changes cwd to the rootfs. Otherwise
       // a caller-relative rootfs is interpreted again from inside that rootfs
       // and subsequent host-path translations acquire the wrong prefix.
@@ -185,12 +199,13 @@ export function parseArguments(argv) {
     }
     break;
   }
-  const command = argv.slice(index);
-  if (rootfs === null || command.length === 0) throw new Error(`${USAGE}\n${TRY_HELP}`);
+  let command = argv.slice(index);
+  if (rootfs === null) throw new Error(`${USAGE}\n${TRY_HELP}`);
+  if (command.length === 0) command=[androidContainer?"/system/bin/sh":"/bin/sh"];
   // The default sits ahead of everything the caller wrote, so any binding of
   // theirs on the same pathname is the later one and wins.
   if (!sawDns) bindings.unshift({ dns: "auto" });
-  return { rootfs, bindings, command, killOnExit, ignorePin };
+  return { rootfs, bindings, command, killOnExit, ignorePin, ...(androidContainer && { androidContainer:true }) };
 }
 /**
  * `--l2s-status`: what state a rootfs's emulated hard-link store is in.
@@ -378,7 +393,7 @@ export function run(argv) {
     console.log(renderMarkdown(markdown));
     return 0;
   }
-  const { rootfs, bindings, command, killOnExit, ignorePin } = parsed;
+  const { rootfs, bindings, command, killOnExit, ignorePin, androidContainer } = parsed;
   // A pinned store is not merely unreadable from in here: the tracer
   // identifies an emulated hard link by its guest-absolute target, so while
   // it is pinned it recognises none of them. Reads fail, and writes are
@@ -401,8 +416,19 @@ export function run(argv) {
     `${OVERFLOW_ID}:/proc/sys/kernel/overflowuid`,
     `${OVERFLOW_ID}:/proc/sys/kernel/overflowgid`,
   ];
-  const mounts = createBindings(rootfs, [...compatibilityBindings,...bindings.flatMap((entry) =>
+  const androidBindings=androidContainer ? [
+    "/system:/system", "/apex:/apex", "/linkerconfig/ld.config.txt:/linkerconfig/ld.config.txt",
+    `${process.argv0}:/bin/bun`,
+  ] : [];
+  const mounts = createBindings(rootfs, [...compatibilityBindings,...androidBindings,...bindings.flatMap((entry) =>
     typeof entry === "string" ? [entry] : resolverBindings(rootfs, entry.dns))]);
+  const environment=guestEnvironment();
+  if (androidContainer) {
+    const pathIndex=environment.findIndex((entry)=>entry.startsWith("PATH="));
+    const path=pathIndex<0?"":environment[pathIndex].slice(5);
+    const value=`PATH=/system/bin:${path}`;
+    if (pathIndex<0) environment.push(value); else environment[pathIndex]=value;
+  }
   let guestExecutable=command[0].startsWith("/")
     ? canonicalizeGuestPath(mounts,command[0],{preserveInternalFinal:true})
     : command[0];
@@ -413,7 +439,7 @@ export function run(argv) {
   // an ELF and reports a truncated one.
   let guestArgv=command;
   const guestPaths=makeGuestPaths(mounts,
-    guestEnvironment().find((entry)=>entry.startsWith("PATH="))?.slice(5));
+    environment.find((entry)=>entry.startsWith("PATH="))?.slice(5));
   const script=expandShebang(executable,guestExecutable,guestArgv,guestPaths);
   if (script!==null) {
     guestExecutable=canonicalizeGuestPath(mounts,script.guestPath,{preserveInternalFinal:true});
@@ -433,5 +459,5 @@ export function run(argv) {
   ];
   const pid = spawnTracee(childArgv, bootstrapEnvironment());
   return traceProcess(pid, mounts, { executable, guestPath: guestExecutable,
-    name: basename(command[0]), interpreter, loader, argv: guestArgv }, { killOnExit });
+    name: basename(command[0]), interpreter, loader, argv: guestArgv, env:environment }, { killOnExit });
 }

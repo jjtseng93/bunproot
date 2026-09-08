@@ -30,9 +30,26 @@ test("bindings are collected in order and never eat the command", () => {
   expect(parseArguments(["-S", "/rootfs", "/bin/sh", "--help"])).toEqual({
     rootfs: "/rootfs", bindings: [{ dns: "auto" }], command: ["/bin/sh", "--help"], killOnExit: false, ignorePin: false,
   });
-  expect(() => parseArguments(["-S", "/rootfs"])).toThrow();
+  expect(parseArguments(["-S", "/rootfs"])).toEqual({
+    rootfs: "/rootfs", bindings: [{ dns: "auto" }], command: ["/bin/sh"],
+    killOnExit: false, ignorePin: false,
+  });
   expect(() => parseArguments(["-b", "/data", "/bin/sh"])).toThrow();
   expect(() => parseArguments(["-S", "/rootfs", "-b"])).toThrow();
+});
+
+test("--android-container takes a rootfs and defaults only its command", () => {
+  expect(parseArguments(["--android-container", "./empty"])).toEqual({
+    rootfs: resolve("./empty"), bindings: [{ dns: "auto" }], command: ["/system/bin/sh"],
+    killOnExit: false, ignorePin: false, androidContainer: true,
+  });
+  expect(parseArguments(["--android-container=./empty", "-b", "/dev/null:/bin/bun", "/system/bin/id"]))
+    .toEqual({
+      rootfs: resolve("./empty"), bindings: [{ dns: "auto" }, "/dev/null:/bin/bun"],
+      command: ["/system/bin/id"], killOnExit: false, ignorePin: false, androidContainer: true,
+    });
+  expect(() => parseArguments(["--android-container", "./empty", "-S", "./other", "/bin/sh"])).toThrow();
+  expect(() => parseArguments(["-S", "./other", "--android-container", "./empty", "/bin/sh"])).toThrow();
 });
 
 test("--kill-on-exit is a tracer option and never reaches the guest", () => {
