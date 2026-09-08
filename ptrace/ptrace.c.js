@@ -1204,22 +1204,26 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
     mounts=task.mounts;
     if ((status&0x7f)===0) {
       if (verbose) console.error(`[ptrace] tracee ${taskPid} exited status=${(status>>8)&0xff}`);
-      if (taskPid===pid && killOnExit) {
+      if (taskPid===pid) {
         rootExit=(status>>8)&0xff;
-        if (verbose && tasks.size>1)
-          console.error(`[ptrace] root tracee exited; tracer exit will kill ${tasks.size-1} remaining task(s)`);
-        break traceLoop;
+        if (killOnExit) {
+          if (verbose && tasks.size>1)
+            console.error(`[ptrace] root tracee exited; tracer exit will kill ${tasks.size-1} remaining task(s)`);
+          break traceLoop;
+        }
       }
       deleteTask(taskPid); continue;
     }
     if ((status&0x7f)!==0x7f) {
       const terminatingSignal=status&0x7f;
       if (verbose) console.error(`[ptrace] tracee ${taskPid} terminated signal=${terminatingSignal}`);
-      if (taskPid===pid && killOnExit) {
+      if (taskPid===pid) {
         rootExit=128+terminatingSignal;
-        if (verbose && tasks.size>1)
-          console.error(`[ptrace] root tracee terminated; tracer exit will kill ${tasks.size-1} remaining task(s)`);
-        break traceLoop;
+        if (killOnExit) {
+          if (verbose && tasks.size>1)
+            console.error(`[ptrace] root tracee terminated; tracer exit will kill ${tasks.size-1} remaining task(s)`);
+          break traceLoop;
+        }
       }
       deleteTask(taskPid); continue;
     }
