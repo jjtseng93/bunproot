@@ -666,6 +666,112 @@ const PATH_ARGUMENTS = new Map([
   [437,[{path:1,dirfd:0}]], [439,[{path:1,dirfd:0}]],
 ]);
 
+// setregid, setgid, setreuid, setuid, setresuid, setresgid, setfsuid,
+// setfsgid, setgroups. Under fake-id0 each one succeeds without reaching the
+// kernel, which cannot grant any of them to an Android app uid.
+const ID_SETTING_SYSCALLS=[143,144,145,146,147,149,151,152,159];
+
+// The Android ids the tracer really runs as. A guest's own files are owned by
+// these, which is how fake-id0 tells them apart from everything else it can
+// see, and they are what its fake credentials translate to and from.
+const realUid=process.getuid(), realGid=process.getgid();
+
+/** The credentials a guest believes it has, mirroring the Config of
+ *  src/extension/fake_id0/config.h. It starts as root -- that is what
+ *  fake-id0 is for -- but a guest that drops privilege must be seen to have
+ *  dropped it: PostgreSQL refuses to run while geteuid() is 0, so a
+ *  `su postgres` that leaves geteuid() at 0 is no use to it.
+ *
+ *  capsActive stands in for CAP_SETUID/CAP_SETGID exactly as upstream's
+ *  caps_active does. keepCaps mirrors PR_SET_KEEPCAPS, which upstream watches
+ *  prctl(2) for; prctl is not traced here, so it stays false and a permanent
+ *  uid drop always clears the capability. Upstream also re-asserts caps on
+ *  execve of a setuid-root binary, which this port has no setuid bit to see. */
+const rootCredentials=()=>({ ruid:0, euid:0, suid:0, fsuid:0,
+  rgid:0, egid:0, sgid:0, fsgid:0, capsActive:true, keepCaps:false });
+
+/**
+ * Emulate one set*id syscall against those credentials and answer the way the
+ * kernel would, following the SETXID, SETREXID, SETRESXID and SETFSXID macros
+ * of src/extension/fake_id0/fake_id0.c. -1 leaves a field alone; setfsuid and
+ * setfsgid report the previous value rather than 0.
+ */
+function applyIdSyscall(ids, syscall, first, second, third) {
+  const arg=(value)=>Number(BigInt.asIntN(32,value));
+  const EPERM=BigInt.asUintN(64,-1n);
+  const unset=(value)=>value===-1;
+  // The gid calls move the same four fields as their uid counterparts.
+  // Privilege is read from the uid side either way, as upstream's macros do.
+  const gid=[143,144,149,152].includes(syscall);
+  const R=gid?"rgid":"ruid", E=gid?"egid":"euid";
+  const S=gid?"sgid":"suid", FS=gid?"fsgid":"fsuid";
+  const privileged=ids.euid===0||ids.capsActive;
+  const equalsAny=(value)=>value===ids[R]||value===ids[E]||value===ids[S];
+  const unchanged=(value,field)=>unset(value)||value===ids[field];
+  const wasRoot=ids.ruid===0||ids.euid===0||ids.suid===0;
+  // A permanent drop out of root takes CAP_SETUID with it, so a guest that
+  // became postgres cannot climb back to root afterwards.
+  const maybeDropCaps=()=>{
+    if (wasRoot&&!ids.keepCaps&&ids.ruid!==0&&ids.euid!==0&&ids.suid!==0)
+      ids.capsActive=false;
+  };
+  switch (syscall) {
+    case 146: case 144: { // setuid, setgid
+      const value=arg(first);
+      if (!privileged&&!equalsAny(value)) return EPERM;
+      // "If the effective UID of the caller is root, the real UID and saved
+      // set-user-ID are also set." -- man setuid
+      if (privileged) { ids[R]=value; ids[S]=value; }
+      ids[E]=value; ids[FS]=value;
+      maybeDropCaps();
+      return 0n;
+    }
+    case 145: case 143: { // setreuid, setregid
+      const real=arg(first), effective=arg(second);
+      const allowed=privileged
+        ||(unchanged(effective,E)&&unchanged(real,R))
+        ||(real===ids[E]&&(effective===ids[R]||unchanged(effective,E)))
+        ||(effective===ids[R]&&(real===ids[E]||unchanged(real,R)))
+        ||(effective===ids[S]&&unchanged(real,R));
+      if (!allowed) return EPERM;
+      if (!unset(effective)) {
+        if (effective!==ids[R]) ids[S]=effective;
+        ids[E]=effective; ids[FS]=effective;
+      }
+      // After the effective id, because it reads the old real id.
+      if (!unset(real)) {
+        if (!unset(effective)) ids[S]=effective;
+        ids[R]=real;
+      }
+      maybeDropCaps();
+      return 0n;
+    }
+    case 147: case 149: { // setresuid, setresgid
+      const real=arg(first), effective=arg(second), saved=arg(third);
+      const allowed=privileged||((unset(real)||equalsAny(real))
+        &&(unset(effective)||equalsAny(effective))
+        &&(unset(saved)||equalsAny(saved)));
+      if (!allowed) return EPERM;
+      if (!unset(real)) ids[R]=real;
+      // "the file system UID is always set to the same value as the
+      // (possibly new) effective UID." -- man setresuid
+      if (!unset(effective)) { ids[E]=effective; ids[FS]=effective; }
+      if (!unset(saved)) ids[S]=saved;
+      maybeDropCaps();
+      return 0n;
+    }
+    case 151: case 152: { // setfsuid, setfsgid
+      const value=arg(first), previous=ids[FS];
+      if (privileged||value===ids[FS]||equalsAny(value)) ids[FS]=value;
+      // "On success, the previous value of fsuid is returned." -- man setfsuid
+      return BigInt(previous);
+    }
+    // setgroups: upstream makes it a void call outright, because Android hands
+    // back gids the rootfs knows nothing about.
+    default: return 0n;
+  }
+}
+
 // Every syscall the enter stage looks at: the pathname table plus the calls
 // that are emulated, translated or recorded outright.
 const HANDLED_ON_ENTER=new Set([...PATH_ARGUMENTS.keys(),
@@ -675,7 +781,7 @@ const HANDLED_ON_ENTER=new Set([...PATH_ARGUMENTS.keys(),
   SYS_SENDTO, SYS_RECVFROM, SYS_SENDMSG, SYS_RECVMSG, SYS_GETSOCKOPT,
   39,40,41,97,268,       // umount2, mount, pivot_root, unshare, setns
   79, 80, 291,          // fstat, newfstatat, statx
-  144,145,146,147,148,149,150,151,152,158,159, // set*id, getres*id, getgroups
+  143,144,145,146,147,148,149,150,151,152,158,159, // set*id, getres*id, getgroups
   174,175,176,177,      // getuid, geteuid, getgid, getegid
   220,221,435,          // clone, execve, clone3
 ]);
@@ -887,7 +993,7 @@ function translateSendmsgCredentials(pid,task,state) {
   const controlLength=Number(view.getBigUint64(40,true));
   if (controlAddress<4096n || controlLength<16 || controlLength>1024) return false;
   const control=readTraceeBytes(pid,controlAddress,controlLength);
-  const controlView=new DataView(control.buffer), realUid=process.getuid(), realGid=process.getgid();
+  const controlView=new DataView(control.buffer);
   let changed=false;
   for (let offset=0; offset+16<=control.length;) {
     const length=Number(controlView.getBigUint64(offset,true));
@@ -1031,7 +1137,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
     pendingCwd:null, pendingGetcwd:null, cwd:"/", configured:true, seenStop:true,
     openedHostFds:new Map(), openedGuestFds:new Map(), mounts,
     fakeNetlink:new Map(),
-    scratch:trampoline+4096n+512n, scratchSlot:1n,
+    scratch:trampoline+4096n+512n, scratchSlot:1n, ids:rootCredentials(),
     exe:guest===null?null:guest.guestPath??guestPathOf(mounts,guest.executable) }]]);
   tasks.get(pid).trampoline=trampoline;
   tasks.get(pid).borrowPc=images.interpreter?.entry??images.main.entry;
@@ -1074,7 +1180,8 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
       // the tracee on first sight instead (get_tracee(NULL, pid, true),
       // src/tracee/event.c:417); the parent's event fills in the rest.
       task={ entering:true, pendingSignal:0n, pendingExec:null, pendingCwd:null,
-        pendingGetcwd:null, cwd:"/", exe:null, running:false, configured:false, seenStop:false };
+        pendingGetcwd:null, cwd:"/", exe:null, running:false, configured:false, seenStop:false,
+        ids:rootCredentials() };
       tasks.set(taskPid,task);
       if (verbose) console.error(`[ptrace] tracee ${taskPid} stopped before its parent's fork event`);
     }
@@ -1117,6 +1224,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
           cwd:task.cwd, exe:task.exe, trampoline:task.trampoline, borrowPc:task.borrowPc,
           scratch:task.trampoline+scratchSlot*4096n+512n, scratchSlot, configured:true,
           namespaceEmulated:task.namespaceEmulated, pivoted:task.pivoted };
+        inherited.ids={ ...task.ids??rootCredentials() };
         inherited.usernsLimitFaked=task.usernsLimitFaked;
         inherited.usernsAfterLimit=task.usernsAfterLimit;
         inherited.openedHostFds=new Map(task.openedHostFds??[]);
@@ -1167,6 +1275,20 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
         if ([39,40,41].includes(blockedSyscall))
           emulateNamespaceFilesystem(taskPid,mounts,task,stopped,blockedSyscall);
         setX(stopped.regs,0,0n); putRegisters(taskPid,stopped);
+        task.entering=true;
+        continue;
+      }
+      if (signal===31 && ID_SETTING_SYSCALLS.includes(getSyscallNumber(stopped.regs))) {
+        // Android's platform seccomp can reject an id-setting syscall before
+        // our SECCOMP_RET_TRACE filter gets its entry stop, so the fake-id0
+        // emulation further down never runs and the generic SIGSYS fallback
+        // answers ENOSYS. A guest that believes it is root then cannot drop
+        // privilege at all: busybox su stops at "can't set groups: Function
+        // not implemented". The frame is already past svc, so supply the same
+        // success the entry path would have forced.
+        const result=applyIdSyscall(task.ids,getSyscallNumber(stopped.regs),
+          getX(stopped.regs,0),getX(stopped.regs,1),getX(stopped.regs,2));
+        setX(stopped.regs,0,result); putRegisters(taskPid,stopped);
         task.entering=true;
         continue;
       }
@@ -1225,8 +1347,11 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
         // which puts the third write past the end of them: GTK's
         // check_setugid() calls it, and the overrun tripped the stack
         // protector before any window could open.
-        for (const address of task.idWrites) if (address!==0n)
-          writeTraceeBytes(taskPid,address,new Uint8Array(4),4n);
+        for (const [address,value] of task.idWrites) if (address!==0n) {
+          const field=new Uint8Array(4);
+          new DataView(field.buffer).setUint32(0,value>>>0,true);
+          writeTraceeBytes(taskPid,address,field,4n);
+        }
         task.idWrites=undefined;
       }
       if (task.pendingStat!==undefined) {
@@ -1240,8 +1365,26 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
         const validOutput=isMappedRange(taskPid,task.pendingStat.buffer,outputSize);
         if (matchingSyscall && validOutput && BigInt.asIntN(64,getX(exited.regs,0))===0n) {
           const { buffer,kind }=task.pendingStat;
+          // src/extension/fake_id0/stat.c overrides an owner only where the
+          // file belongs to the tracer's own Android uid, and writes the saved
+          // set-user-ID rather than a hard 0. Both matter: a file the app does
+          // not own keeps its real owner, and a guest that dropped to another
+          // user sees the files it owns as its own -- PostgreSQL refuses to
+          // start otherwise, with "data directory has wrong ownership".
+          const ids=task.ids;
           const uidOffset=kind==="statx"?20n:24n;
-          writeBytes(memory,taskPid,buffer+uidOffset,new Uint8Array(8));
+          const owner=readTraceeBytes(taskPid,buffer+uidOffset,8);
+          const ownerView=new DataView(owner.buffer);
+          // statx only fills a field it advertises in stx_mask.
+          const mask=kind==="statx"?new DataView(readTraceeBytes(taskPid,buffer,4).buffer).getUint32(0,true):0xffffffff;
+          let owned=false;
+          if ((mask&0x8)!==0 && ownerView.getUint32(0,true)===realUid) {
+            ownerView.setUint32(0,ids.suid>>>0,true); owned=true;
+          }
+          if ((mask&0x10)!==0 && ownerView.getUint32(4,true)===realGid) {
+            ownerView.setUint32(4,ids.sgid>>>0,true); owned=true;
+          }
+          if (owned) writeBytes(memory,taskPid,buffer+uidOffset,owner);
           if (task.pendingStat.nlink!==undefined) {
             const count=new Uint8Array(4);
             new DataView(count.buffer).setUint32(0,Number(task.pendingStat.nlink),true);
@@ -1596,26 +1739,30 @@ const exited=registers(), result=exitResult(phase,exited);
         continue;
       }
     }
-    if (syscall>=174 && syscall<=177) {
+    if (syscall>=174 && syscall<=177) { // getuid, geteuid, getgid, getegid
       setKernelSyscallNumber(taskPid,state,SYS_GETPID);
-      task.forcedResult=0n;
+      const ids=task.ids;
+      task.forcedResult=BigInt([ids.ruid,ids.euid,ids.rgid,ids.egid][syscall-174]);
       continue;
     }
-    if ([144,145,146,147,149,151,152,159].includes(syscall)) {
+    if (ID_SETTING_SYSCALLS.includes(syscall)) {
       setKernelSyscallNumber(taskPid,state,SYS_GETPID);
-      task.forcedResult=0n;
+      task.forcedResult=applyIdSyscall(task.ids,syscall,
+        getX(state.regs,0),getX(state.regs,1),getX(state.regs,2));
       continue;
     }
     if (syscall===148 || syscall===150) { // getresuid/getresgid
       setKernelSyscallNumber(taskPid,state,SYS_GETPID);
-      task.idWrites=[getX(state.regs,0),getX(state.regs,1),getX(state.regs,2)];
+      const ids=task.ids;
+      const trio=syscall===148?[ids.ruid,ids.euid,ids.suid]:[ids.rgid,ids.egid,ids.sgid];
+      task.idWrites=[0,1,2].map((index)=>[getX(state.regs,index),trio[index]]);
       task.forcedResult=0n;
       continue;
     }
     if (syscall===158) { // getgroups
       const size=getX(state.regs,0);
       setKernelSyscallNumber(taskPid,state,SYS_GETPID);
-      task.idWrites=size>0n?[getX(state.regs,1)]:[];
+      task.idWrites=size>0n?[[getX(state.regs,1),task.ids.egid]]:[];
       task.forcedResult=1n;
       continue;
     }
