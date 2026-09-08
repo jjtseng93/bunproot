@@ -87,6 +87,10 @@ What to run to check any of this still holds is in
    substitution of `fake_id0.c` -- and a synthesized `/proc/self/mountinfo`.
    What remains for those is moving each into its own module, not making it
    work. SysV semaphores and message queues are not implemented at all.
+   Link2symlink also does not yet implement `RENAME_EXCHANGE` when the source
+   is an emulated link: the ordinary rename bookkeeping moves and removes its
+   ref instead of swapping both names. The overwrite case is guarded against
+   exchange and does not have this problem.
 9. **Architectures.** Add ELF32/AArch32 and other ABIs after ARM64 behavior is
    stable.
 
@@ -131,10 +135,13 @@ execve) and `sigaltstack(SS_DISABLE)` -- at bootstrap and at every emulated
 exec. Node's `child_process` needs the forwarded SIGCHLD to complete a spawn;
 BusyBox wget's `ssl_client` path, git's helpers and `bun x` all still pass.
 
-The guest's main stack is mapped at `RLIMIT_STACK` rather than 1 MiB. The
-mapping is fixed and the kernel never grows it, so a guest reading back
-`ulimit -s` of 8 MiB and sizing its own guard from it -- V8 does -- would run
-off the end of a 1 MiB mapping.
+The guest keeps the kernel-created main-stack mapping and `buildGuestStack()`
+rebuilds argv, envp and auxv at its top. Moving SP to a separate anonymous
+mapping is not equivalent to `execve`: bionic caches the kernel stack range in
+its pthread metadata, so JavaScriptCore's `sanitizeStackForVM()` sees the new
+SP outside that range and aborts. Nested exec preserves the mapping containing
+SP for the same reason. The bootstrap stack is already sized to
+`RLIMIT_STACK`, retaining the 8 MiB depth expected by runtimes such as V8.
 
 `fchownat`/`fchown` swap the emulated ids for the real ones before the kernel
 sees them, as in `src/extension/fake_id0/chown.c:handle_chown_enter_end()`.

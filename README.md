@@ -8,8 +8,9 @@ It runs wherever `bunx` does — Termux, a shell inside an app built with
 [minapk](https://github.com/jjtseng93/minapk)
 ([npm](https://www.npmjs.com/package/@drxiaozhi/minapk)), or any other Android
 environment with Bun on `PATH`. The tracer itself is Bun; the guest is an ARM64
-Linux rootfs you supply — and that rootfs can be as little as
-[five files](#a-rootfs-can-be-five-files).
+Linux rootfs you supply. It can be an [empty directory](#a-rootfs-can-be-zero-files)
+that borrows Android's system files, or a self-contained rootfs assembled from
+as few as [five files](#a-rootfs-can-be-five-files).
 
 **This is early work, and it is not trying to replace Termux's PRoot.** That
 one is mature, complete and considerably faster; if you are in Termux and it
@@ -123,7 +124,7 @@ Android and does not yet run anywhere else.
 ### Route 4: from source
 
 ```sh
-git clone <this repository> bunproot
+git clone https://github.com/jjtseng93/bunproot.git
 cd bunproot
 bun proot.js --help          # or: sh proot --help
 ```
@@ -151,6 +152,33 @@ against.
 ```sh
 bunproot -S ./alpine /bin/sh -c 'cat /etc/os-release'
 ```
+
+## A rootfs can be zero files
+
+Android already has a shell and the usual command-line tools under `/system`.
+An empty directory can therefore be used as a borrowed root:
+
+```sh
+mkdir empty
+bunproot --android-container ./empty
+```
+
+This binds `/system`, `/apex`, `/linkerconfig/ld.config.txt`, and the Android
+Bun that started bunproot at `/bin/bun`. It prepends `/system/bin` to the guest
+`PATH` and runs `/system/bin/sh` when no command is given. A command and more
+options can be supplied normally:
+
+```sh
+bunproot --android-container ./empty /system/bin/id
+bunproot --android-container ./empty -b ./other-bun:/bin/bun /bin/bun app.ts
+```
+
+Bindings written by the caller come after the preset, so a binding at
+`/bin/bun` replaces the default one; binding another existing file such as
+`/dev/null` there disables it. As with other bindings, this makes endpoints
+reachable but does not populate the empty root directory: `ls /` remains
+empty because the glue filesystem which synthesizes intermediate directories
+has not been ported.
 
 ## A rootfs can be five files
 
@@ -231,7 +259,7 @@ by copying five files, with no distribution to download, unpack or trust.
 ## Usage
 
 ```text
-bunproot [OPTION ...] -S ROOTFS COMMAND [ARG ...]
+bunproot [OPTION ...] (-S ROOTFS | --android-container ROOTFS) [COMMAND [ARG ...]]
 ```
 
 Every option belongs before `COMMAND`. Parsing stops at the first argument that
@@ -240,7 +268,8 @@ is an argument to the guest program instead.
 
 | Option | Effect |
 | --- | --- |
-| `-S`, `--rootfs ROOTFS` | Run `COMMAND` with `ROOTFS` as its root directory. Required |
+| `-S`, `--rootfs ROOTFS` | Run with `ROOTFS` as the root directory. `COMMAND` defaults to `/bin/sh` |
+| `--android-container ROOTFS` | Use `ROOTFS`, which may be an empty directory, with `/system`, `/apex`, the linker configuration and this Bun bound in. `PATH` starts with `/system/bin`; `COMMAND` defaults to `/system/bin/sh`. `--android-container=ROOTFS` says the same thing |
 | `-b`, `--bind HOST[:GUEST]` | Make a host path visible inside the guest; repeatable. `--bind=SPEC` says the same thing |
 | `-m`, `--mount` | Another name for `--bind`, not a different thing |
 | `--dns MODE` | Which resolver the guest gets: `auto` (default), `simple` or `off`. `--dns=MODE` says the same thing |
@@ -255,9 +284,10 @@ is an argument to the guest program instead.
 | `--l2s-docs` | Render [link2symlink.md](./link2symlink.md), the on-disk format, in the terminal |
 | `-V`, `--version` | The version, then exit |
 
-`PROOT_BUN_VERBOSE`, `PROOT_BUN_PROFILE`, `PROOT_NO_SECCOMP` and
-`PROOT_IGNORE_MISSING_BINDINGS` are environment variables rather than options;
-[Debugging](#debugging) is where they are described.
+`PROOT_BUN_VERBOSE`, `PROOT_BUN_STRACE`, `PROOT_BUN_PROFILE`,
+`PROOT_NO_SECCOMP` and `PROOT_IGNORE_MISSING_BINDINGS` are environment
+variables rather than options; [Debugging](#debugging) is where they are
+described.
 
 ### The rootfs
 
@@ -523,6 +553,7 @@ have no upstream counterpart.
 | Variable | Effect |
 | --- | --- |
 | `PROOT_BUN_VERBOSE=1` | Trace ELF loading, process events, signals, guest exec replacement and pathname rewriting. A memory fault also reports `si_code`, `si_addr`, and the mappings the faulting address and the faulting PC belong to. |
+| `PROOT_BUN_STRACE=1` | Print every guest syscall and its result. This automatically disables syscall filtering; a result changed by the tracer shows both values, and a translated pathname also shows its host pathname. |
 | `PROOT_BUN_PROFILE=1` | On exit, report how many times the tracer stopped, how many of those stops it handled, how many pathnames it translated, and where the wall clock went. |
 | `PROOT_NO_SECCOMP` | Set to any value to stop on every syscall instead of filtering. Upstream's variable, with upstream's semantics: presence is what counts. This is also the automatic fallback when the filter cannot be installed. |
 | `PROOT_IGNORE_MISSING_BINDINGS` | Set to any value to drop a binding whose host path does not exist without reporting it. The binding is dropped either way; this silences the report. |
@@ -530,6 +561,13 @@ have no upstream counterpart.
 ```sh
 PROOT_BUN_VERBOSE=1 PATH="$PWD:$PATH" LD_PRELOAD= \
   bunproot -S "$ROOTFS" /bin/ls /
+```
+
+For a syscall-by-syscall view, including the value or pathname the tracer
+substituted:
+
+```sh
+PROOT_BUN_STRACE=1 bunproot -S "$ROOTFS" /bin/cat /etc/os-release
 ```
 
 Reading a profile: `stops` is what the tracer paid for and `handled` is what it
