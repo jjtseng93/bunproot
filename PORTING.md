@@ -69,8 +69,10 @@ What to run to check any of this still holds is in
    mountinfo, hidden-files, port-switch, SysV IPC, and the remaining options.
    `-b`/`--bind` is implemented; what is missing from `src/path/binding.c` is
    the glue filesystem that materialises a mount point the rootfs does not
-   already contain (`src/path/glue.c`), asymmetric `--root-id` handling, and
-   the induced bindings a sub-reconfiguration adds.
+   already contain (`src/path/glue.c`), asymmetric `--root-id` handling, the
+   induced bindings a sub-reconfiguration adds, and the second translation an
+   absolute symlink target needs when it is reached through a binding -- see
+   below.
 
    This item measures the file-by-file port, not what works.
    `extension/link2symlink/` and `extension/sysvipc/sysvipc_shm.c.js` are the
@@ -344,6 +346,28 @@ as SIGSYS rather than at the filter's entry stop, past `svc`, so the results
 are supplied from the signal stop; a kernel that permits these syscalls raises
 no SIGSYS and runs them itself, which is the wanted behaviour everywhere but
 Android.
+
+A binding translates the pathnames a syscall carries, but not the target a
+symlink inside that binding points at. Reading a file under a binding works;
+reading it through a symlink whose target is an absolute pathname that only
+the binding makes reachable does not. Measured on a synthetic store, with the
+binding in place:
+
+```text
+readlink intermediate  ok      (the target string comes back)
+read final directly    ok      (a plain file under the binding)
+read via intermediate  ENOENT  (the same file through the symlink)
+```
+
+The consequence is that only a symmetric binding rescues a rootfs written by
+the original PRoot, whose store names host pathnames. `-b /data` works, and
+the README's example of it was measured against a proot-distro Debian rootfs,
+because host and guest pathnames are identical there and no second
+translation is ever needed. `-b <current-location>:<recorded-prefix>` does
+not work, which is the form a moved rootfs would want. Such a rootfs is
+recovered by moving it back, or by making the recorded pathname lead to it
+again with a host-side symlink and then binding that pathname symmetrically;
+`--l2s-status` reports which case a store is in and prints the commands.
 
 An `AF_UNIX` pathname never reaches the kernel as a syscall pathname argument:
 it travels inside a `sockaddr`, which openat-style translation never sees.

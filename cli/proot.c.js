@@ -284,7 +284,13 @@ function describeUpstream(rootfs, upstream) {
     blocks.push("> Read-only: writing through this port lays a second store beside the first.");
   } else {
     blocks.push(bullets([["status", "the rootfs has moved since"]]),
-      "Those targets resolve to nothing now. The original PRoot cannot read it here either: the pathnames are baked into the store.");
+      "Those targets resolve to nothing now. The original PRoot cannot read it here either: the pathnames are baked into the store.",
+      "### Recovering it",
+      "Move the rootfs back to that pathname, or make the pathname lead here again and bind it in:",
+      `    ln -s ${rootfs} ${upstream.prefix}`,
+      "then run with:", `    -b ${upstream.prefix}`,
+      "The parent of that pathname has to exist and be writable.",
+      "> Binding the current location under the old name does not work. A symlink inside a binding keeps its absolute target, and the tracer does not translate that a second time.");
   }
   return blocks;
 }
