@@ -423,9 +423,10 @@ export function run(argv) {
     `${OVERFLOW_ID}:/proc/sys/kernel/overflowuid`,
     `${OVERFLOW_ID}:/proc/sys/kernel/overflowgid`,
   ];
+  const androidBun=androidContainer ? Bun.which("bun")??process.argv0 : null;
   const androidBindings=androidContainer ? [
     "/system:/system", "/apex:/apex", "/linkerconfig/ld.config.txt:/linkerconfig/ld.config.txt",
-    "/system/bin/sh:/bin/sh", `${process.argv0}:/bin/bun`, `${process.argv0}:/bin/node`,
+    "/system/bin/sh:/bin/sh", `${androidBun}:/bin/bun`, `${androidBun}:/bin/node`,
   ] : [];
   const mounts = createBindings(rootfs, [...compatibilityBindings,...androidBindings,...bindings.flatMap((entry) =>
     typeof entry === "string" ? [entry] : resolverBindings(rootfs, entry.dns))]);
