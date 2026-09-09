@@ -24,15 +24,21 @@ function install() {
     `  cwd: ${directory}`,
     `  ${command.map((part)=>JSON.stringify(part)).join(" ")}`,
   ].join("\n"));
-  const answer=prompt("Install the locked isomorphic-git dependencies now? (Y/n)");
+  // Bun can return null for an empty interactive line when no default is
+  // supplied, making Enter indistinguishable from EOF. Give prompt an
+  // explicit default so the conventional uppercase Y really means yes.
+  const answer=prompt("Install the locked isomorphic-git dependencies now? (Y/n)","y");
   if (answer===null || !["","y","yes"].includes(answer.trim().toLowerCase()))
     throw new Error("isomorphic-git installation cancelled");
-  const result=Bun.spawnSync({
+  Bun.spawnSync({
     cmd:command,
     cwd:directory,
     stdin:"inherit", stdout:"inherit", stderr:"inherit",
   });
-  if (result.exitCode!==0 || !installed())
+  // Do not trust Bun install's exit status here. Before oven-sh/bun#39060 was
+  // fixed it could report failure after completing the installation. The
+  // locked package on disk is the result this command actually needs.
+  if (!installed())
     throw new Error(`could not install the locked isomorphic-git ${expected}`);
 }
 

@@ -300,7 +300,9 @@ Only Enter, `y`, or `yes` starts the in-place installation. It uses
 `bun install --frozen-lockfile --ignore-scripts --production`, so the lockfile
 cannot be updated and dependency lifecycle scripts cannot run. Any other
 answer cancels it. Later runs reuse the installed, version-checked copy without
-asking again.
+asking again. bunproot verifies the installed package on disk rather than
+trusting `bun install`'s exit status, which was unreliable before
+[oven-sh/bun#39060](https://github.com/oven-sh/bun/issues/39060) was fixed.
 
 ## Usage
 
