@@ -163,6 +163,42 @@ mkdir empty
 bunproot --android-container ./empty
 ```
 
+From the shell inside the container, Bun can fetch an interactive
+[bunmsh](https://github.com/jjtseng93/bunmsh) shell or use bunproot's
+Git-compatible wrapper around the pure-JavaScript
+[isomorphic-git](https://isomorphic-git.org/) to clone a repository without a
+system Git:
+
+```sh
+bun x bunmsh
+bun x bunproot --git clone https://github.com/jjtseng93/jsmdcui
+```
+
+On older Android releases, the first `bun x` invocation may finish installing
+the package and then fail with an `invalid pointer` error before its command
+starts. The installation has normally completed despite that message; ignore
+it and run the same command again, and it may start successfully on the second
+run.
+
+On a device where the `invalid pointer` failure persists, replace `bun x xxx`
+with an explicit global install followed by a direct launch:
+
+```sh
+bun i -g xxx
+bun /root/.bun/bin/xxx
+```
+
+There is one further limitation on affected Bun versions: when a package's
+declared bin entry is not at the top level of that package, Android's blocked
+`openat2` can prevent the global bin link from being created. If
+`/root/.bun/bin/xxx` is missing, invoke the installed JavaScript entry point
+directly instead (replace the final `xxx.js` with that package's actual entry
+file):
+
+```sh
+bun /root/.bun/install/global/node_modules/xxx/xxx.js
+```
+
 This binds `/system`, `/apex`, `/linkerconfig/ld.config.txt`, and
 `/system/bin/sh` at `/bin/sh`. The Android Bun that started bunproot is bound
 at both `/bin/bun` and `/bin/node`. It prepends `/system/bin` to the guest
