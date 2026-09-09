@@ -68,7 +68,8 @@ const HELP = `${USAGE}
 
   --android-container ROOTFS
       use ROOTFS, which may be an empty directory, with Android's system,
-      APEX, linker configuration and this Bun bound in; COMMAND defaults to
+      APEX and linker configuration bound in; /system/bin/sh is also /bin/sh,
+      and this Bun is both /bin/bun and /bin/node; COMMAND defaults to
       /system/bin/sh
 
   -b, --bind HOST[:GUEST]
@@ -419,7 +420,7 @@ export function run(argv) {
   ];
   const androidBindings=androidContainer ? [
     "/system:/system", "/apex:/apex", "/linkerconfig/ld.config.txt:/linkerconfig/ld.config.txt",
-    `${process.argv0}:/bin/bun`,
+    "/system/bin/sh:/bin/sh", `${process.argv0}:/bin/bun`, `${process.argv0}:/bin/node`,
   ] : [];
   const mounts = createBindings(rootfs, [...compatibilityBindings,...androidBindings,...bindings.flatMap((entry) =>
     typeof entry === "string" ? [entry] : resolverBindings(rootfs, entry.dns))]);

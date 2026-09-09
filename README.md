@@ -163,22 +163,26 @@ mkdir empty
 bunproot --android-container ./empty
 ```
 
-This binds `/system`, `/apex`, `/linkerconfig/ld.config.txt`, and the Android
-Bun that started bunproot at `/bin/bun`. It prepends `/system/bin` to the guest
+This binds `/system`, `/apex`, `/linkerconfig/ld.config.txt`, and
+`/system/bin/sh` at `/bin/sh`. The Android Bun that started bunproot is bound
+at both `/bin/bun` and `/bin/node`. It prepends `/system/bin` to the guest
 `PATH` and runs `/system/bin/sh` when no command is given. A command and more
 options can be supplied normally:
 
 ```sh
 bunproot --android-container ./empty /system/bin/id
+bunproot --android-container ./empty /bin/sh -c 'echo hello'
+bunproot --android-container ./empty /bin/node -e 'console.log(process.version)'
 bunproot --android-container ./empty -b ./other-bun:/bin/bun /bin/bun app.ts
 ```
 
-Bindings written by the caller come after the preset, so a binding at
-`/bin/bun` replaces the default one; binding another existing file such as
-`/dev/null` there disables it. As with other bindings, this makes endpoints
-reachable but does not populate the empty root directory: `ls /` remains
-empty because the glue filesystem which synthesizes intermediate directories
-has not been ported.
+Bindings written by the caller come after the preset, so bindings at
+`/bin/sh`, `/bin/bun`, or `/bin/node` replace the corresponding defaults;
+binding another existing file such as `/dev/null` at one of those paths
+disables that alias. As with other bindings, this makes endpoints reachable
+but does not populate the empty root directory: `ls /` remains empty because
+the glue filesystem which synthesizes intermediate directories has not been
+ported.
 
 ## A rootfs can be five files
 
@@ -269,7 +273,7 @@ is an argument to the guest program instead.
 | Option | Effect |
 | --- | --- |
 | `-S`, `--rootfs ROOTFS` | Run with `ROOTFS` as the root directory. `COMMAND` defaults to `/bin/sh` |
-| `--android-container ROOTFS` | Use `ROOTFS`, which may be an empty directory, with `/system`, `/apex`, the linker configuration and this Bun bound in. `PATH` starts with `/system/bin`; `COMMAND` defaults to `/system/bin/sh`. `--android-container=ROOTFS` says the same thing |
+| `--android-container ROOTFS` | Use `ROOTFS`, which may be an empty directory, with `/system`, `/apex` and the linker configuration bound in; `/system/bin/sh` is also `/bin/sh`, and this Bun is both `/bin/bun` and `/bin/node`. `PATH` starts with `/system/bin`; `COMMAND` defaults to `/system/bin/sh`. `--android-container=ROOTFS` says the same thing |
 | `-b`, `--bind HOST[:GUEST]` | Make a host path visible inside the guest; repeatable. `--bind=SPEC` says the same thing |
 | `-m`, `--mount` | Another name for `--bind`, not a different thing |
 | `--dns MODE` | Which resolver the guest gets: `auto` (default), `simple` or `off`. `--dns=MODE` says the same thing |
