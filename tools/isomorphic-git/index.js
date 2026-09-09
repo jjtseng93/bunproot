@@ -17,17 +17,21 @@ function install() {
   const bun=Bun.which("bun")||process.argv0;
   const command=[bun,"install","--frozen-lockfile","--ignore-scripts","--production"];
   console.error([
-    `bunproot --git uses isomorphic-git ${expected}.`,
-    "Its lockfile fixes all 55 packages in the reviewed production dependency tree.",
-    "The first run will download them from the npm registry with lifecycle scripts disabled.",
+    "bunproot --git uses",
+    `isomorphic-git ${expected}.`,
+    "The lock fixes all 55 packages.",
+    "They will be downloaded from npm.",
+    "Lifecycle scripts are disabled.",
     "Bun.spawnSync will run:",
-    `  cwd: ${directory}`,
-    `  ${command.map((part)=>JSON.stringify(part)).join(" ")}`,
+    "  cwd:",
+    `    ${directory}`,
+    "  cmd:",
   ].join("\n"));
+  console.error(command);
   // Bun can return null for an empty interactive line when no default is
   // supplied, making Enter indistinguishable from EOF. Give prompt an
   // explicit default so the conventional uppercase Y really means yes.
-  const answer=prompt("Install the locked isomorphic-git dependencies now? (Y/n)","y");
+  const answer=prompt("Install now? (Y/n)","y");
   if (answer===null || !["","y","yes"].includes(answer.trim().toLowerCase()))
     throw new Error("isomorphic-git installation cancelled");
   Bun.spawnSync({

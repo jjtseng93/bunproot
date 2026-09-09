@@ -293,7 +293,7 @@ locked dependencies from the npm registry, prints the complete command and
 working directory that it will give `Bun.spawnSync`, and asks:
 
 ```text
-Install the locked isomorphic-git dependencies now? (Y/n)
+Install now? (Y/n)
 ```
 
 Only Enter, `y`, or `yes` starts the in-place installation. It uses
