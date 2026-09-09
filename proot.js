@@ -24,6 +24,20 @@ if (process.argv[2] === "--download-alpine") {
   process.exit(0);
 }
 
+// A deliberately tiny Git-compatible surface for a zero-file Android
+// container.  It is a command mode only in argv[0]; anywhere else --git still
+// belongs to the rootfs command exactly like every argument after COMMAND.
+if (process.argv[2] === "--git") {
+  try {
+    const { run }=await import("./tools/isomorphic-git/index.js");
+    process.exitCode=await run(process.argv.slice(3));
+  } catch (error) {
+    console.error(`bunproot git: ${error.message}`);
+    process.exitCode=1;
+  }
+  process.exit();
+}
+
 if (!process.env.BUN_FEATURE_FLAG_NO_ORPHANS) {
   // Drop LD_PRELOAD for the same reason the shell launcher does. The tracer
   // works with Termux's libtermux-exec loaded -- the bootstrap it spawns gets a

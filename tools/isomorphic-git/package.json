@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "isomorphic-git": "1.41.9"
+  }
+}

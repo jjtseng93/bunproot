@@ -62,6 +62,11 @@ const TRY_HELP = "try `bunproot --help` for the options and the debug environmen
 
 const HELP = `${USAGE}
 
+  --git clone [OPTION ...] REPOSITORY [DIRECTORY]
+      when --git is the very first argument, install the locked Git helper
+      in place after confirmation and clone with Git-compatible arguments,
+      then exit
+
   -S, --rootfs ROOTFS
       run COMMAND with ROOTFS as its root directory; COMMAND defaults to
       /bin/sh

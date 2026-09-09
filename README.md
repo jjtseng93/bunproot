@@ -176,6 +176,9 @@ bunproot --android-container ./empty /bin/node -e 'console.log(process.version)'
 bunproot --android-container ./empty -b ./other-bun:/bin/bun /bin/bun app.ts
 ```
 
+With Bun already present, this zero-file container can also [clone a Git
+repository without a system Git](#git-clone-without-system-git).
+
 Bindings written by the caller come after the preset, so bindings at
 `/bin/sh`, `/bin/bun`, or `/bin/node` replace the corresponding defaults;
 binding another existing file such as `/dev/null` at one of those paths
@@ -260,6 +263,45 @@ bunproot -S ./bare /bin/bun x bunmsh
 It is not a *small* rootfs — Bun is 70-odd MiB — but it is one you can assemble
 by copying five files, with no distribution to download, unpack or trust.
 
+It can likewise [clone a Git repository without adding Git to those five
+files](#git-clone-without-system-git).
+
+## Git clone without system Git
+
+Inside either minimal rootfs, a writable `bun x` installation can fetch
+bunproot and use [isomorphic-git](https://isomorphic-git.org/) without a
+system Git. bunproot runs isomorphic-git underneath but wraps its API in the
+usual `git clone [options] repository [directory]` CLI shape; it does not
+expose isomorphic-git's own CLI. `--git` selects this mode only when it is the
+very first bunproot argument, and the first release supports only `clone`:
+
+```sh
+bun x bunproot --git clone https://github.com/jjtseng93/bunproot.git
+bun x bunproot --git clone --depth 1 --branch main URL DIRECTORY
+```
+
+To reduce npm supply-chain drift, the published `tools/isomorphic-git/bun.lock`
+fixes isomorphic-git 1.41.9 and all 55 packages in its production dependency
+tree. That tree received a broad AI-assisted static review for install scripts,
+native payloads, dynamic code execution, subprocesses, unexpected network
+targets and known advisories before it was locked. This is not a formal audit
+or a guarantee that the packages or repositories being cloned are safe: use
+this feature at your own risk.
+
+On first use bunproot explains that it will download isomorphic-git and its
+locked dependencies from the npm registry, prints the complete command and
+working directory that it will give `Bun.spawnSync`, and asks:
+
+```text
+Install the locked isomorphic-git dependencies now? (Y/n)
+```
+
+Only Enter, `y`, or `yes` starts the in-place installation. It uses
+`bun install --frozen-lockfile --ignore-scripts --production`, so the lockfile
+cannot be updated and dependency lifecycle scripts cannot run. Any other
+answer cancels it. Later runs reuse the installed, version-checked copy without
+asking again.
+
 ## Usage
 
 ```text
@@ -272,6 +314,7 @@ is an argument to the guest program instead.
 
 | Option | Effect |
 | --- | --- |
+| `--git clone [OPTION ...] REPOSITORY [DIRECTORY]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, accept Git-compatible clone arguments, clone, then exit |
 | `-S`, `--rootfs ROOTFS` | Run with `ROOTFS` as the root directory. `COMMAND` defaults to `/bin/sh` |
 | `--android-container ROOTFS` | Use `ROOTFS`, which may be an empty directory, with `/system`, `/apex` and the linker configuration bound in; `/system/bin/sh` is also `/bin/sh`, and this Bun is both `/bin/bun` and `/bin/node`. `PATH` starts with `/system/bin`; `COMMAND` defaults to `/system/bin/sh`. `--android-container=ROOTFS` says the same thing |
 | `-b`, `--bind HOST[:GUEST]` | Make a host path visible inside the guest; repeatable. `--bind=SPEC` says the same thing |
