@@ -62,11 +62,6 @@ const TRY_HELP = "try `bunproot --help` for the options and the debug environmen
 
 const HELP = `${USAGE}
 
-  --git clone [OPTION ...] REPOSITORY [DIRECTORY]
-      when --git is the very first argument, install the locked Git helper
-      in place after confirmation and clone with Git-compatible arguments,
-      then exit
-
   -S, --rootfs ROOTFS
       run COMMAND with ROOTFS as its root directory; COMMAND defaults to
       /bin/sh
@@ -114,6 +109,11 @@ These run without entering a rootfs, then exit:
 
   --download-alpine
       download and verify an Alpine minirootfs
+
+  --git clone [OPTION ...] REPOSITORY [DIRECTORY]
+      when --git is the very first argument, install the locked
+      isomorphic-git 1.41.9 helper in place after confirmation, wrap it in
+      Git-compatible clone arguments, then exit
 
   --readme
       render README.md in the terminal, with hyperlinks where it has links

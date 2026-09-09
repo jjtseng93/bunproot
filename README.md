@@ -314,7 +314,6 @@ is an argument to the guest program instead.
 
 | Option | Effect |
 | --- | --- |
-| `--git clone [OPTION ...] REPOSITORY [DIRECTORY]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, accept Git-compatible clone arguments, clone, then exit |
 | `-S`, `--rootfs ROOTFS` | Run with `ROOTFS` as the root directory. `COMMAND` defaults to `/bin/sh` |
 | `--android-container ROOTFS` | Use `ROOTFS`, which may be an empty directory, with `/system`, `/apex` and the linker configuration bound in; `/system/bin/sh` is also `/bin/sh`, and this Bun is both `/bin/bun` and `/bin/node`. `PATH` starts with `/system/bin`; `COMMAND` defaults to `/system/bin/sh`. `--android-container=ROOTFS` says the same thing |
 | `-b`, `--bind HOST[:GUEST]` | Make a host path visible inside the guest; repeatable. `--bind=SPEC` says the same thing |
@@ -327,6 +326,7 @@ is an argument to the guest program instead.
 | `--l2s-docs` | Render [link2symlink.md](./link2symlink.md), the on-disk format, in the terminal |
 | `--l2s-ignore-pin` | Enter a rootfs whose link store is pinned, which is otherwise refused. Its emulated hard links do not work while it is pinned |
 | `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
+| `--git clone [OPTION ...] REPOSITORY [DIRECTORY]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, accept Git-compatible clone arguments, clone, then exit |
 | `--readme` | Render this README in the terminal, with links where it has them |
 | `-h`, `--help` | The options and the debug environment variables |
 | `-V`, `--version` | The version, then exit |
