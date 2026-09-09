@@ -61,6 +61,28 @@ Licensed **GPL-2.0-or-later**, inherited as a derivative work of PRoot.
 [NOTICE.md](./NOTICE.md) records what it was ported from and how to read the
 `src/...` citations in the comments; [COPYING](./COPYING) is the licence.
 
+## Confirmed running (mostly under Alpine)
+
+- Firefox
+- bubblewrap (`bwrap`)
+- Flatpak (limited testing)
+  - GNOME Text Editor
+  - GNOME Calculator
+- PostgreSQL
+- GTK3/WebKit 4.1 test browser
+- LibreOffice
+  ```sh
+  uname -a > pv.txt
+  DISPLAY=:0 bunproot -S ROOTFS -b ./pv.txt:/proc/version /bin/sh -c libreoffice
+  ```
+- bunmsh: Bun Modern Shell
+- jsmdcui: Text Editor & App runtime
+- npm-installed Bun
+- Git clone
+- OpenSSH client (`terminal.shop` confirmed) and non-root server
+  - The server may need a port above 1024, the same account for `sshd` and the
+    login, and relaxed `StrictModes`. Root `sshd` still needs `chroot` emulation.
+
 ## Quick start
 
 bunproot needs a Bun built for Android/bionic, and how you get one depends on
