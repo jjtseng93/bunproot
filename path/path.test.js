@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { parseArguments } from "../cli/proot.c.js";
+import { parseArguments, procVersion } from "../cli/proot.c.js";
 import { createBindings, parseBinding } from "./binding.c.js";
 import { translatePath } from "./path.c.js";
 
@@ -80,6 +80,12 @@ test("kernel release accepts upstream and separated spellings, with the last one
   expect(()=>parseArguments(["-k","-S","/r"])).toThrow();
   expect(()=>parseArguments(["--kernel-release="])).toThrow();
   expect(()=>parseArguments(["-k","x".repeat(65),"-S","/r"])).toThrow();
+});
+
+test("the synthetic proc version carries the guest-visible release", () => {
+  const value=procVersion("5.1.107-70-PRoot");
+  expect(value).toContain(" 5.1.107-70-PRoot ");
+  expect(value.endsWith("\n")).toBe(true);
 });
 
 test("a bare binding keeps its pathname, a pair maps one to the other", () => {

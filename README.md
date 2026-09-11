@@ -512,6 +512,10 @@ This changes identification only, not the kernel's capabilities. See
 [PORTING.md](./PORTING.md#kernel-release-identification) for its scope and the
 difference from upstream PRoot's compatibility extension.
 
+For compatibility with applications that inspect it instead of calling
+`uname`, bunproot also supplies a matching `/proc/version`. An explicit
+`-b FILE:/proc/version` takes precedence.
+
 ### The resolver
 
 A rootfs straight from a distribution tarball often carries no

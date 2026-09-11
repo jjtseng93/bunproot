@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, statSync, realpathSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
+import { hostname, machine, release as hostRelease, tmpdir, type as hostType, version as hostVersion } from "node:os";
 import { FFIType, ptr } from "bun:ffi";
 import { cString, lazySymbols } from "../ffi.js";
 import { readElfInterpreter } from "../execve/elf.c.js";
@@ -14,6 +15,10 @@ import { parseDnsMode, resolverBindings } from "../dns.js";
 import { isPublishedPort, offsetPortMode, parsePortMapping } from "../extension/port_switch/port_switch.c.js";
 
 const OVERFLOW_ID = resolve(import.meta.dir,"../fakeid.txt");
+
+export function procVersion(release = hostRelease()) {
+  return `${hostType()} ${hostname()} ${release} ${hostVersion()} ${machine()}\n`;
+}
 /** Render markdown at the terminal's own width.
  *
  * Bun's renderer wraps near 79 and never asks the terminal how wide it is --
@@ -513,6 +518,11 @@ export function run(argv) {
     "/system:/system", "/apex:/apex", "/linkerconfig/ld.config.txt:/linkerconfig/ld.config.txt",
     "/system/bin/sh:/bin/sh", `${androidBun}:/bin/bun`, `${androidBun}:/bin/node`,
   ] : [];
+  const versionDirectory=mkdtempSync(join(tmpdir(),"bunproot-version-"));
+  const versionFile=join(versionDirectory,"version");
+  writeFileSync(versionFile,procVersion(kernelRelease??hostRelease()));
+  compatibilityBindings.push(`${versionFile}:/proc/version`);
+  try {
   const mounts = createBindings(rootfs, [...compatibilityBindings,...androidBindings,...bindings.flatMap((entry) =>
     typeof entry === "string" ? [entry] : resolverBindings(rootfs, entry.dns))]);
   let environment=guestEnvironment();
@@ -554,4 +564,7 @@ export function run(argv) {
   const pid = spawnTracee(childArgv, bootstrapEnvironment());
   return traceProcess(pid, mounts, { executable, guestPath: guestExecutable,
     name: basename(command[0]), interpreter, loader, argv: guestArgv, env:environment }, { killOnExit, portMode, kernelRelease });
+  } finally {
+    rmSync(versionDirectory,{ recursive:true, force:true });
+  }
 }

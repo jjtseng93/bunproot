@@ -345,6 +345,17 @@ bunproot's option is identification only: it cannot provide a kernel feature
 that the Android host lacks. This limited behavior is sufficient for launchers
 that supply a fixed release merely to control what guest tools report.
 
+Some applications, notably LibreOffice on the tested Android environment,
+inspect `/proc/version` instead of relying only on `uname`. Upstream PRoot does
+not synthesize that procfs file, and Android's native contents are not accepted
+by the application. bunproot therefore creates a temporary regular file from
+the host uname fields, substitutes the configured release when present, and
+adds it as an internal `/proc/version` binding. This uses the ordinary open,
+stat, mmap, and descriptor paths consistently instead of emulating reads or
+stat metadata one syscall at a time. The binding precedes caller bindings, so
+an explicit `-b FILE:/proc/version` wins. Its temporary directory is removed
+after all traced tasks exit or if guest startup fails.
+
 ## Current priority
 
 Items 1 and 2 are in progress. Implemented so far:
