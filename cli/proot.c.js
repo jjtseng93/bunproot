@@ -1,5 +1,5 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, realpathSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, join, posix, resolve } from "node:path";
 import { hostname, machine, release as hostRelease, tmpdir, type as hostType, version as hostVersion } from "node:os";
 import { FFIType, ptr } from "bun:ffi";
 import { cString, lazySymbols } from "../ffi.js";
@@ -60,7 +60,7 @@ function spawnTracee(argv, env) {
   if (status !== 0) throw new Error(`posix_spawn failed: ${status}`);
   return new DataView(pidBytes.buffer).getInt32(0, true);
 }
-const USAGE = "Usage: bunproot [OPTION ...] (-S ROOTFS | --android-container ROOTFS) [COMMAND [ARG ...]]";
+const USAGE = "Usage: bunproot [OPTION ...] (-r ROOTFS | -S ROOTFS | --android-container ROOTFS) [COMMAND [ARG ...]]";
 // Nothing about the usage line says where the rest is, and the rest includes
 // the debug environment variables, so every way of getting the invocation
 // wrong ends by naming --help.
@@ -68,7 +68,7 @@ const TRY_HELP = "try `bunproot --help` for the options and the debug environmen
 
 const HELP = `${USAGE}
 
-  -S, --rootfs ROOTFS
+  -r, -S, --rootfs ROOTFS
       run COMMAND with ROOTFS as its root directory; COMMAND defaults to
       /bin/sh
 
@@ -89,6 +89,9 @@ const HELP = `${USAGE}
 
   -u, --unset-env NAME
       remove a variable from the guest environment; repeatable
+
+  -w, --cwd DIR
+      start COMMAND in guest directory DIR; --pwd is another name
 
   --dns MODE
       resolver binding: auto (default), simple, or off
@@ -162,7 +165,7 @@ export function parseArguments(argv) {
   // once the rootfs is known, in the place it was written.
   const bindings = [];
   const environmentActions=[];
-  let rootfs = null, androidContainer = false, sawDns = false, killOnExit = false, ignorePin = false, portMode = null, portWarnings = null, kernelRelease = null, index = 0;
+  let rootfs = null, cwd = null, androidContainer = false, sawDns = false, killOnExit = false, ignorePin = false, portMode = null, portWarnings = null, kernelRelease = null, index = 0;
   for (; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === "-e" || argument === "--env" || argument.startsWith("--env=")) {
@@ -281,13 +284,28 @@ export function parseArguments(argv) {
       rootfs=resolve(target); androidContainer=true;
       continue;
     }
-    if (argument === "-S" || argument === "--rootfs") {
-      if (argv[++index] === undefined) throw new Error(`${argument} needs a rootfs\n${USAGE}\n${TRY_HELP}`);
-      if (androidContainer) throw new Error(`${argument} does not combine with --android-container\n${USAGE}\n${TRY_HELP}`);
+    if (argument === "-r" || argument.startsWith("-r") && !argument.startsWith("--") ||
+        argument === "-S" || argument.startsWith("-S") ||
+        argument === "--rootfs" || argument.startsWith("--rootfs=")) {
+      const target=argument.startsWith("--rootfs=")?argument.slice(9)
+        : argument === "-r" || argument === "-S" || argument === "--rootfs" ? argv[++index]
+        : argument.slice(2);
+      if (!target) throw new Error(`${argument.split("=")[0]} needs a rootfs\n${USAGE}\n${TRY_HELP}`);
+      if (androidContainer) throw new Error(`a rootfs option does not combine with --android-container\n${USAGE}\n${TRY_HELP}`);
       // Resolve this before the bootstrap changes cwd to the rootfs. Otherwise
       // a caller-relative rootfs is interpreted again from inside that rootfs
       // and subsequent host-path translations acquire the wrong prefix.
-      rootfs = resolve(argv[index]);
+      rootfs = resolve(target);
+      continue;
+    }
+    if (argument === "-w" || argument.startsWith("-w") && !argument.startsWith("--") ||
+        argument === "--cwd" || argument === "--pwd" ||
+        argument.startsWith("--cwd=") || argument.startsWith("--pwd=")) {
+      const target=argument.includes("=")?argument.slice(argument.indexOf("=")+1)
+        : argument === "-w" || argument === "--cwd" || argument === "--pwd" ? argv[++index]
+        : argument.slice(2);
+      if (!target) throw new Error(`${argument.split("=")[0]} needs a directory\n${USAGE}\n${TRY_HELP}`);
+      cwd=posix.resolve("/",target);
       continue;
     }
     break;
@@ -300,7 +318,7 @@ export function parseArguments(argv) {
   if (!sawDns) bindings.unshift({ dns: "auto" });
   return { rootfs, bindings, command, killOnExit, ignorePin, ...(portMode && { portMode }),
     ...(portWarnings && { portWarnings }), ...(environmentActions.length>0 && { environmentActions }),
-    ...(kernelRelease!==null && { kernelRelease }),
+    ...(kernelRelease!==null && { kernelRelease }), ...(cwd!==null && { cwd }),
     ...(androidContainer && { androidContainer:true }) };
 }
 /**
@@ -525,6 +543,10 @@ export function run(argv) {
   try {
   const mounts = createBindings(rootfs, [...compatibilityBindings,...androidBindings,...bindings.flatMap((entry) =>
     typeof entry === "string" ? [entry] : resolverBindings(rootfs, entry.dns))]);
+  const cwd=canonicalizeGuestPath(mounts,parsed.cwd??"/");
+  try {
+    if (!statSync(mounts.toHost(cwd)).isDirectory()) throw new Error();
+  } catch { throw new Error(`guest working directory is not a directory: ${parsed.cwd??"/"}`); }
   let environment=guestEnvironment();
   if (androidContainer) {
     const pathIndex=environment.findIndex((entry)=>entry.startsWith("PATH="));
@@ -563,7 +585,7 @@ export function run(argv) {
   ];
   const pid = spawnTracee(childArgv, bootstrapEnvironment());
   return traceProcess(pid, mounts, { executable, guestPath: guestExecutable,
-    name: basename(command[0]), interpreter, loader, argv: guestArgv, env:environment }, { killOnExit, portMode, kernelRelease });
+    name: basename(command[0]), interpreter, loader, argv: guestArgv, env:environment }, { killOnExit, portMode, kernelRelease, cwd });
   } finally {
     rmSync(versionDirectory,{ recursive:true, force:true });
   }

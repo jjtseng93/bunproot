@@ -370,12 +370,13 @@ is an argument to the guest program instead.
 
 | Option | Effect |
 | --- | --- |
-| `-S`, `--rootfs ROOTFS` | Run with `ROOTFS` as the root directory. `COMMAND` defaults to `/bin/sh` |
+| `-r`, `-S`, `--rootfs ROOTFS` | Run with `ROOTFS` as the root directory. `--rootfs=ROOTFS` is also accepted; `COMMAND` defaults to `/bin/sh` |
 | `--android-container ROOTFS` | Use `ROOTFS`, which may be an empty directory, with `/system`, `/apex` and the linker configuration bound in; `/system/bin/sh` is also `/bin/sh`, and this Bun is both `/bin/bun` and `/bin/node`. `PATH` starts with `/system/bin`; `COMMAND` defaults to `/system/bin/sh`. `--android-container=ROOTFS` says the same thing |
 | `-b`, `--bind HOST[:GUEST]` | Make a host path visible inside the guest; repeatable. `--bind=SPEC` says the same thing |
 | `-m`, `--mount` | Another name for `--bind`, not a different thing |
 | `-e`, `--env NAME[=VALUE]` | Set a guest environment variable, or copy `NAME` from the host when no value is supplied; repeatable. `--env=NAME[=VALUE]` says the same thing |
 | `-u`, `--unset-env NAME` | Remove a variable from the guest environment; repeatable. `--unset-env=NAME` says the same thing |
+| `-w`, `--cwd DIR` | Start `COMMAND` in guest directory `DIR`. `--cwd=DIR`, `--pwd DIR`, and `--pwd=DIR` are equivalent |
 | `--dns MODE` | Which resolver the guest gets: `auto` (default), `simple` or `off`. `--dns=MODE` says the same thing |
 | `-koe`, `--kill-on-exit` | Kill whatever is left of the guest when `COMMAND` exits |
 | `-k`, `--kernel-release RELEASE` | Replace only the release reported by `uname(2)`. `--kernel-release=RELEASE` says the same thing; this identifies the kernel differently but does not emulate kernel features |

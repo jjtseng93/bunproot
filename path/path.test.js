@@ -17,6 +17,21 @@ test("legacy argument translation and -S parsing remain deterministic", () => {
   });
 });
 
+test("upstream rootfs and initial working-directory spellings are accepted", () => {
+  expect(parseArguments(["-r","./root","-w","/root","/bin/pwd"]))
+    .toMatchObject({ rootfs:resolve("./root"), cwd:"/root", command:["/bin/pwd"] });
+  expect(parseArguments(["--rootfs=./root","--cwd=/tmp","/bin/pwd"]))
+    .toMatchObject({ rootfs:resolve("./root"), cwd:"/tmp", command:["/bin/pwd"] });
+  expect(parseArguments(["--rootfs","./root","--pwd","var/lib","/bin/pwd"]))
+    .toMatchObject({ rootfs:resolve("./root"), cwd:"/var/lib", command:["/bin/pwd"] });
+  expect(parseArguments(["-S","./root","--pwd=/srv","/bin/pwd"]))
+    .toMatchObject({ rootfs:resolve("./root"), cwd:"/srv", command:["/bin/pwd"] });
+  expect(parseArguments(["-r./root","-w/root","/bin/pwd"]))
+    .toMatchObject({ rootfs:resolve("./root"), cwd:"/root", command:["/bin/pwd"] });
+  expect(()=>parseArguments(["--rootfs="])).toThrow();
+  expect(()=>parseArguments(["-S","./root","--cwd="])).toThrow();
+});
+
 test("bindings are collected in order and never eat the command", () => {
   expect(parseArguments(["-b", "/data", "-S", "/rootfs", "/bin/sh"])).toEqual({
     rootfs: "/rootfs", bindings: [{ dns: "auto" }, "/data"], command: ["/bin/sh"], killOnExit: false, ignorePin: false,

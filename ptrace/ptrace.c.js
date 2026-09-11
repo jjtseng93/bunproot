@@ -1113,7 +1113,7 @@ function resolveProcLink(taskPid,tasks,guestPath) {
   return known.exe??null;
 }
 
-export function traceProcess(pid, mounts, guest = null, { killOnExit = false, portMode = null, kernelRelease = null } = {}) {
+export function traceProcess(pid, mounts, guest = null, { killOnExit = false, portMode = null, kernelRelease = null, cwd = "/" } = {}) {
   const started=performance.now();
   const mountinfoPaths=new Set();
   const mountinfoPathFor=(taskPid)=>{
@@ -1138,7 +1138,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
     console.error(`[ptrace] mapped guest entry=0x${images.main.entry.toString(16)} interpreter entry=${images.interpreter ? `0x${images.interpreter.entry.toString(16)}` : "static"}`);
   resetGuestSignals(pid,trampoline);
   if (guest!==null) setGuestName(pid,trampoline,guest.name??posix.basename(guest.executable));
-  setKernelRootCwd(pid,trampoline,mounts.rootfs);
+  setKernelRootCwd(pid,trampoline,mounts.toHost(cwd));
   const filtering=installSyscallFilter(pid,trampoline);
   // Without a filter every syscall has to be stopped to find the few that
   // matter, which is correct but costs two stops per syscall.
@@ -1149,7 +1149,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
   let nextScratchSlot=1n;
   const freeScratchSlots=[];
   const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null,
-    pendingCwd:null, pendingGetcwd:null, cwd:"/", configured:true, seenStop:true,
+    pendingCwd:null, pendingGetcwd:null, cwd, configured:true, seenStop:true,
     openedHostFds:new Map(), openedGuestFds:new Map(), mounts,
     fakeNetlink:new Map(),
     socketProtocols:new Map(),
