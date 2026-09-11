@@ -382,6 +382,7 @@ is an argument to the guest program instead.
 | `-u`, `--unset-env NAME` | Remove a variable from the guest environment; repeatable. `--unset-env=NAME` says the same thing |
 | `--dns MODE` | Which resolver the guest gets: `auto` (default), `simple` or `off`. `--dns=MODE` says the same thing |
 | `-koe`, `--kill-on-exit` | Kill whatever is left of the guest when `COMMAND` exits |
+| `-k`, `--kernel-release RELEASE` | Replace only the release reported by `uname(2)`. `--kernel-release=RELEASE` says the same thing; this identifies the kernel differently but does not emulate kernel features |
 | `-p [PORT SPEC]` | With `[HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp\|udp]`, rewrite guest ports to explicit host endpoints; repeatable. A bare `-p` enables low-port protection through `PROOT_PORT_ADD`. A single port is accepted for Docker CLI compatibility |
 | `--l2s-status ROOTFS` | Report what state a rootfs's emulated hard-link store is in, then exit. Recognises the original PRoot's format too. Reads only, takes a rootfs of its own, and combines with nothing else |
 | `--l2s-pin ROOTFS` | Rewrite that store so tools outside the rootfs can follow its emulated hard links. The guest loses them for as long as it is pinned, and the rootfs can no longer be moved |
@@ -445,9 +446,8 @@ bunproot -S ./alpine -e DEBUG=1 -u DEBUG -e DEBUG=0 /bin/sh
 
 ### Port mapping and low ports
 
-The guest shares the host network; this is syscall rewriting, not a separate
-Docker network namespace or NAT. The explicit form follows Docker's
-`HOST_PORT:CONTAINER_PORT` order and may be repeated:
+The explicit form follows Docker's `HOST_PORT:CONTAINER_PORT` order and may be
+repeated:
 
 ```sh
 bunproot -S ./alpine \
@@ -459,38 +459,26 @@ bunproot -S ./alpine \
 
 This maps guest TCP 80 to host TCP 8080, restricts guest TCP 443 to host
 `127.0.0.1:8443`, and maps guest UDP 53 to host UDP 5353. TCP is the default;
-use `/udp` explicitly for UDP. IPv6 host addresses must be bracketed:
+use `/udp` explicitly for UDP. Bracket IPv6 host addresses, for example
+`-p '[::1]:8080:80'`.
 
-```sh
-bunproot -S ./alpine -p '[::1]:8080:80' /bin/server
-```
-
-On `bind()`, both the mapped port and an explicitly supplied host IP are
-substituted before the host kernel sees the address. Localhost `connect()` and
-UDP `sendto()` calls receive the corresponding substitution as well; remote
-destinations are left alone.
-
-A single Docker-style container port needs no publication because the guest
-already uses the host network. It is consumed as a compatibility no-op:
+A single port is accepted as a Docker CLI compatibility no-op because the
+guest already shares the host network:
 
 ```sh
 bunproot -S ./alpine -p 8080 /bin/server
 ```
 
-For ports 1 through 1023 this cannot reproduce Docker's automatic random host
-port allocation, so bunproot prints a warning. Use an explicit mapping, or use
-a bare `-p` to protect every low port by adding `PROOT_PORT_ADD` (2000 by
-default):
+For low ports, use an explicit mapping or bare `-p`; the latter adds
+`PROOT_PORT_ADD` (2000 by default) to every port below 1024:
 
 ```sh
 bunproot -S ./alpine -p 2080:80 /bin/server
 PROOT_PORT_ADD=3000 bunproot -p -S ./alpine /bin/server
 ```
 
-In the second example, a guest `bind()` to port 80 becomes a host bind to
-3080. Ports 1024 and above, and port 0 (kernel-selected), remain unchanged.
-Whenever this automatic low-port rewrite occurs, bunproot reports the guest
-and actual host ports.
+The precise syscall behavior and differences from Docker networking are in
+[PORTING.md](./PORTING.md#network-port-translation).
 
 ### Hidden compatibility options for PRoot launchers
 
@@ -510,6 +498,19 @@ These options are intentionally omitted from `--help`: they exist only for
 launcher compatibility and do not enable features. A `--change-id` value other
 than `0:0` is rejected rather than silently pretending that arbitrary initial
 identities are implemented.
+
+### Kernel release identification
+
+`-k RELEASE` and `--kernel-release RELEASE` change the release shown by
+`uname`; if repeated, the last value wins:
+
+```sh
+bunproot -S ./alpine --kernel-release=5.1.107-70-PRoot uname -a
+```
+
+This changes identification only, not the kernel's capabilities. See
+[PORTING.md](./PORTING.md#kernel-release-identification) for its scope and the
+difference from upstream PRoot's compatibility extension.
 
 ### The resolver
 

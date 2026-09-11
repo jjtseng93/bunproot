@@ -118,6 +118,7 @@ const SYS_SOCKET = 198, SYS_BIND = 200, SYS_CONNECT = 203, SYS_GETSOCKNAME = 204
 const SYS_SENDTO = 206, SYS_RECVFROM = 207, SYS_SENDMSG = 211, SYS_RECVMSG = 212;
 const SYS_GETSOCKOPT = 209;
 const SYS_FCHOWNAT = 54, SYS_FCHOWN = 55;
+const SYS_UNAME = 160;
 const SYS_SIGALTSTACK = 132, SYS_RT_SIGACTION = 134, SYS_PRCTL = 167;
 const PTRACE_EVENT_SECCOMP = 7;
 const PR_SET_NO_NEW_PRIVS = 38, PR_SET_SECCOMP = 22, SECCOMP_MODE_FILTER = 2, PR_SET_NAME = 15;
@@ -790,6 +791,7 @@ function applyIdSyscall(ids, syscall, first, second, third) {
 const HANDLED_ON_ENTER=new Set([...PATH_ARGUMENTS.keys(),
   SYS_MUNMAP, SYS_GETCWD, SYS_CLOSE, SYS_GETDENTS64, SYS_READLINKAT, SYS_FCHDIR,
   SYS_FCHOWNAT, SYS_FCHOWN,
+  SYS_UNAME,
   SYS_SOCKET, SYS_BIND, SYS_CONNECT, SYS_GETSOCKNAME, SYS_GETPEERNAME,
   SYS_SENDTO, SYS_RECVFROM, SYS_SENDMSG, SYS_RECVMSG, SYS_GETSOCKOPT,
   39,40,41,97,268,       // umount2, mount, pivot_root, unshare, setns
@@ -1111,7 +1113,7 @@ function resolveProcLink(taskPid,tasks,guestPath) {
   return known.exe??null;
 }
 
-export function traceProcess(pid, mounts, guest = null, { killOnExit = false, portMode = null } = {}) {
+export function traceProcess(pid, mounts, guest = null, { killOnExit = false, portMode = null, kernelRelease = null } = {}) {
   const started=performance.now();
   const mountinfoPaths=new Set();
   const mountinfoPathFor=(taskPid)=>{
@@ -1462,6 +1464,15 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
           task.socketProtocols.set(Number(result),task.pendingSocketProtocol);
         task.pendingSocketProtocol=undefined;
       }
+      if (task.pendingUname!==undefined) {
+        const exited=registers();
+        if (exitedSyscall===SYS_UNAME && BigInt.asIntN(64,getX(exited.regs,0))===0n) {
+          const release=new Uint8Array(65);
+          release.set(new TextEncoder().encode(kernelRelease));
+          writeTraceeBytes(taskPid,task.pendingUname+130n,release,65n);
+        }
+        task.pendingUname=undefined;
+      }
       if (task.idWrites!==undefined) {
         // A uid_t is four bytes and PTRACE_POKEDATA writes eight, so these
         // must go through the read-modify-write path or each one zeroes the
@@ -1741,6 +1752,10 @@ const exited=registers(), result=exitResult(phase,exited);
     // then fall back to running free until the filter traps the next one.
     if (seccompStop) task.restart=PTRACE_SYSCALL;
     const state=registers();
+    if (syscall===SYS_UNAME) {
+      if (kernelRelease!==null) task.pendingUname=getX(state.regs,0);
+      continue;
+    }
     if ([39,40,41,97,268].includes(syscall)) {
       // Android denies unprivileged namespaces and mounts.  Like the upstream
       // Android PRoot branch, keep bwrap's setup state machine moving while

@@ -72,6 +72,16 @@ test("always-enabled upstream extension flags are accepted as hidden no-ops", ()
   expect(()=>parseArguments(["--change-id"])).toThrow();
 });
 
+test("kernel release accepts upstream and separated spellings, with the last one winning", () => {
+  expect(parseArguments(["-k","5.10-one","--kernel-release=6.1-two","-S","/r"]))
+    .toMatchObject({ kernelRelease:"6.1-two" });
+  expect(parseArguments(["--kernel-release","5.1.107-70-PRoot","-S","/r"]))
+    .toMatchObject({ kernelRelease:"5.1.107-70-PRoot" });
+  expect(()=>parseArguments(["-k","-S","/r"])).toThrow();
+  expect(()=>parseArguments(["--kernel-release="])).toThrow();
+  expect(()=>parseArguments(["-k","x".repeat(65),"-S","/r"])).toThrow();
+});
+
 test("a bare binding keeps its pathname, a pair maps one to the other", () => {
   expect(parseBinding("/data/sdk")).toEqual({ host: "/data/sdk", guest: "/data/sdk" });
   expect(parseBinding("/data/sdk:/opt/sdk/")).toEqual({ host: "/data/sdk", guest: "/opt/sdk" });

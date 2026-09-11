@@ -91,6 +91,10 @@ const HELP = `${USAGE}
   -koe, --kill-on-exit
       kill all remaining guest processes when COMMAND exits
 
+  -k, --kernel-release RELEASE
+      report RELEASE in uname(2); this changes identification only and does
+      not emulate kernel features
+
   -p [[HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp|udp]]
       with a Docker-style port pair, map the guest/container port to the host
       port; repeatable. Without a valid pair, protect ports below 1024 by
@@ -153,7 +157,7 @@ export function parseArguments(argv) {
   // once the rootfs is known, in the place it was written.
   const bindings = [];
   const environmentActions=[];
-  let rootfs = null, androidContainer = false, sawDns = false, killOnExit = false, ignorePin = false, portMode = null, portWarnings = null, index = 0;
+  let rootfs = null, androidContainer = false, sawDns = false, killOnExit = false, ignorePin = false, portMode = null, portWarnings = null, kernelRelease = null, index = 0;
   for (; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === "-e" || argument === "--env" || argument.startsWith("--env=")) {
@@ -222,6 +226,16 @@ export function parseArguments(argv) {
     }
     if (argument === "-V" || argument === "--version") return { version: true };
     if (argument === "-koe" || argument === "--kill-on-exit") { killOnExit = true; continue; }
+    if (argument === "-k" || argument === "--kernel-release" || argument.startsWith("--kernel-release=")) {
+      const release=argument.startsWith("--kernel-release=")?argument.slice(17):argv[++index];
+      if (release===undefined || release==="")
+        throw new Error(`${argument.split("=")[0]} needs a release\n${USAGE}\n${TRY_HELP}`);
+      const encoded=new TextEncoder().encode(release);
+      if (release.includes("\0") || encoded.length>64)
+        throw new Error(`kernel release must be at most 64 bytes and contain no NUL`);
+      kernelRelease=release;
+      continue;
+    }
     // Hidden compatibility spellings used by existing PRoot launchers. These
     // extensions are always active in bunproot, so accepting their switches
     // must not change runtime state or advertise them as configurable.
@@ -281,6 +295,7 @@ export function parseArguments(argv) {
   if (!sawDns) bindings.unshift({ dns: "auto" });
   return { rootfs, bindings, command, killOnExit, ignorePin, ...(portMode && { portMode }),
     ...(portWarnings && { portWarnings }), ...(environmentActions.length>0 && { environmentActions }),
+    ...(kernelRelease!==null && { kernelRelease }),
     ...(androidContainer && { androidContainer:true }) };
 }
 /**
@@ -469,7 +484,7 @@ export function run(argv) {
     console.log(renderMarkdown(markdown));
     return 0;
   }
-  const { rootfs, bindings, command, killOnExit, ignorePin, androidContainer, portMode } = parsed;
+  const { rootfs, bindings, command, killOnExit, ignorePin, androidContainer, portMode, kernelRelease } = parsed;
   for (const warning of parsed.portWarnings??[]) console.error(`bunproot: warning: ${warning}`);
   // A pinned store is not merely unreadable from in here: the tracer
   // identifies an emulated hard link by its guest-absolute target, so while
@@ -538,5 +553,5 @@ export function run(argv) {
   ];
   const pid = spawnTracee(childArgv, bootstrapEnvironment());
   return traceProcess(pid, mounts, { executable, guestPath: guestExecutable,
-    name: basename(command[0]), interpreter, loader, argv: guestArgv, env:environment }, { killOnExit, portMode });
+    name: basename(command[0]), interpreter, loader, argv: guestArgv, env:environment }, { killOnExit, portMode, kernelRelease });
 }

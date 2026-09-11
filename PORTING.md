@@ -297,6 +297,54 @@ failing the call makes ordinary archive extraction report that it could not
 preserve ownership -- Alpine's `shadow` and `linux-pam` ship `root:shadow`
 files, and apk counts one error per file.
 
+## Network port translation
+
+The guest and Android host share one network stack; bunproot creates neither a
+network namespace nor NAT rules. Explicit `-p` mappings are implemented by
+rewriting Internet socket addresses at syscall entry. For `bind()`, the guest
+port becomes the configured host port and an explicit host IP replaces the
+bind address when its address family matches. Localhost `connect()` and UDP
+`sendto()` receive the corresponding substitution so guest clients can still
+address the service by its guest port. Remote destinations are deliberately
+left unchanged.
+
+Socket type is recorded when `socket()` returns and inherited across traced
+forks, allowing TCP and UDP mappings for the same guest port to remain
+distinct. IPv4 and IPv6 sockaddr layouts carry their port in network byte
+order at offset two; addresses begin at offsets four and eight respectively.
+Rewritten addresses are placed in the tracee's per-task scratch page instead
+of altering the buffer supplied by the guest.
+
+Bare `-p` uses the older `PROOT_PORT_ADD` policy: ports 1 through 1023 are
+increased by the configured offset, while port 0 and ports from 1024 upward
+are unchanged. Bind rewrites are reported because the externally reachable
+port differs from the one the server requested. A single Docker-style port is
+only consumed for CLI compatibility: without a separate network there is
+nothing to publish, and bunproot cannot reproduce Docker's automatic random
+host-port allocation.
+
+This is intentionally narrower than Docker publishing. It provides no
+firewall isolation, bridge address, cross-family proxy, or multiple host
+listeners for one guest bind. Mapping the same guest port to several host
+endpoints would require a host-side proxy rather than syscall substitution.
+
+## Kernel release identification
+
+`-k` and `--kernel-release` add `uname` (ARM64 syscall 160) to the seccomp trace
+set. After a successful call, the tracer overwrites only the 65-byte
+`struct utsname.release` member at byte offset 130, zero-filling its terminator
+and leaving `sysname`, `nodename`, `version`, `machine`, and `domainname` as the
+host kernel returned them. Input is consequently limited to 64 encoded bytes
+and may not contain NUL.
+
+This does not port upstream PRoot's `kompat` extension. That extension also
+compares the real and requested releases, translates a finite set of newer
+syscalls to older equivalents, repairs flags with chained `fcntl()` calls,
+adjusts ELF auxiliary vectors, and virtualizes hostname/domainname changes.
+bunproot's option is identification only: it cannot provide a kernel feature
+that the Android host lacks. This limited behavior is sufficient for launchers
+that supply a fixed release merely to control what guest tools report.
+
 ## Current priority
 
 Items 1 and 2 are in progress. Implemented so far:
