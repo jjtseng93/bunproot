@@ -61,6 +61,17 @@ test("--kill-on-exit is a tracer option and never reaches the guest", () => {
     .toMatchObject({ killOnExit: false, ignorePin: false, command: ["/bin/sh", "--kill-on-exit"] });
 });
 
+test("always-enabled upstream extension flags are accepted as hidden no-ops", () => {
+  expect(parseArguments([
+    "-0","--root-id","-l","--link2symlink","-L","--sysvipc","--change-id=0:0",
+    "-S","/r","/bin/sh",
+  ])).toMatchObject({ rootfs:"/r", command:["/bin/sh"] });
+  expect(parseArguments(["--change-id","0:0","-S","/r"]))
+    .toMatchObject({ rootfs:"/r" });
+  expect(()=>parseArguments(["--change-id=1000:1000","-S","/r"])).toThrow();
+  expect(()=>parseArguments(["--change-id"])).toThrow();
+});
+
 test("a bare binding keeps its pathname, a pair maps one to the other", () => {
   expect(parseBinding("/data/sdk")).toEqual({ host: "/data/sdk", guest: "/data/sdk" });
   expect(parseBinding("/data/sdk:/opt/sdk/")).toEqual({ host: "/data/sdk", guest: "/opt/sdk" });

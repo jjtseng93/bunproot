@@ -378,6 +378,8 @@ is an argument to the guest program instead.
 | `--android-container ROOTFS` | Use `ROOTFS`, which may be an empty directory, with `/system`, `/apex` and the linker configuration bound in; `/system/bin/sh` is also `/bin/sh`, and this Bun is both `/bin/bun` and `/bin/node`. `PATH` starts with `/system/bin`; `COMMAND` defaults to `/system/bin/sh`. `--android-container=ROOTFS` says the same thing |
 | `-b`, `--bind HOST[:GUEST]` | Make a host path visible inside the guest; repeatable. `--bind=SPEC` says the same thing |
 | `-m`, `--mount` | Another name for `--bind`, not a different thing |
+| `-e`, `--env NAME[=VALUE]` | Set a guest environment variable, or copy `NAME` from the host when no value is supplied; repeatable. `--env=NAME[=VALUE]` says the same thing |
+| `-u`, `--unset-env NAME` | Remove a variable from the guest environment; repeatable. `--unset-env=NAME` says the same thing |
 | `--dns MODE` | Which resolver the guest gets: `auto` (default), `simple` or `off`. `--dns=MODE` says the same thing |
 | `-koe`, `--kill-on-exit` | Kill whatever is left of the guest when `COMMAND` exits |
 | `-p [PORT SPEC]` | With `[HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp\|udp]`, rewrite guest ports to explicit host endpoints; repeatable. A bare `-p` enables low-port protection through `PROOT_PORT_ADD`. A single port is accepted for Docker CLI compatibility |
@@ -419,6 +421,27 @@ below `/usr/lib/sdk` and nothing above it; the rootfs is simply the binding at
 upstream does; `PROOT_IGNORE_MISSING_BINDINGS` silences the report but still
 drops it. `/proc`, `/dev` and `/sys` reach the host kernel filesystems without
 needing a binding.
+
+### Environment
+
+`-e`/`--env` follows Docker's two common forms. An assignment supplies an
+explicit guest value; a bare name copies that variable from the host:
+
+```sh
+TOKEN=host-value bunproot -S ./alpine \
+  -e APP_MODE=production \
+  --env TOKEN \
+  /bin/sh -c 'printf "%s %s\\n" "$APP_MODE" "$TOKEN"'
+```
+
+If a bare name is absent from the host, it remains absent in the guest. Use
+`-u`/`--unset-env` to remove inherited variables explicitly. Both options are
+repeatable and applied from left to right, so the last operation for a name
+wins:
+
+```sh
+bunproot -S ./alpine -e DEBUG=1 -u DEBUG -e DEBUG=0 /bin/sh
+```
 
 ### Port mapping and low ports
 
@@ -468,6 +491,25 @@ In the second example, a guest `bind()` to port 80 becomes a host bind to
 3080. Ports 1024 and above, and port 0 (kernel-selected), remain unchanged.
 Whenever this automatic low-port rewrite occurs, bunproot reports the guest
 and actual host ports.
+
+### Hidden compatibility options for PRoot launchers
+
+Some existing launchers always pass extension switches used by patched or
+upstream PRoot builds. bunproot enables the corresponding behavior without a
+switch, but accepts these spellings as no-ops so those launchers do not have to
+remove them first:
+
+| Accepted compatibility option | Why it is a no-op in bunproot |
+| --- | --- |
+| `-l`, `--link2symlink` | Android-forbidden hard links are always handled by bunproot's portable link-to-symlink store |
+| `-L` | bunproot always applies its symlink/path translation behavior; there is no optional symlink-size extension to turn on |
+| `--sysvipc` | System V shared memory compatibility is automatic; other permitted System V IPC calls continue to use the host kernel |
+| `-0`, `--root-id`, `--change-id=0:0` | Every guest starts with the emulated root identity already. The separated spelling `--change-id 0:0` is accepted too |
+
+These options are intentionally omitted from `--help`: they exist only for
+launcher compatibility and do not enable features. A `--change-id` value other
+than `0:0` is rejected rather than silently pretending that arbitrary initial
+identities are implemented.
 
 ### The resolver
 

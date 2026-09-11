@@ -8,7 +8,7 @@ import { canonicalizeGuestPath } from "../path/canon.c.js";
 import { createBindings } from "../path/binding.c.js";
 import { storeIsPinned } from "../extension/link2symlink/link2symlink.c.js";
 import { traceProcess } from "../ptrace/ptrace.c.js";
-import { bootstrapEnvironment, guestEnvironment, verbose } from "../env.js";
+import { applyGuestEnvironment, bootstrapEnvironment, guestEnvironment, verbose } from "../env.js";
 import pkg from "../package.json" with { type: "json" };
 import { parseDnsMode, resolverBindings } from "../dns.js";
 import { isPublishedPort, offsetPortMode, parsePortMapping } from "../extension/port_switch/port_switch.c.js";
@@ -79,6 +79,12 @@ const HELP = `${USAGE}
   -m, --mount
       another name for --bind, not a different thing
 
+  -e, --env NAME[=VALUE]
+      set a guest environment variable, or copy NAME from the host; repeatable
+
+  -u, --unset-env NAME
+      remove a variable from the guest environment; repeatable
+
   --dns MODE
       resolver binding: auto (default), simple, or off
 
@@ -146,9 +152,30 @@ export function parseArguments(argv) {
   // A binding is a specification string; --dns contributes a token expanded
   // once the rootfs is known, in the place it was written.
   const bindings = [];
+  const environmentActions=[];
   let rootfs = null, androidContainer = false, sawDns = false, killOnExit = false, ignorePin = false, portMode = null, portWarnings = null, index = 0;
   for (; index < argv.length; index++) {
     const argument = argv[index];
+    if (argument === "-e" || argument === "--env" || argument.startsWith("--env=")) {
+      const specification=argument.startsWith("--env=")?argument.slice(6):argv[++index];
+      if (specification===undefined || specification==="")
+        throw new Error(`${argument.split("=")[0]} needs NAME or NAME=VALUE\n${USAGE}\n${TRY_HELP}`);
+      const equals=specification.indexOf("=");
+      const name=equals<0?specification:specification.slice(0,equals);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`invalid environment variable name: ${name}`);
+      environmentActions.push(equals<0
+        ? { name, inherit:true }
+        : { name, value:specification.slice(equals+1) });
+      continue;
+    }
+    if (argument === "-u" || argument === "--unset-env" || argument.startsWith("--unset-env=")) {
+      const name=argument.startsWith("--unset-env=")?argument.slice(12):argv[++index];
+      if (name===undefined || name==="")
+        throw new Error(`${argument.split("=")[0]} needs NAME\n${USAGE}\n${TRY_HELP}`);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`invalid environment variable name: ${name}`);
+      environmentActions.push({ name, unset:true });
+      continue;
+    }
     if (argument === "-b" || argument === "--bind" || argument === "-m" || argument === "--mount") {
       if (argv[++index] === undefined) throw new Error(`${argument} needs a binding\n${USAGE}\n${TRY_HELP}`);
       bindings.push(argv[index]);
@@ -195,6 +222,19 @@ export function parseArguments(argv) {
     }
     if (argument === "-V" || argument === "--version") return { version: true };
     if (argument === "-koe" || argument === "--kill-on-exit") { killOnExit = true; continue; }
+    // Hidden compatibility spellings used by existing PRoot launchers. These
+    // extensions are always active in bunproot, so accepting their switches
+    // must not change runtime state or advertise them as configurable.
+    if (argument === "-0" || argument === "--root-id" ||
+        argument === "-l" || argument === "--link2symlink" ||
+        argument === "-L" || argument === "--sysvipc") continue;
+    if (argument === "--change-id" || argument.startsWith("--change-id=")) {
+      const identity=argument.includes("=")?argument.slice(argument.indexOf("=")+1):argv[++index];
+      if (identity===undefined) throw new Error(`--change-id needs UID:GID\n${USAGE}\n${TRY_HELP}`);
+      if (identity!=="0:0") throw new Error(
+        `bunproot always starts with the emulated identity 0:0; unsupported --change-id value: ${identity}`);
+      continue;
+    }
     if (argument === "-p" || argument === "--port") {
       const mapping=parsePortMapping(argv[index+1]);
       if (mapping !== null) {
@@ -240,7 +280,8 @@ export function parseArguments(argv) {
   // theirs on the same pathname is the later one and wins.
   if (!sawDns) bindings.unshift({ dns: "auto" });
   return { rootfs, bindings, command, killOnExit, ignorePin, ...(portMode && { portMode }),
-    ...(portWarnings && { portWarnings }), ...(androidContainer && { androidContainer:true }) };
+    ...(portWarnings && { portWarnings }), ...(environmentActions.length>0 && { environmentActions }),
+    ...(androidContainer && { androidContainer:true }) };
 }
 /**
  * `--l2s-status`: what state a rootfs's emulated hard-link store is in.
@@ -459,13 +500,14 @@ export function run(argv) {
   ] : [];
   const mounts = createBindings(rootfs, [...compatibilityBindings,...androidBindings,...bindings.flatMap((entry) =>
     typeof entry === "string" ? [entry] : resolverBindings(rootfs, entry.dns))]);
-  const environment=guestEnvironment();
+  let environment=guestEnvironment();
   if (androidContainer) {
     const pathIndex=environment.findIndex((entry)=>entry.startsWith("PATH="));
     const path=pathIndex<0?"":environment[pathIndex].slice(5);
     const value=`PATH=/system/bin:${path}`;
     if (pathIndex<0) environment.push(value); else environment[pathIndex]=value;
   }
+  environment=applyGuestEnvironment(environment,parsed.environmentActions??[]);
   let guestExecutable=command[0].startsWith("/")
     ? canonicalizeGuestPath(mounts,command[0],{preserveInternalFinal:true})
     : command[0];

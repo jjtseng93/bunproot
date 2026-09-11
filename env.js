@@ -67,6 +67,22 @@ export function guestEnvironment(base = process.env) {
   return Object.entries(environment).map(([key, value]) => `${key}=${value}`);
 }
 
+/** Apply ordered CLI environment operations to execve's KEY=value vector. */
+export function applyGuestEnvironment(environment, actions, host = process.env) {
+  const values=new Map(environment.map((entry)=>{
+    const equals=entry.indexOf("=");
+    return [entry.slice(0,equals),entry.slice(equals+1)];
+  }));
+  for (const action of actions) {
+    if (action.unset) values.delete(action.name);
+    else if (action.inherit) {
+      if (host[action.name]===undefined) values.delete(action.name);
+      else values.set(action.name,host[action.name]);
+    } else values.set(action.name,action.value);
+  }
+  return [...values].map(([name,value])=>`${name}=${value}`);
+}
+
 /** The Android bootstrap process runs before any guest exists; it only needs
  *  the host environment with the launcher's LD_PRELOAD cleared. */
 export function bootstrapEnvironment(base = process.env) {
