@@ -121,6 +121,12 @@ test("a binding whose host is missing is dropped, not presented empty", () => {
   expect(mounts.toHost("/mnt/x")).toBe("/rootfs/mnt/x");
 });
 
+test("a direct /proc binding is ignored", () => {
+  expect(parseArguments(["-b", "/proc", "-S", "/rootfs"])).toHaveProperty("bindings", [{ dns: "auto" }]);
+  expect(parseArguments(["--bind=/proc", "-S", "/rootfs"])).toHaveProperty("bindings", [{ dns: "auto" }]);
+  expect(parseArguments(["-m", "/proc:/proc", "-S", "/rootfs"])).toHaveProperty("bindings", [{ dns: "auto" }]);
+});
+
 test("the most specific binding wins in both directions", () => {
   // Real directories: createBindings drops a binding whose host is missing.
   const base = mkdtempSync(join(tmpdir(), "prbun-binding-"));

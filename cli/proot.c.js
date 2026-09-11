@@ -166,6 +166,11 @@ export function parseArguments(argv) {
   const bindings = [];
   const environmentActions=[];
   let rootfs = null, cwd = null, androidContainer = false, sawDns = false, killOnExit = false, ignorePin = false, portMode = null, portWarnings = null, kernelRelease = null, index = 0;
+  const isProcBinding = (specification) => {
+    const separator = specification.indexOf(":");
+    const guest = separator < 0 ? specification : specification.slice(separator + 1);
+    return resolve(guest) === "/proc";
+  };
   for (; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === "-e" || argument === "--env" || argument.startsWith("--env=")) {
@@ -190,11 +195,12 @@ export function parseArguments(argv) {
     }
     if (argument === "-b" || argument === "--bind" || argument === "-m" || argument === "--mount") {
       if (argv[++index] === undefined) throw new Error(`${argument} needs a binding\n${USAGE}\n${TRY_HELP}`);
-      bindings.push(argv[index]);
+      if (!isProcBinding(argv[index])) bindings.push(argv[index]);
       continue;
     }
     if (argument.startsWith("--bind=") || argument.startsWith("--mount=")) {
-      bindings.push(argument.slice(argument.indexOf("=") + 1));
+      const binding=argument.slice(argument.indexOf("=") + 1);
+      if (!isProcBinding(binding)) bindings.push(binding);
       continue;
     }
     if (argument === "--dns") {
