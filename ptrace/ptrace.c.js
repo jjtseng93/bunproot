@@ -15,6 +15,7 @@ import { formatCall, formatResult } from "../syscall/strace.c.js";
 import { count, report, timed } from "../profile.js";
 import { buildFilter, buildProgramHeader } from "../syscall/seccomp.c.js";
 import { commitEmulatedDirectoryRename, commitEmulatedRename, commitEmulatedUnlink, emulateHardLink, hasEmulatedDirectory, inspectEmulatedAlias, inspectEmulatedObject, isEmulatedAlias } from "../extension/link2symlink/link2symlink.c.js";
+import { ipBytes as endpointIpBytes, mappedEndpoint } from "../extension/port_switch/port_switch.c.js";
 
 const PTRACE_PEEKTEXT=1, PTRACE_PEEKDATA=2, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5;
 const PTRACE_CONT=7, PTRACE_ATTACH=16, PTRACE_SYSCALL=24;
@@ -1110,7 +1111,7 @@ function resolveProcLink(taskPid,tasks,guestPath) {
   return known.exe??null;
 }
 
-export function traceProcess(pid, mounts, guest = null, { killOnExit = false } = {}) {
+export function traceProcess(pid, mounts, guest = null, { killOnExit = false, portMode = null } = {}) {
   const started=performance.now();
   const mountinfoPaths=new Set();
   const mountinfoPathFor=(taskPid)=>{
@@ -1149,6 +1150,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
     pendingCwd:null, pendingGetcwd:null, cwd:"/", configured:true, seenStop:true,
     openedHostFds:new Map(), openedGuestFds:new Map(), mounts,
     fakeNetlink:new Map(),
+    socketProtocols:new Map(),
     scratch:trampoline+4096n+512n, scratchSlot:1n, ids:rootCredentials(),
     exe:guest===null?null:guest.guestPath??guestPathOf(mounts,guest.executable) }]]);
   tasks.get(pid).trampoline=trampoline;
@@ -1251,6 +1253,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
         inherited.openedHostFds=new Map(task.openedHostFds??[]);
         inherited.openedGuestFds=new Map(task.openedGuestFds??[]);
         inherited.fakeNetlink=new Map([...task.fakeNetlink??[]].map(([fd])=>[fd,null]));
+        inherited.socketProtocols=new Map(task.socketProtocols??[]);
         inherited.bwrapFdMounts=new Map(task.bwrapFdMounts??[]);
         inherited.mounts=task.pendingChildMountNamespace?task.mounts.clone():task.mounts;
         task.pendingChildMountNamespace=false;
@@ -1452,6 +1455,12 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false } =
           if (verbose) console.error(`[ptrace] pid=${taskPid} emulated NETLINK_ROUTE fd=${result}`);
         }
         task.pendingFakeNetlinkSocket=undefined;
+      }
+      if (task.pendingSocketProtocol!==undefined) {
+        const exited=registers(), result=BigInt.asIntN(64,getX(exited.regs,0));
+        if (exitedSyscall===SYS_SOCKET && result>=0n)
+          task.socketProtocols.set(Number(result),task.pendingSocketProtocol);
+        task.pendingSocketProtocol=undefined;
       }
       if (task.idWrites!==undefined) {
         // A uid_t is four bytes and PTRACE_POKEDATA writes eight, so these
@@ -1762,6 +1771,11 @@ const exited=registers(), result=exitResult(phase,exited);
       task.pendingFakeNetlinkSocket=true;
       continue;
     }
+    if (syscall===SYS_SOCKET) {
+      const type=Number(getX(state.regs,1))&0xf;
+      task.pendingSocketProtocol=type===SOCK_DGRAM?"udp":"tcp";
+      continue;
+    }
     const socketFd=Number(BigInt.asIntN(32,getX(state.regs,0)));
     const fakeNetlink=task.fakeNetlink?.has(socketFd);
     if (fakeNetlink && (syscall===SYS_BIND || syscall===SYS_CONNECT)) {
@@ -1812,6 +1826,32 @@ const exited=registers(), result=exitResult(phase,exited);
         setKernelSyscallNumber(taskPid,state,SYS_GETPID); task.forcedResult=BigInt(received); continue;
       }
     }
+    if (syscall===SYS_SENDTO && portMode!==null) {
+      const address=getX(state.regs,4), supplied=Number(getX(state.regs,5));
+      if (address>=4096n && supplied>=4) {
+        const bytes=readTraceeBytes(taskPid,address,Math.min(supplied,128));
+        const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+        const family=view.getUint16(0,true);
+        const local=family===AF_INET
+          ? bytes.length>=8 && bytes[4]===127 && bytes[5]===0 && bytes[6]===0 && bytes[7]===1
+          : family===AF_INET6 && bytes.length>=24 && bytes.subarray(8,23).every((byte)=>byte===0) && bytes[23]===1;
+        if (local) {
+          const guestPort=view.getUint16(2,false);
+          const endpoint=mappedEndpoint(portMode,guestPort,"udp");
+          const hostAddress=endpoint.hostAddress===null?null:endpointIpBytes(endpoint.hostAddress);
+          const addressFits=hostAddress===null ||
+            (family===AF_INET && hostAddress.length===4) || (family===AF_INET6 && hostAddress.length===16);
+          if (addressFits && (endpoint.port!==guestPort || hostAddress!==null)) {
+            view.setUint16(2,endpoint.port,false);
+            if (hostAddress!==null) bytes.set(hostAddress,family===AF_INET?4:8);
+            writeBytes(memory,taskPid,task.scratch,bytes);
+            setX(state.regs,4,task.scratch); putRegisters(taskPid,state);
+            if (verbose) console.error(`[ptrace] pid=${taskPid} sendto udp ${guestPort} -> ${endpoint.hostAddress??"localhost"}:${endpoint.port}`);
+          }
+        }
+      }
+      continue;
+    }
     if (syscall===SYS_SENDMSG) {
       // fake_id0 makes the guest report uid/gid 0, and GDBus includes those
       // values in SCM_CREDENTIALS during authentication. The kernel compares
@@ -1837,7 +1877,29 @@ const exited=registers(), result=exitResult(phase,exited);
       if (address>=4096n && supplied>=3) {
         const bytes=readTraceeBytes(taskPid,address,Math.min(supplied,110));
         const family=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getUint16(0,true);
-        if (family===1 && bytes[2]!==0) { // AF_UNIX, pathname rather than abstract
+        if ((family===AF_INET || family===AF_INET6) && portMode!==null) {
+          const local=syscall===SYS_BIND || (family===AF_INET
+            ? bytes.length>=8 && bytes[4]===127 && bytes[5]===0 && bytes[6]===0 && bytes[7]===1
+            : bytes.length>=24 && bytes.subarray(8,23).every((byte)=>byte===0) && bytes[23]===1);
+          if (local && bytes.length>=4) {
+            const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+            const guestPort=view.getUint16(2,false);
+            const protocol=task.socketProtocols.get(socketFd)??"tcp";
+            const endpoint=mappedEndpoint(portMode,guestPort,protocol);
+            const hostAddress=endpoint.hostAddress===null?null:endpointIpBytes(endpoint.hostAddress);
+            const addressFits=hostAddress===null ||
+              (family===AF_INET && hostAddress.length===4) || (family===AF_INET6 && hostAddress.length===16);
+            if (addressFits && (endpoint.port!==guestPort || hostAddress!==null)) {
+              view.setUint16(2,endpoint.port,false);
+              if (hostAddress!==null) bytes.set(hostAddress,family===AF_INET?4:8);
+              writeBytes(memory,taskPid,task.scratch,bytes);
+              setX(state.regs,1,task.scratch); putRegisters(taskPid,state);
+              if (syscall===SYS_BIND && portMode.kind==="offset")
+                console.error(`bunproot: low port ${guestPort} requested by bind(); using host port ${endpoint.port}`);
+              if (verbose) console.error(`[ptrace] pid=${taskPid} ${syscall===SYS_BIND?"bind":"connect"} ${protocol} ${guestPort} -> ${endpoint.hostAddress??"same address"}:${endpoint.port}`);
+            }
+          }
+        } else if (family===1 && bytes[2]!==0) { // AF_UNIX, pathname rather than abstract
           let end=2;
           while (end<bytes.length && bytes[end]!==0) end++;
           const pathname=new TextDecoder().decode(bytes.subarray(2,end));
@@ -1993,6 +2055,7 @@ const exited=registers(), result=exitResult(phase,exited);
       // pathname against the backing object, so stale records are harmless.
       task.openedHostFds?.delete(Number(BigInt.asIntN(32,getX(state.regs,0))));
       task.openedGuestFds?.delete(Number(BigInt.asIntN(32,getX(state.regs,0))));
+      task.socketProtocols?.delete(Number(BigInt.asIntN(32,getX(state.regs,0))));
       task.fakeNetlink?.delete(Number(BigInt.asIntN(32,getX(state.regs,0))));
       continue;
     }

@@ -11,6 +11,7 @@ import { traceProcess } from "../ptrace/ptrace.c.js";
 import { bootstrapEnvironment, guestEnvironment, verbose } from "../env.js";
 import pkg from "../package.json" with { type: "json" };
 import { parseDnsMode, resolverBindings } from "../dns.js";
+import { isPublishedPort, offsetPortMode, parsePortMapping } from "../extension/port_switch/port_switch.c.js";
 
 const OVERFLOW_ID = resolve(import.meta.dir,"../fakeid.txt");
 /** Render markdown at the terminal's own width.
@@ -84,6 +85,13 @@ const HELP = `${USAGE}
   -koe, --kill-on-exit
       kill all remaining guest processes when COMMAND exits
 
+  -p [[HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp|udp]]
+      with a Docker-style port pair, map the guest/container port to the host
+      port; repeatable. Without a valid pair, protect ports below 1024 by
+      adding PROOT_PORT_ADD (2000 by default). A single high port is accepted
+      as a no-op; a single low port also warns that Docker-style automatic
+      host-port allocation is unavailable
+
 Emulated hard links. The first four take a rootfs of their own, run nothing
 inside it, and combine with nothing else; the last is an option to a normal
 run:
@@ -138,7 +146,7 @@ export function parseArguments(argv) {
   // A binding is a specification string; --dns contributes a token expanded
   // once the rootfs is known, in the place it was written.
   const bindings = [];
-  let rootfs = null, androidContainer = false, sawDns = false, killOnExit = false, ignorePin = false, index = 0;
+  let rootfs = null, androidContainer = false, sawDns = false, killOnExit = false, ignorePin = false, portMode = null, portWarnings = null, index = 0;
   for (; index < argv.length; index++) {
     const argument = argv[index];
     if (argument === "-b" || argument === "--bind" || argument === "-m" || argument === "--mount") {
@@ -187,6 +195,25 @@ export function parseArguments(argv) {
     }
     if (argument === "-V" || argument === "--version") return { version: true };
     if (argument === "-koe" || argument === "--kill-on-exit") { killOnExit = true; continue; }
+    if (argument === "-p" || argument === "--port") {
+      const mapping=parsePortMapping(argv[index+1]);
+      if (mapping !== null) {
+        if (portMode?.kind === "offset") portMode={ kind:"mapping", mappings:[] };
+        portMode??={ kind:"mapping", mappings:[] };
+        portMode.mappings.push(mapping); index++;
+      } else if (isPublishedPort(argv[index+1])) {
+        // Docker's `-p CONTAINER_PORT` asks it to choose a random host port.
+        // There is no separate network here, so consume the compatibility
+        // argument and leave that already-host-visible port unchanged.
+        const published=Number(argv[++index]);
+        if (published<1024) {
+          portWarnings??=[];
+          portWarnings.push(`-p ${published} cannot allocate Docker's random host port on the shared host network; `+
+            `a guest bind to low port ${published} may fail. Use bare -p or an explicit mapping such as -p ${published+2000}:${published}.`);
+        }
+      } else portMode=offsetPortMode();
+      continue;
+    }
     if (argument === "--l2s-ignore-pin") { ignorePin = true; continue; }
     if (argument === "--android-container" || argument.startsWith("--android-container=")) {
       if (rootfs !== null) throw new Error(`--android-container does not combine with -S\n${USAGE}\n${TRY_HELP}`);
@@ -212,7 +239,8 @@ export function parseArguments(argv) {
   // The default sits ahead of everything the caller wrote, so any binding of
   // theirs on the same pathname is the later one and wins.
   if (!sawDns) bindings.unshift({ dns: "auto" });
-  return { rootfs, bindings, command, killOnExit, ignorePin, ...(androidContainer && { androidContainer:true }) };
+  return { rootfs, bindings, command, killOnExit, ignorePin, ...(portMode && { portMode }),
+    ...(portWarnings && { portWarnings }), ...(androidContainer && { androidContainer:true }) };
 }
 /**
  * `--l2s-status`: what state a rootfs's emulated hard-link store is in.
@@ -400,7 +428,8 @@ export function run(argv) {
     console.log(renderMarkdown(markdown));
     return 0;
   }
-  const { rootfs, bindings, command, killOnExit, ignorePin, androidContainer } = parsed;
+  const { rootfs, bindings, command, killOnExit, ignorePin, androidContainer, portMode } = parsed;
+  for (const warning of parsed.portWarnings??[]) console.error(`bunproot: warning: ${warning}`);
   // A pinned store is not merely unreadable from in here: the tracer
   // identifies an emulated hard link by its guest-absolute target, so while
   // it is pinned it recognises none of them. Reads fail, and writes are
@@ -467,5 +496,5 @@ export function run(argv) {
   ];
   const pid = spawnTracee(childArgv, bootstrapEnvironment());
   return traceProcess(pid, mounts, { executable, guestPath: guestExecutable,
-    name: basename(command[0]), interpreter, loader, argv: guestArgv, env:environment }, { killOnExit });
+    name: basename(command[0]), interpreter, loader, argv: guestArgv, env:environment }, { killOnExit, portMode });
 }

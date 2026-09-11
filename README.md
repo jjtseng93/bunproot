@@ -380,6 +380,7 @@ is an argument to the guest program instead.
 | `-m`, `--mount` | Another name for `--bind`, not a different thing |
 | `--dns MODE` | Which resolver the guest gets: `auto` (default), `simple` or `off`. `--dns=MODE` says the same thing |
 | `-koe`, `--kill-on-exit` | Kill whatever is left of the guest when `COMMAND` exits |
+| `-p [PORT SPEC]` | With `[HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp\|udp]`, rewrite guest ports to explicit host endpoints; repeatable. A bare `-p` enables low-port protection through `PROOT_PORT_ADD`. A single port is accepted for Docker CLI compatibility |
 | `--l2s-status ROOTFS` | Report what state a rootfs's emulated hard-link store is in, then exit. Recognises the original PRoot's format too. Reads only, takes a rootfs of its own, and combines with nothing else |
 | `--l2s-pin ROOTFS` | Rewrite that store so tools outside the rootfs can follow its emulated hard links. The guest loses them for as long as it is pinned, and the rootfs can no longer be moved |
 | `--l2s-unpin ROOTFS` | Rewrite it back, so the guest can follow them again and the rootfs can move |
@@ -418,6 +419,55 @@ below `/usr/lib/sdk` and nothing above it; the rootfs is simply the binding at
 upstream does; `PROOT_IGNORE_MISSING_BINDINGS` silences the report but still
 drops it. `/proc`, `/dev` and `/sys` reach the host kernel filesystems without
 needing a binding.
+
+### Port mapping and low ports
+
+The guest shares the host network; this is syscall rewriting, not a separate
+Docker network namespace or NAT. The explicit form follows Docker's
+`HOST_PORT:CONTAINER_PORT` order and may be repeated:
+
+```sh
+bunproot -S ./alpine \
+  -p 8080:80 \
+  -p 127.0.0.1:8443:443 \
+  -p 5353:53/udp \
+  /bin/server
+```
+
+This maps guest TCP 80 to host TCP 8080, restricts guest TCP 443 to host
+`127.0.0.1:8443`, and maps guest UDP 53 to host UDP 5353. TCP is the default;
+use `/udp` explicitly for UDP. IPv6 host addresses must be bracketed:
+
+```sh
+bunproot -S ./alpine -p '[::1]:8080:80' /bin/server
+```
+
+On `bind()`, both the mapped port and an explicitly supplied host IP are
+substituted before the host kernel sees the address. Localhost `connect()` and
+UDP `sendto()` calls receive the corresponding substitution as well; remote
+destinations are left alone.
+
+A single Docker-style container port needs no publication because the guest
+already uses the host network. It is consumed as a compatibility no-op:
+
+```sh
+bunproot -S ./alpine -p 8080 /bin/server
+```
+
+For ports 1 through 1023 this cannot reproduce Docker's automatic random host
+port allocation, so bunproot prints a warning. Use an explicit mapping, or use
+a bare `-p` to protect every low port by adding `PROOT_PORT_ADD` (2000 by
+default):
+
+```sh
+bunproot -S ./alpine -p 2080:80 /bin/server
+PROOT_PORT_ADD=3000 bunproot -p -S ./alpine /bin/server
+```
+
+In the second example, a guest `bind()` to port 80 becomes a host bind to
+3080. Ports 1024 and above, and port 0 (kernel-selected), remain unchanged.
+Whenever this automatic low-port rewrite occurs, bunproot reports the guest
+and actual host ports.
 
 ### The resolver
 
@@ -664,6 +714,7 @@ have no upstream counterpart.
 | `PROOT_BUN_PROFILE=1` | On exit, report how many times the tracer stopped, how many of those stops it handled, how many pathnames it translated, and where the wall clock went. |
 | `PROOT_NO_SECCOMP` | Set to any value to stop on every syscall instead of filtering. Upstream's variable, with upstream's semantics: presence is what counts. This is also the automatic fallback when the filter cannot be installed. |
 | `PROOT_IGNORE_MISSING_BINDINGS` | Set to any value to drop a binding whose host path does not exist without reporting it. The binding is dropped either way; this silences the report. |
+| `PROOT_PORT_ADD` | Offset used by bare `-p` to protect guest ports 1–1023; defaults to 2000. A Docker-style `-p [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp|udp]` instead enables explicit mapping mode; `-p CONTAINER_PORT` is accepted as a no-op because the guest already shares the host network. |
 
 ```sh
 PROOT_BUN_VERBOSE=1 PATH="$PWD:$PATH" LD_PRELOAD= \
