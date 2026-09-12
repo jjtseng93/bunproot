@@ -125,7 +125,8 @@ const PTRACE_EVENT_SECCOMP = 7;
 const PR_SET_NO_NEW_PRIVS = 38, PR_SET_SECCOMP = 22, SECCOMP_MODE_FILTER = 2, PR_SET_NAME = 15;
 const TASK_COMM_LEN = 16;
 const DT_REG = 8, DT_LNK = 10;
-const AF_UNIX=1, AF_INET=2, AF_INET6=10, AF_NETLINK=16, NETLINK_ROUTE=0;
+const AF_UNIX=1, AF_INET=2, AF_INET6=10, AF_NETLINK=16;
+const NETLINK_ROUTE=0, NETLINK_AUDIT=9;
 const SOCK_DGRAM=2, SOCK_CLOEXEC=0x80000;
 const MSG_PEEK=2, MSG_TRUNC=0x20;
 const NLM_F_MULTI=2, NLM_F_REQUEST=1, NLM_F_DUMP=0x300;
@@ -416,7 +417,8 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
   // and /proc/<PID>/exe, and the host pathname the loader actually reads.  They
   // differ for an emulated hard link, and an interpreter that resolves its
   // imports next to argv[1] must never be handed /.proot.l2s/objs/<id>.
-  let guestPath=canonicalizeGuestPath(mounts,resolveProcLink(pid,tasks,input)??input,
+  const invokedPath=resolveProcLink(pid,tasks,input)??input;
+  let guestPath=canonicalizeGuestPath(mounts,invokedPath,
     {preserveInternalFinal:true});
   let executable=mounts.toHost(canonicalizeGuestPath(mounts,guestPath));
   // Flatpak hides almost all bubblewrap options in a NUL-separated --args FD.
@@ -462,7 +464,11 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
   // The PATH a `#!/usr/bin/env NAME` search has to use is the guest's own, and
   // for a nested exec that is whatever envp the tracee is passing along.
   const searchPath=env.find((entry)=>entry.startsWith("PATH="))?.slice(5);
-  const script=expandShebang(executable,guestPath,argv,makeGuestPaths(mounts,searchPath,task.cwd));
+  // The kernel puts the pathname passed to execve in the shebang interpreter's
+  // argv, including its final symlink spelling.  Programs such as Debian's
+  // adduser/addgroup intentionally dispatch on that spelling, so the loader's
+  // canonical path must not leak into the script argument.
+  const script=expandShebang(executable,invokedPath,argv,makeGuestPaths(mounts,searchPath,task.cwd));
   if (script!==null) {
     guestPath=canonicalizeGuestPath(mounts,script.guestPath,{preserveInternalFinal:true});
     executable=mounts.toHost(canonicalizeGuestPath(mounts,guestPath));
@@ -1497,6 +1503,18 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
         }
         task.pendingFakeNetlinkSocket=undefined;
       }
+      if (task.pendingAuditSocket!==undefined) {
+        const exited=registers(), result=BigInt.asIntN(64,getX(exited.regs,0));
+        // Android denies NETLINK_AUDIT to app UIDs.  A fake-root guest should
+        // see the same result as a kernel built without audit support, which
+        // lets shadow's useradd/groupadd continue without audit logging.
+        if (exitedSyscall===SYS_SOCKET && task.pendingAuditSocket &&
+            (result===-1n || result===-13n)) {
+          setX(exited.regs,0,BigInt.asUintN(64,-93n)); // EPROTONOSUPPORT
+          putRegisters(taskPid,exited);
+        }
+        task.pendingAuditSocket=undefined;
+      }
       if (task.pendingSocketProtocol!==undefined) {
         const exited=registers(), result=BigInt.asIntN(64,getX(exited.regs,0));
         if (exitedSyscall===SYS_SOCKET && result>=0n)
@@ -1823,6 +1841,11 @@ const exited=registers(), result=exitResult(phase,exited);
       setX(state.regs,1,BigInt(SOCK_DGRAM|(type&SOCK_CLOEXEC)));
       setX(state.regs,2,0n); putRegisters(taskPid,state);
       task.pendingFakeNetlinkSocket=true;
+      continue;
+    }
+    if (syscall===SYS_SOCKET && Number(getX(state.regs,0))===AF_NETLINK &&
+        Number(getX(state.regs,2))===NETLINK_AUDIT) {
+      task.pendingAuditSocket=task.ids.euid===0;
       continue;
     }
     if (syscall===SYS_SOCKET) {
