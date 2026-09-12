@@ -1680,6 +1680,31 @@ const exited=registers(), result=exitResult(phase,exited);
           if (task.pendingGuestPaths?.length)
             task.openedGuestFds.set(Number(result),task.pendingGuestPaths[0]);
         }
+        // An emulated hard link only comes into being here, at the exit of the
+        // linkat that asked for it.  Bun installs from several threads, so
+        // another thread's faccessat on that name can be translated while the
+        // alias is still missing -- the pathname passes through untouched --
+        // and reach the kernel after this loop has created it.  The kernel
+        // then follows the alias itself, and its target is a guest-absolute
+        // /.proot.l2s/refs path that resolves nowhere on the host: ENOENT for
+        // a file that exists.  The tracer is single-threaded and creates the
+        // alias synchronously, so re-inspecting the name now is definitive.
+        if (task.pendingPathSyscall===SYS_FACCESSAT && result===BigInt.asIntN(64,ENOENT) &&
+            task.pendingGuestPaths?.length===1) {
+          let alias=null;
+          // The mets lookup inside throws on a corrupt count; a bad store must
+          // not take the whole trace down over one access(2).
+          try { alias=inspectEmulatedAlias(mounts.rootfs,task.pendingHostPaths?.[0]??""); } catch {}
+          if (alias) {
+            try {
+              accessSync(mounts.toHost(alias.objectGuest),task.pendingAccessMode);
+              setX(exited.regs,0,0n); putRegisters(taskPid,exited); finalResult=0n;
+            } catch (error) {
+              finalResult=BigInt(error.errno??-13);
+              setX(exited.regs,0,BigInt.asUintN(64,finalResult)); putRegisters(taskPid,exited);
+            }
+          }
+        }
         if (task.pendingL2sUnlink && result===0n) {
           try { commitEmulatedUnlink(mounts.rootfs,task.pendingL2sUnlink); }
           catch (error) {
@@ -1733,6 +1758,7 @@ const exited=registers(), result=exitResult(phase,exited);
           stracePaths=task.pendingHostPaths?.filter((path)=>path!==null) ?? null;
         task.pendingHostPaths=undefined;
         task.pendingGuestPaths=undefined;
+        task.pendingAccessMode=undefined;
         task.pendingLinkPaths=undefined;
         task.pendingLinkGuestPaths=undefined;
         task.pendingL2sUnlink=undefined;
@@ -2352,6 +2378,7 @@ const exited=registers(), result=exitResult(phase,exited);
     task.pendingPaths=guestPaths;
     task.pendingHostPaths=hostPaths;
     task.pendingGuestPaths=guestPaths;
+    if (syscall===SYS_FACCESSAT) task.pendingAccessMode=Number(getX(state.regs,2));
     if (syscall===SYS_FACCESSAT2 && hostPaths.length===1) {
       let result=0n;
       try { accessSync(hostPaths[0],Number(getX(state.regs,2))); }

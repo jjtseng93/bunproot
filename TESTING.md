@@ -29,7 +29,7 @@ Each line names what breaks when it fails, so a red one points somewhere.
 | `proot -S "$ROOTFS" /bin/sh -c 'ls /'` | The vertical slice: bootstrap, ELF loading, path translation |
 | `PROOT_BUN_STRACE=1 proot -S "$ROOTFS" /bin/cat /etc/os-release` | Full syscall tracing. It must include passed-through calls as well as `openat` with the translated host pathname; setting this variable disables the seccomp filter automatically |
 | `proot -S "$EMPTY" -b /system -b /apex -b /linkerconfig/ld.config.txt -b "$BIONIC_BUN:/bin/bun" /bin/bun -e 'console.log(process.platform)'` | The emulated loader keeps SP in the kernel-created main stack. Bionic caches that range in pthread metadata, and JavaScriptCore aborts in `sanitizeStackForVM` if the guest is started on an unrelated anonymous mapping |
-| `proot -S "$ROOTFS" /bin/sh -c 'bun x cowsay hello'` | Registry resolve, install, `#!` re-exec, `getdents64` d_type for emulated hard links |
+| `proot -S "$ROOTFS" /bin/sh -c 'bun x cowsay hello'` | Registry resolve, install, `#!` re-exec, `getdents64` d_type and post-link `faccessat` for emulated hard links |
 | `proot -S "$ROOTFS" /bin/sh -c 'bun x bunmsh -c "echo ok"'` | ES module resolution, which reads a module's own directory back through `/proc/<PID>/fd/<FD>` |
 | `proot -S "$ROOTFS" /usr/bin/git clone -q https://github.com/jjtseng93/jsmdcui "$C"` | HTTPS, git's helper processes, the link2symlink hard-link emulation on pack files |
 | `proot -S "$ROOTFS" /bin/sh -c "mkdir -p $FRESH; cd $FRESH; git init -q . && echo x > a && git add a && git -c user.email=a@b -c user.name=c commit -qm t"` | Loose-object hard links. **`$FRESH` must be a guest path that has never been used** — see the pitfalls below |
