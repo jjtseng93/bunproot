@@ -64,6 +64,9 @@ Licensed **GPL-2.0-or-later**, inherited as a derivative work of PRoot.
 ## Confirmed running (mostly under Alpine)
 
 - Firefox
+- Chromium
+  - Run with `bunproot -b "$TMPDIR:/dev/shm" -S "$ROOTFS" /bin/sh -c
+    'chromium --no-sandbox'`.
 - bubblewrap (`bwrap`)
 - Flatpak (limited testing)
   - GNOME Text Editor
