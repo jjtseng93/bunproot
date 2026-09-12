@@ -601,10 +601,34 @@ const O_NOFOLLOW = 0x8000n;
 // fchmodat, faccessat and mknodat are not in it -- the kernel does not honour
 // the flag for them -- so they stay REGULAR here too.
 const AT_SYMLINK_NOFOLLOW = 0x100n;
+const AT_EACCESS = 0x200n;
 // Empty pathnames normally fail with ENOENT.  The *at syscalls that support
 // this Linux extension inspect dirfd itself only when the caller opts in.
 const AT_EMPTY_PATH = 0x1000n;
 const ENOENT = BigInt.asUintN(64,-2n);
+const EINVAL = BigInt.asUintN(64,-22n);
+const FACCESSAT2_FLAGS=AT_SYMLINK_NOFOLLOW|AT_EACCESS|AT_EMPTY_PATH;
+
+// accessSync(), like access(2), always dereferences the final symlink.  The
+// kernel's faccessat2(AT_SYMLINK_NOFOLLOW) instead checks the link inode; on
+// Linux a symlink grants every access mode, so reaching it with lstat is the
+// complete final-component check.  Non-symlinks retain the host kernel's
+// permission, noexec and read-only-filesystem checks through accessSync().
+function accessResult(host,mode,noFollow=false) {
+  try {
+    if (noFollow && lstatSync(host).isSymbolicLink()) return 0n;
+    accessSync(host,mode); return 0n;
+  } catch (error) { return BigInt.asUintN(64,BigInt(error.errno??-13)); }
+}
+
+/** The result written to an arm64 faccessat2 register, exported for the ABI
+ * regression tests. Path/dirfd resolution happens in the tracer before this
+ * final inode access check. */
+export function faccessat2Result(host,mode,flags) {
+  const bits=BigInt(flags);
+  if ((BigInt(mode)&~7n)!==0n || (bits&~FACCESSAT2_FLAGS)!==0n) return EINVAL;
+  return accessResult(host,mode,(bits&AT_SYMLINK_NOFOLLOW)!==0n);
+}
 
 const align4=(value)=>(value+3)&~3;
 function netlinkAttribute(type,data) {
@@ -719,7 +743,8 @@ const PATH_ARGUMENTS = new Map([
   [89,[{path:0}]], [276,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]],
   [281,[{path:1,dirfd:0}]],
   [291,[{path:1,dirfd:0,nofollow:{arg:2,mask:AT_SYMLINK_NOFOLLOW}}]],
-  [437,[{path:1,dirfd:0}]], [SYS_FACCESSAT2,[{path:1,dirfd:0}]],
+  [437,[{path:1,dirfd:0}]],
+  [SYS_FACCESSAT2,[{path:1,dirfd:0,nofollow:{arg:3,mask:AT_SYMLINK_NOFOLLOW}}]],
 ]);
 
 // setregid, setgid, setreuid, setuid, setresuid, setresgid, setfsuid,
@@ -1490,14 +1515,16 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
         // translated guest pathname and place the result straight in x0.
         let result=0n;
         try {
+          const mode=getX(stopped.regs,2), flags=getX(stopped.regs,3);
+          if ((mode&~7n)!==0n || (flags&~FACCESSAT2_FLAGS)!==0n) result=EINVAL;
           const path=readCString(memory,taskPid,getX(stopped.regs,1));
-          if (path==="" && (getX(stopped.regs,3)&AT_EMPTY_PATH)===0n) result=ENOENT;
-          else {
+          if (result===0n && path==="" && (flags&AT_EMPTY_PATH)===0n) result=ENOENT;
+          else if (result===0n) {
             const guestPath=resolveGuestPath(taskPid,mounts,task,stopped,path,
               {dirfd:0,nofollow:{arg:3,mask:AT_SYMLINK_NOFOLLOW}});
-            accessSync(mounts.toHost(guestPath),Number(getX(stopped.regs,2)));
+            result=faccessat2Result(mounts.toHost(guestPath),Number(mode),flags);
           }
-        } catch (error) { result=BigInt(error.errno??-13); }
+        } catch (error) { result=BigInt.asUintN(64,BigInt(error.errno??-13)); }
         setX(stopped.regs,0,BigInt.asUintN(64,result)); putRegisters(taskPid,stopped);
         task.entering=true;
         continue;
@@ -2270,6 +2297,17 @@ const exited=registers(), result=exitResult(phase,exited);
       }
     }
     if (syscall===SYS_FACCESSAT || syscall===SYS_FACCESSAT2) {
+      if (syscall===SYS_FACCESSAT2) {
+        const mode=getX(state.regs,2), flags=getX(state.regs,3);
+        if ((mode&~7n)!==0n || (flags&~FACCESSAT2_FLAGS)!==0n) {
+          task.pendingPaths=[];
+          task.pendingHostPaths=[];
+          task.pendingGuestPaths=[];
+          setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+          task.forcedResult=EINVAL;
+          continue;
+        }
+      }
       let path=null;
       try { path=readCString(memory,taskPid,getX(state.regs,1)); } catch {}
       // faccessat has no flags argument and never accepts an empty pathname.
@@ -2455,9 +2493,8 @@ const exited=registers(), result=exitResult(phase,exited);
     task.pendingGuestPaths=guestPaths;
     if (syscall===SYS_FACCESSAT) task.pendingAccessMode=Number(getX(state.regs,2));
     if (syscall===SYS_FACCESSAT2 && hostPaths.length===1) {
-      let result=0n;
-      try { accessSync(hostPaths[0],Number(getX(state.regs,2))); }
-      catch (error) { result=BigInt(error.errno??-13); }
+      const flags=getX(state.regs,3);
+      const result=faccessat2Result(hostPaths[0],Number(getX(state.regs,2)),flags);
       setKernelSyscallNumber(taskPid,state,SYS_GETPID);
       task.forcedResult=BigInt.asUintN(64,result);
       continue;
