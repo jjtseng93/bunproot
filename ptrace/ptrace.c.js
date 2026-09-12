@@ -1,5 +1,5 @@
 import { FFIType, ptr } from "bun:ffi";
-import { accessSync, constants as fsConstants, copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { posix } from "node:path";
 import { networkInterfaces, tmpdir } from "node:os";
 import { lazySymbols } from "../ffi.js";
@@ -1013,6 +1013,39 @@ function hasKernelFilesystemBinding(mounts,path) {
     (path===guest || path.startsWith(`${guest}/`)));
 }
 
+// Simulate CAP_DAC_OVERRIDE for a fake-root guest: while its path syscall runs,
+// give the tracer's own uid read/write on every component under the rootfs
+// (and search on directories), then put the original modes back at syscall
+// exit.  Mirrors upstream fake_id0's override_permissions()
+// (src/extension/fake_id0/fake_id0.c), which canonicalize() invokes for each
+// component through HOST_PATH.  Without it a guest extracting an OCI layer
+// cannot write into a 0555 directory or replace a 0444 file it created moments
+// earlier, and Fedora images are full of both.  Two deliberate departures:
+// suid/sgid/sticky bits stay in place instead of being dropped and re-added,
+// and a symlink component is left alone rather than chmod()ing its target.
+// The walk is over the translated host path, so it happens after
+// canonicalization rather than during it as upstream does.
+function overrideRootPermissions(rootfs,hostPath,includeFinal=true) {
+  const paths=[];
+  for (let current=includeFinal?hostPath:posix.dirname(hostPath);
+       current===rootfs || current.startsWith(`${rootfs}/`);
+       current=posix.dirname(current)) {
+    paths.push(current);
+    if (current===rootfs) break;
+  }
+  const changed=[];
+  for (const path of paths.reverse()) {
+    try {
+      const stat=lstatSync(path);
+      if (stat.isSymbolicLink()) continue;
+      const mode=stat.mode&0o7777;
+      const widened=mode|0o600|(stat.isDirectory()?0o100:0);
+      if (widened!==mode) { chmodSync(path,widened); changed.push([path,mode]); }
+    } catch {}
+  }
+  return changed;
+}
+
 // writeBytes() stores whole 8-byte words. A readlink(2) result lands in a
 // caller-sized buffer, so the trailing partial word has to keep whatever the
 // tracee already had there instead of being zero-filled past the limit.
@@ -1204,6 +1237,11 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
     if (removed?.scratchSlot!==undefined) freeScratchSlots.push(removed.scratchSlot);
     if (removed?.shmAttachments!==undefined)
       for (const { shmid } of removed.shmAttachments.values()) shmDetached(shmid,taskPid);
+    // A tracee killed inside a path syscall never reaches the exit handler
+    // that restores what overrideRootPermissions widened.
+    if (removed?.pendingPermissionRestores!==undefined)
+      for (const [path,mode] of removed.pendingPermissionRestores.reverse())
+        try { chmodSync(path,mode); } catch {}
     tasks.delete(taskPid);
   };
   let rootExit=1;
@@ -1752,6 +1790,11 @@ const exited=registers(), result=exitResult(phase,exited);
         if (finalResult<0n && verbose)
           console.error(`[ptrace] pid=${taskPid} syscall=${task.pendingPathSyscall} result=${finalResult}`+
             (task.pendingPaths?.length?` paths=${task.pendingPaths.join(" -> ")}`:""));
+        if (task.pendingPermissionRestores!==undefined) {
+          for (const [path,mode] of task.pendingPermissionRestores.reverse())
+            try { chmodSync(path,mode); } catch {}
+          task.pendingPermissionRestores=undefined;
+        }
         task.pendingPathSyscall=undefined;
         task.pendingPaths=undefined;
         if (straceCall!==undefined)
@@ -2208,6 +2251,21 @@ const exited=registers(), result=exitResult(phase,exited);
     const arguments_=PATH_ARGUMENTS.get(syscall);
     if (arguments_===undefined) continue;
     task.pendingPathSyscall=syscall;
+    if (syscall===79 || syscall===291) {
+      let path=null;
+      try { path=readCString(memory,taskPid,getX(state.regs,1)); } catch {}
+      if (path==="") {
+        const flags=getX(state.regs,syscall===79?3:2);
+        task.pendingPaths=[path];
+        task.pendingHostPaths=[];
+        task.pendingGuestPaths=[path];
+        if ((flags&AT_EMPTY_PATH)===0n) {
+          setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+          task.forcedResult=ENOENT;
+        }
+        continue;
+      }
+    }
     if (syscall===SYS_FACCESSAT || syscall===SYS_FACCESSAT2) {
       let path=null;
       try { path=readCString(memory,taskPid,getX(state.regs,1)); } catch {}
@@ -2359,6 +2417,20 @@ const exited=registers(), result=exitResult(phase,exited);
            canonicalHost.startsWith(`${mounts.rootfs}${L2S_OBJS}`)))
         task.pendingOpenAlias=canonicalizeGuestPath(mounts,inputGuest,{preserveInternalFinal:true});
       const host=canonicalHost;
+      if (task.ids.euid===0 && host.startsWith(`${mounts.rootfs}/`)) {
+        // The final component keeps its mode when the syscall never needs
+        // DAC on it: the stat family (upstream leaves those alone too, so the
+        // guest reads the true mode), fchmodat, and every call that only
+        // creates, removes or renames the directory entry -- for those the
+        // parent's wx is what matters.  Widening the final of a rename would
+        // even stick: the restore chmod()s the old name, which is gone.
+        const includeFinal=spec.deref!==false && ![43,53,79,291].includes(syscall);
+        const changedModes=overrideRootPermissions(mounts.rootfs,host,includeFinal);
+        if (changedModes.length) {
+          task.pendingPermissionRestores??=[];
+          task.pendingPermissionRestores.push(...changedModes);
+        }
+      }
       if (syscall===SYS_OPENAT && task.pivoted && !host.startsWith(mounts.rootfs) &&
           !host.startsWith("/proc/") && !host.startsWith("/dev/") && !host.startsWith("/sys/"))
         task.lastExternalSourceHost=host;
