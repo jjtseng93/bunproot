@@ -155,7 +155,7 @@ first colon separates them. The most specific binding wins; the rootfs is the
 binding at "/". /proc, /dev and /sys reach the host kernel without one.
 
 PROOT_BUN_VERBOSE=1   trace what the tracer does
-PROOT_BUN_STRACE=1    trace every guest syscall and substituted result/path
+PROOT_BUN_STRACE=1|nocolor   trace every guest syscall; nocolor emits plain text
 PROOT_BUN_PROFILE=1   report stop counts and where the time went
 PROOT_NO_SECCOMP      stop on every syscall instead of filtering
 PROOT_IGNORE_MISSING_BINDINGS   do not warn about a binding that does not exist`;

@@ -754,7 +754,7 @@ have no upstream counterpart.
 | Variable | Effect |
 | --- | --- |
 | `PROOT_BUN_VERBOSE=1` | Trace ELF loading, process events, signals, guest exec replacement and pathname rewriting. A memory fault also reports `si_code`, `si_addr`, and the mappings the faulting address and the faulting PC belong to. |
-| `PROOT_BUN_STRACE=1` | Print every guest syscall and its result. This automatically disables syscall filtering; a result changed by the tracer shows both values, and a translated pathname also shows its host pathname. |
+| `PROOT_BUN_STRACE=1` | Print every guest syscall and its result, with ANSI colors by default. Use `PROOT_BUN_STRACE=nocolor` for plain text. Either value automatically disables syscall filtering; a result changed by the tracer shows both values, and a translated pathname also shows its host pathname. |
 | `PROOT_BUN_PROFILE=1` | On exit, report how many times the tracer stopped, how many of those stops it handled, how many pathnames it translated, and where the wall clock went. |
 | `PROOT_NO_SECCOMP` | Set to any value to stop on every syscall instead of filtering. Upstream's variable, with upstream's semantics: presence is what counts. This is also the automatic fallback when the filter cannot be installed. |
 | `PROOT_IGNORE_MISSING_BINDINGS` | Set to any value to drop a binding whose host path does not exist without reporting it. The binding is dropped either way; this silences the report. |

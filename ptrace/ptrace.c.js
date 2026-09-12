@@ -10,7 +10,7 @@ import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
 import { readElfLoadInfo, relocateElf } from "../execve/elf.c.js";
 import { expandShebang, makeGuestPaths } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
-import { guestEnvironment, noSeccomp, strace, verbose } from "../env.js";
+import { guestEnvironment, noSeccomp, strace, straceColor, verbose } from "../env.js";
 import { formatCall, formatResult } from "../syscall/strace.c.js";
 import { count, report, timed } from "../profile.js";
 import { buildFilter, buildProgramHeader } from "../syscall/seccomp.c.js";
@@ -1848,10 +1848,13 @@ const exited=registers(), result=exitResult(phase,exited);
       if (straceCall!==undefined) {
         const seen=BigInt.asUintN(64,getX(registers().regs,0));
         // A result this port replaced is worth showing as the swap it is.
-        const outcome=seen===straceKernel?formatResult(seen)
-          :`${formatResult(seen)} (kernel ${formatResult(straceKernel)})`;
-        console.error(`[strace] ${taskPid} ${straceCall} = ${outcome}` +
-          (stracePaths?.length>0?`  [${stracePaths.join(", ")}]`:""));
+        const outcome=seen===straceKernel?formatResult(seen,straceColor)
+          :`${formatResult(seen,straceColor)} (kernel ${formatResult(straceKernel,straceColor)})`;
+        const pathSuffix=stracePaths?.length>0?`  [${stracePaths.join(", ")}]`:"";
+        if (straceColor) {
+          console.error(`\x1b[2m[strace] ${taskPid}\x1b[0m ${straceCall} = ${outcome}`+
+            (pathSuffix?`\x1b[32m${pathSuffix}\x1b[0m`:""));
+        } else console.error(`[strace] ${taskPid} ${straceCall} = ${outcome}${pathSuffix}`);
       }
       continue;
     }
@@ -1867,7 +1870,7 @@ const exited=registers(), result=exitResult(phase,exited);
       // The host pathname is only known once the arguments below are
       // translated, so it is filled in at exit from what the port recorded.
       task.straceCall=formatCall(syscall,
-        [0,1,2,3,4,5].map((index)=>getX(entered,index)),read,()=>null);
+        [0,1,2,3,4,5].map((index)=>getX(entered,index)),read,()=>null,straceColor);
     }
     // Nothing to do for a syscall this tracer does not translate, and by far
     // the most syscalls a guest makes are of that kind: reading the registers

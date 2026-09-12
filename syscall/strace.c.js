@@ -17,6 +17,8 @@
 import { syscallName } from "./names.js";
 
 const AT_FDCWD = -100;
+const ANSI={reset:"\x1b[0m",dim:"\x1b[2m",name:"\x1b[36m",number:"\x1b[33m",string:"\x1b[32m",symbol:"\x1b[35m",error:"\x1b[31m"};
+const paint=(enabled,kind,value)=>enabled?`${ANSI[kind]}${value}${ANSI.reset}`:value;
 
 // Only the flags worth reading at a glance. An unknown bit is kept as a
 // number rather than dropped, so a decoded value never lies by omission.
@@ -89,27 +91,30 @@ const SHAPES = new Map([
  * `translate` reports what that pathname was rewritten to, or null when the
  * port left it alone.
  */
-export function formatCall(number, args, read, translate) {
+export function formatCall(number, args, read, translate, color=false) {
   const shape = SHAPES.get(number) ?? [];
   const rendered = args.map((value, index) => {
     switch (shape[index]) {
-      case "dirfd": case "olddirfd": case "newdirfd": return dirfd(value);
-      case "openflags": return openFlags(value);
+      case "dirfd": case "olddirfd": case "newdirfd": {
+        const rendered=dirfd(value);
+        return paint(color,rendered==="AT_FDCWD"?"symbol":"number",rendered);
+      }
+      case "openflags": return paint(color,"symbol",openFlags(value));
       case "path": {
         const guest = read(value);
-        if (guest === null) return `0x${value.toString(16)}`;
+        if (guest === null) return paint(color,"number",`0x${value.toString(16)}`);
         const host = translate(guest);
         return host === null || host === guest
-          ? JSON.stringify(guest)
-          : `${JSON.stringify(guest)} -> ${JSON.stringify(host)}`;
+          ? paint(color,"string",JSON.stringify(guest))
+          : `${paint(color,"string",JSON.stringify(guest))} ${paint(color,"dim","->")} ${paint(color,"string",JSON.stringify(host))}`;
       }
-      case "mode": return `0o${BigInt.asUintN(32, value).toString(8)}`;
+      case "mode": return paint(color,"number",`0o${BigInt.asUintN(32, value).toString(8)}`);
       // No shape for this position: show the value rather than nothing. A
       // number is honest, and for the calls nobody has described yet it is
       // still the difference between `mmap()` and knowing what was asked for.
       case undefined:
-        return value === 0n ? "0" : `0x${value.toString(16)}`;
-      default: return `0x${value.toString(16)}`;
+        return paint(color,"number",value === 0n ? "0" : `0x${value.toString(16)}`);
+      default: return paint(color,"number",`0x${value.toString(16)}`);
     }
   });
   const arity = ARITY.get(number) ?? SHAPES.get(number)?.length;
@@ -119,14 +124,14 @@ export function formatCall(number, args, read, translate) {
     // real arguments, so they go.
     while (rendered.length > 0 && rendered[rendered.length - 1] === "0") rendered.pop();
   }
-  return `${syscallName(number)}(${rendered.join(", ")})`;
+  return `${paint(color,"name",syscallName(number))}(${rendered.join(", ")})`;
 }
 
 /** The result, as strace prints it: a value, or -ERRNO. */
-export function formatResult(value) {
+export function formatResult(value,color=false) {
   const signed = BigInt.asIntN(64, value);
-  if (signed >= 0n) return signed > 0xffffn ? `0x${signed.toString(16)}` : String(signed);
-  return `-${ERRNO.get(Number(-signed)) ?? -signed}`;
+  if (signed >= 0n) return paint(color,"number",signed > 0xffffn ? `0x${signed.toString(16)}` : String(signed));
+  return paint(color,"error",`-${ERRNO.get(Number(-signed)) ?? -signed}`);
 }
 
 const ERRNO = new Map([
