@@ -1,6 +1,6 @@
 {
   "name": "bunproot",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "A port of PRoot to Bun: a userspace chroot, mount --bind and binfmt_misc for Android, with no privileges required",
   "license": "GPL-2.0-or-later",
   "type": "module",
