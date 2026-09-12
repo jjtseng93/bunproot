@@ -388,6 +388,7 @@ is an argument to the guest program instead.
 | `--l2s-ignore-pin` | Enter a rootfs whose link store is pinned, which is otherwise refused. Its emulated hard links do not work while it is pinned |
 | `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
 | `--git clone [OPTION ...] REPOSITORY [DIRECTORY]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, accept Git-compatible clone arguments, clone, then exit |
+| `--x11-demo` | Open the tiny dependency-free JavaScript X11 smoke-test window |
 | `--readme` | Render this README in the terminal, with links where it has them |
 | `-h`, `--help` | The options and the debug environment variables |
 | `-V`, `--version` | The version, then exit |

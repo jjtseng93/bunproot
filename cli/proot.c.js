@@ -141,6 +141,9 @@ These run without entering a rootfs, then exit:
       isomorphic-git 1.41.9 helper in place after confirmation, wrap it in
       Git-compatible clone arguments, then exit
 
+  --x11-demo
+      open the tiny dependency-free JavaScript X11 smoke-test window
+
   --readme
       render README.md in the terminal, with hyperlinks where it has links
 
@@ -213,6 +216,10 @@ export function parseArguments(argv) {
       continue;
     }
     if (argument === "-h" || argument === "--help") return { help: true };
+    if (argument === "--x11-demo") {
+      if (argv.length!==1) throw new Error(`--x11-demo is a command of its own and takes no arguments`);
+      return { x11Demo:true };
+    }
     if (DOCUMENT_FLAGS[argument] !== undefined) return { document: DOCUMENT_FLAGS[argument] };
     const storeAction = STORE_COMMANDS[argument.split("=")[0]];
     if (storeAction !== undefined) {
@@ -506,6 +513,7 @@ export function run(argv) {
   // Only a --help before the command is ours; after it, it belongs to the guest.
   if (parsed.help) { console.log(HELP); return 0; }
   if (parsed.version) { console.log(`${pkg.name} ${pkg.version}`); return 0; }
+  if (parsed.x11Demo) return import("../test/x11-demo.js").then(()=>0);
   if (parsed.storeAction !== undefined)
     return runStoreCommand(parsed.storeRootfs, parsed.storeAction);
   if (parsed.document !== undefined) {
