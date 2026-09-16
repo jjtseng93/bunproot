@@ -346,15 +346,20 @@ options. The everyday flow is covered: `init`, `clone`, `add`, `rm`, `mv`,
 `commit`, `status`, `log`, `diff`, `branch`, `checkout`, `switch`,
 `restore`, `reset`, `tag`, `remote`, `fetch`, `pull`, `push`, `merge`,
 `cherry-pick`, `stash`, `config`, `rev-parse`, `ls-files`, `ls-remote`,
-`show-ref`, `cat-file` and `hash-object`. The global `-C <path>` and
+`show`, `show-ref`, `cat-file` and `hash-object`. The global `-C <path>` and
 `-c <name>=<value>` options work, identity comes from
 `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, the repository config or `~/.gitconfig`,
 and HTTPS credentials come from `GIT_TOKEN`/`GITHUB_TOKEN`,
 `GIT_USERNAME`/`GIT_PASSWORD` or `~/.git-credentials`; nothing prompts.
-Remotes are HTTP(S) only: there is no SSH, no local-path clone, no `rebase`
-or editor, and `commit` needs `-m` or `-F`. `fetch` follows Git 2.48 in
+Clone accepts HTTP(S), local paths and `file://` URLs. Network remotes are
+HTTP(S) only: there is no SSH or `rebase`. A commit without `-m` or `-F`
+uses `GIT_EDITOR`, `VISUAL` or `EDITOR`. `fetch` follows Git 2.48 in
 creating `refs/remotes/<remote>/HEAD` when it is missing, and honours
 `remote.<remote>.followRemoteHEAD` (`create`, `warn`, `always`, `never`).
+
+The stash command inherits isomorphic-git's narrower semantics: it stashes
+tracked files only, and apply/pop cannot abort on conflicts. Its command-line
+messages, identity lookup and reflog names are adapted to match Git.
 
 `diff` is the one command that is not isomorphic-git underneath: it writes
 the two sides being compared into a scratch directory and has `bun pm diff

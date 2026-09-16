@@ -6,12 +6,13 @@
 import * as git from "isomorphic-git";
 import http from "isomorphic-git/http/web";
 import fs from "node:fs";
-import { chmod, copyFile, lstat, mkdtemp, mkdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, cp, lstat, mkdtemp, mkdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { count, list, parse, parseClone, positiveDepth } from "./options.js";
 
 const VERSION="1.41.9";
+const EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const HINT=`Run\n\n  git config --global user.email "you@example.com"\n  git config --global user.name "Your Name"`;
 
 // ---------------------------------------------------------------- helpers
@@ -347,7 +348,10 @@ async function commitSummary(ctx,oid,parentOid,{ table=false }={}) {
 const DAYS=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 const MONTHS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 function zone(offset) {
-  const sign=offset<0||Object.is(offset,-0)?"-":"+", minutes=Math.abs(offset);
+  // isomorphic-git stores JavaScript's minutes west of UTC; Git prints the
+  // opposite direction (`getTimezoneOffset() === -480` is `+0800`). Preserve
+  // negative zero because parseDate uses it to distinguish an explicit -0000.
+  const sign=offset>0||Object.is(offset,-0)?"-":"+", minutes=Math.abs(offset);
   return `${sign}${String(Math.floor(minutes/60)).padStart(2,"0")}${String(minutes%60).padStart(2,"0")}`;
 }
 function shifted(person) { return new Date((person.timestamp-person.timezoneOffset*60)*1000); }
@@ -434,6 +438,19 @@ function cleanMessage(text) {
   while (out.at(-1)==="") out.pop();
   return out.join("\n")+"\n";
 }
+function cleanEditedMessage(text) {
+  return cleanMessage(text.split("\n").filter((line)=>!line.startsWith("#")).join("\n"));
+}
+async function editMessage(repo,initial="") {
+  const file=join(repo.gitdir,"COMMIT_EDITMSG");
+  await writeFile(file,initial||"\n# Please enter the commit message for your changes.\n");
+  const editor=process.env.GIT_EDITOR||process.env.VISUAL||process.env.EDITOR;
+  if (!editor) throw new Error("Terminal is dumb, but EDITOR unset");
+  const shell=process.env.SHELL||"/bin/sh";
+  const result=Bun.spawnSync({ cmd:[shell,"-c",`${editor} \"$@\"`,"git-editor",file], cwd:repo.dir, stdin:"inherit", stdout:"inherit", stderr:"inherit" });
+  if (result.exitCode!==0) throw new Error(`There was a problem with the editor '${editor}'.`);
+  return cleanEditedMessage(await readFile(file,"utf8"));
+}
 
 // -- remotes and authentication
 async function remoteUrl(ctx,name) {
@@ -497,8 +514,45 @@ async function clone(ctx,argv) {
   const options=parseClone(argv,ctx.cwd);
   if (!options.quiet) ctx.err(`Cloning into '${relative(ctx.cwd,options.dir)||"."}'...\n`);
   const { quiet,...cloneOptions }=options;
+  const localUrl=options.url.startsWith("file://")?decodeURIComponent(new URL(options.url).pathname):!/^\w+(?::\/\/|::)/.test(options.url)&&!/^\w+@[^:]+:/.test(options.url)?options.url:null;
+  if (localUrl!==null) return cloneLocal(ctx,{ ...cloneOptions, url:options.url, source:resolve(ctx.cwd,localUrl) });
   await git.clone({ fs, ...network(ctx,options), ...cloneOptions });
   await nativeConfig(join(options.dir,".git"));
+}
+
+async function cloneLocal(ctx,{ source,dir,url,remote="origin",ref,singleBranch,noCheckout,noTags }) {
+  const sourceGitdir=fs.existsSync(join(source,".git"))?join(source,".git"):source;
+  if (!fs.existsSync(join(sourceGitdir,"HEAD"))) throw new Error(`repository '${url}' does not exist`);
+  if (fs.existsSync(dir) && (await fs.promises.readdir(dir)).length) throw new Error(`destination path '${basename(dir)}' already exists and is not an empty directory.`);
+  await mkdir(dir,{ recursive:true });
+  const gitdir=join(dir,".git");
+  await git.init({ fs, dir, gitdir, defaultBranch:"master" });
+  await cp(join(sourceGitdir,"objects"),join(gitdir,"objects"),{ recursive:true, force:true });
+  const sourceRepo={ fs, gitdir:sourceGitdir, dir:source };
+  const sourceHead=(await readFile(join(sourceGitdir,"HEAD"),"utf8")).trim();
+  const symbolic=/^ref: refs\/heads\/(.+)$/.exec(sourceHead);
+  const branches=await git.listBranches(sourceRepo);
+  const branch=ref??symbolic?.[1]??branches[0];
+  if (!branch || !branches.includes(branch)) throw new Error(`Remote branch ${branch} not found in upstream ${remote}`);
+  for (const name of singleBranch?[branch]:branches) {
+    const oid=await git.resolveRef({ ...sourceRepo, ref:`refs/heads/${name}` });
+    await git.writeRef({ fs, gitdir, ref:`refs/remotes/${remote}/${name}`, value:oid, force:true });
+  }
+  await mkdir(join(gitdir,"refs","remotes",remote),{ recursive:true });
+  await writeFile(join(gitdir,"refs","remotes",remote,"HEAD"),`ref: refs/remotes/${remote}/${branch}\n`);
+  if (!noTags) for (const name of await git.listTags(sourceRepo)) {
+    const oid=await git.resolveRef({ ...sourceRepo, ref:`refs/tags/${name}` });
+    await git.writeRef({ fs, gitdir, ref:`refs/tags/${name}`, value:oid, force:true });
+  }
+  const oid=await git.resolveRef({ ...sourceRepo, ref:`refs/heads/${branch}` });
+  await git.writeRef({ fs, gitdir, ref:`refs/heads/${branch}`, value:oid, force:true });
+  await git.setConfig({ fs, gitdir, path:`remote.${remote}.url`, value:url });
+  await git.setConfig({ fs, gitdir, path:`remote.${remote}.fetch`, value:`+refs/heads/*:refs/remotes/${remote}/*` });
+  await git.setConfig({ fs, gitdir, path:`branch.${branch}.remote`, value:remote });
+  await git.setConfig({ fs, gitdir, path:`branch.${branch}.merge`, value:`refs/heads/${branch}` });
+  await writeFile(join(gitdir,"HEAD"),`ref: refs/heads/${branch}\n`);
+  if (!noCheckout) await git.checkout({ fs, dir, gitdir, ref:branch, force:true });
+  await nativeConfig(gitdir);
 }
 
 async function add(ctx,argv) {
@@ -583,7 +637,11 @@ async function commit(ctx,argv) {
   let message;
   if (options.message) message=cleanMessage(options.message.join("\n\n"));
   else if (options.file) message=cleanMessage(await readFile(options.file==="-"?"/dev/stdin":resolve(ctx.cwd,options.file),"utf8"));
-  else if (!options.amend) throw new Error("no commit message given; this port has no editor, use -m <message>");
+  else {
+    let initial="";
+    if (options.amend && await head(ctx)) initial=(await git.readCommit({ ...repo, oid:await head(ctx) })).commit.message;
+    message=options.noEdit&&options.amend?cleanMessage(initial):await editMessage(repo,initial);
+  }
   if (message==="\n" && !options.allowEmptyMessage) throw new Error("Aborting commit due to empty commit message.");
   const before=await head(ctx);
   const branch=await branchName(ctx);
@@ -750,7 +808,7 @@ async function log(ctx,argv) {
   const parsed=parse(argv,{
     n:["maxCount",count], "max-count":["maxCount",count], "<n>":["maxCount",count],
     oneline:"oneline", format:["format"], pretty:["format"], reverse:"reverse",
-    "no-decorate":"noDecorate", decorate:["decorate",null,true], "first-parent":"firstParent", color:"color", "no-color":"noColor", "no-pager":"noPager",
+    "no-decorate":"noDecorate", decorate:["decorate",null,true], "first-parent":"firstParent", all:"all", color:"color", "no-color":"noColor", "no-pager":"noPager",
   });
   const { options,positional }=parsed;
   if (options.color) ctx.colour=true;
@@ -761,9 +819,17 @@ async function log(ctx,argv) {
   if (paths.length===0 && refs.length>1) throw new Error("this port takes one revision and optionally one path after --");
   if (paths.length>1) throw new Error("this port follows at most one path");
   const ref=refs[0]?await revision(ctx,refs[0]):await head(ctx);
-  if (!ref) throw new Error(`your current branch '${await branchName(ctx)}' does not have any commits yet`);
+  if (!ref && !options.all) throw new Error(`your current branch '${await branchName(ctx)}' does not have any commits yet`);
   const filepath=paths[0]?await ctx.pathspec(paths[0]):undefined;
-  let commits=await git.log({ ...repo, ref, depth:filepath?undefined:options.maxCount, filepath, force:true });
+  let commits;
+  if (options.all) {
+    const tips=[];
+    for (const name of await git.listRefs({ ...repo, filepath:"refs" })) {
+      try { tips.push(await revision(ctx,`refs/${name}`,"commit")); } catch {}
+    }
+    const entries=(await Promise.all([...new Set(tips)].map((tip)=>git.log({ ...repo, ref:tip, filepath, force:true })))).flat();
+    commits=[...new Map(entries.map((entry)=>[entry.oid,entry])).values()].sort((a,b)=>b.commit.committer.timestamp-a.commit.committer.timestamp||a.oid.localeCompare(b.oid));
+  } else commits=await git.log({ ...repo, ref, depth:filepath?undefined:options.maxCount, filepath, force:true });
   if (options.maxCount!==undefined) commits=commits.slice(0,options.maxCount);
   if (options.reverse) commits.reverse();
   let format=options.format;
@@ -1276,6 +1342,7 @@ async function diff(ctx,argv) {
   const context=options.context??3;
   const blob=async (oid)=>oid?(await git.readBlob({ ...repo, oid })).blob:undefined;
   const tree=async (ref)=>{
+    if (ref===EMPTY_TREE) return new Map();
     const entries=await git.walk({ ...repo, trees:[git.TREE({ ref })], map:async (path,[entry])=>
       path!=="." && entry && await entry.type()==="blob" && within(path)?[path,{ oid:await entry.oid(), mode:(await entry.mode()).toString(8) }]:undefined });
     return new Map(entries);
@@ -1305,7 +1372,8 @@ async function diff(ctx,argv) {
     pairs.push({ path, left, right });
   };
   if (revs.length===2) {
-    const [a,b]=await Promise.all([tree(await revision(ctx,revs[0],"commit")),tree(await revision(ctx,revs[1],"commit"))]);
+    const resolveTree=async (ref)=>ref===EMPTY_TREE?ref:revision(ctx,ref,"commit");
+    const [a,b]=await Promise.all([tree(await resolveTree(revs[0])),tree(await resolveTree(revs[1]))]);
     for (const path of new Set([...a.keys(),...b.keys()])) await record(path,a.get(path),b.get(path));
   } else if (options.cached) {
     const commitOid=revs[0]?await revision(ctx,revs[0],"commit"):await head(ctx);
@@ -1550,11 +1618,15 @@ async function stash(ctx,argv) {
   if (op==="save") { op="push"; if (rest.length) options.message=[rest.join(" ")]; }
   const refIdx=rest[0]?Number(/\{(\d+)\}/.exec(rest[0])?.[1]??rest[0]):0;
   if (!["push","pop","apply","drop","list","clear"].includes(op)) throw new Error(`unknown subcommand: ${op}`);
-  if (op==="push" && !await config(ctx,"user.name")) {
+  const localName=op==="push"?await git.getConfig({ ...repo, path:"user.name" }):undefined;
+  const localEmail=op==="push"?await git.getConfig({ ...repo, path:"user.email" }):undefined;
+  let borrowedIdentity=false;
+  if (op==="push" && !localName) {
     // stash signs its commits from the repository config alone.
     const author=await identity(ctx,"committer");
     await git.setConfig({ ...repo, path:"user.name", value:author.name });
     await git.setConfig({ ...repo, path:"user.email", value:author.email });
+    borrowedIdentity=true;
   }
   const before=await head(ctx);
   let dropped;
@@ -1562,7 +1634,26 @@ async function stash(ctx,argv) {
     const reflog=(await readFile(join(repo.gitdir,"logs","refs","stash"),"utf8").catch(()=>"")).split("\n").filter(Boolean).reverse();
     dropped=reflog[refIdx]?.split(" ")[1];
   }
-  const result=await git.stash({ ...repo, op, message:options.message?.join("\n\n"), refIdx });
+  let result;
+  try { result=await git.stash({ ...repo, op, message:options.message?.join("\n\n"), refIdx }); }
+  finally {
+    if (borrowedIdentity) {
+      await git.setConfig({ ...repo, path:"user.name", value:localName });
+      await git.setConfig({ ...repo, path:"user.email", value:localEmail });
+    }
+  }
+  if (op==="push") {
+    // isomorphic-git stores `<message>: <head> <subject>` in the reflog. Git's
+    // public stash name is `On <branch>: <message>` for an explicit message.
+    const file=join(repo.gitdir,"logs","refs","stash");
+    const reflog=await readFile(file,"utf8");
+    const rows=reflog.trimEnd().split("\n");
+    const current=await branchName(ctx);
+    const message=options.message?.join("\n\n");
+    const label=message?`On ${current}: ${message}`:`WIP on ${current}: ${short(before)} ${subject((await git.readCommit({ ...repo, oid:before })).commit.message)}`;
+    rows[rows.length-1]=rows.at(-1).replace(/\t.*$/,`\t${label}`);
+    await writeFile(file,rows.join("\n")+"\n");
+  }
   if (op==="list") { for (const [index,line] of (result??[]).entries()) ctx.out(`stash@{${index}}: ${line.replace(/^\S+\s+/,"")}\n`); return; }
   if (options.quiet) return;
   if (op==="push") {
@@ -1571,6 +1662,23 @@ async function stash(ctx,argv) {
   }
   if (op==="pop" || op==="apply") ctx.out(await statusText(ctx,{}));
   if (op==="pop" || op==="drop") ctx.out(`Dropped refs/stash@{${refIdx}} (${dropped})\n`);
+}
+
+async function show(ctx,argv) {
+  const { options,positional }=parse(argv,{ stat:"stat", "no-patch":"noPatch", s:"noPatch", color:"color", "no-color":"noColor" });
+  if (positional.length>1) throw new Error("this port shows one object at a time");
+  if (options.color) ctx.colour=true;
+  if (options.noColor) ctx.colour=false;
+  const oid=await revision(ctx,positional[0]??"HEAD");
+  const repo=await base(ctx);
+  const object=await git.readObject({ ...repo, oid, format:"parsed" });
+  if (object.type!=="commit") return catFile(ctx,["-p",oid]);
+  const entry={ oid,commit:object.object };
+  ctx.out(mediumCommit(ctx,entry,ctx.decorate?await decorations(ctx):undefined));
+  if (options.noPatch) return;
+  ctx.out("\n");
+  const parent=object.object.parent[0];
+  return diff(ctx,[...(options.stat?["--stat"]:[]),parent??EMPTY_TREE,oid]);
 }
 
 async function version(ctx) {
@@ -1585,9 +1693,10 @@ export const commands={
   add:         { usage:"add [-A | -u] [-n] [-v] [--] <pathspec>...", run:add },
   rm:          { usage:"rm [--cached] [-r] [-q] [--] <pathspec>...", run:remove },
   mv:          { usage:"mv [-f] <source>... <destination>", run:move },
-  commit:      { usage:"commit [-a] [-q] [--amend] [--allow-empty] [--author=<author>] [--date=<date>] (-m <msg> | -F <file>) [--] [<pathspec>...]", run:commit },
+  commit:      { usage:"commit [-a] [-q] [--amend] [--allow-empty] [--author=<author>] [--date=<date>] [-m <msg> | -F <file>] [--] [<pathspec>...]", run:commit },
   status:      { usage:"status [-s | --porcelain] [-b] [--] [<pathspec>...]", run:status },
-  log:         { usage:"log [-n <count>] [--oneline] [--format=<format>] [--reverse] [<revision>] [-- <path>]", run:log },
+  log:         { usage:"log [--all] [-n <count>] [--oneline] [--format=<format>] [--reverse] [<revision>] [-- <path>]", run:log },
+  show:        { usage:"show [--stat | --no-patch] [<object>]", run:show },
   branch:      { usage:"branch [-a | -r] | branch <name> [<start-point>] | branch (-d | -D | -m | -M | -u <upstream>) ... | branch --show-current", run:branch },
   checkout:    { usage:"checkout [-f] [-q] <branch> | checkout -b <new-branch> [<start-point>] | checkout [<tree-ish>] -- <pathspec>...", run:checkout },
   switch:      { usage:"switch [-f] [-q] <branch> | switch -c <new-branch> [<start-point>]", run:switchBranch },

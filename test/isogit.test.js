@@ -47,7 +47,7 @@ const home=join(scratch,"home");
 const roots={ sys:join(scratch,"sys"), iso:join(scratch,"iso") };
 let clock=1700000000;
 
-function environment(step) {
+function environment(step,extra={}) {
   const date=`${clock+step} +0000`;
   return {
     ...process.env, HOME:home, XDG_CONFIG_HOME:join(home,".config"), LC_ALL:"C", LANG:"C", TZ:"UTC",
@@ -55,7 +55,7 @@ function environment(step) {
     GIT_AUTHOR_NAME:"Test Author", GIT_AUTHOR_EMAIL:"author@example.com",
     GIT_COMMITTER_NAME:"Test Committer", GIT_COMMITTER_EMAIL:"committer@example.com",
     GIT_AUTHOR_DATE:date, GIT_COMMITTER_DATE:date,
-    LD_PRELOAD:NEEDS_LINKER?TERMUX_EXEC:process.env.LD_PRELOAD??"",
+    LD_PRELOAD:NEEDS_LINKER?TERMUX_EXEC:process.env.LD_PRELOAD??"", ...extra,
   };
 }
 
@@ -63,9 +63,9 @@ function environment(step) {
 // Git only does so on a terminal; ask it for Git's terminal-sensing defaults
 // so both sides print plain text into these pipes.  A later `-c` wins, so a
 // step can still turn colour on for both.
-function launch(side,cwd,args,step) {
+function launch(side,cwd,args,step,envExtra) {
   const cmd=side==="sys"?[SYSTEM_GIT,...args]:[BUN,PROOT,"--git","-c","color.ui=auto","-c","log.decorate=auto",...args];
-  const result=spawn({ cmd, cwd, env:environment(step), stdin:"ignore", stdout:"pipe", stderr:"pipe" });
+  const result=spawn({ cmd, cwd, env:environment(step,envExtra), stdin:"ignore", stdout:"pipe", stderr:"pipe" });
   const scrub=(text)=>text.toString().split(roots.sys).join("<root>").split(roots.iso).join("<root>");
   return { stdout:scrub(result.stdout), stderr:scrub(result.stderr), status:result.exitCode };
 }
@@ -428,6 +428,54 @@ describe("bunproot --git matches the system git",()=>{
     same(["config","--global","--unset","alias.co"]);
     same(["config","--global","--list"]);
     same(["-c","user.name=Override","config","user.name"]);
+  });
+
+  it("show, log --all, the commit editor and stash match Git",()=>{
+    same(["show","--no-patch","HEAD"]);
+    same(["show","--stat","HEAD"]);
+    same(["show","HEAD"]);
+    const rootCommit=launch("sys",roots.sys,["rev-list","--max-parents=0","HEAD"],0).stdout.trim();
+    same(["show",rootCommit]);
+    same(["log","--all","--format=%H %P %s"]);
+    write("edited-message.txt","edited through an editor\n");
+    same(["add","edited-message.txt"]);
+    process.env.GIT_EDITOR="sed -i '1i editor supplied message'";
+    try { same(["commit"]); } finally { delete process.env.GIT_EDITOR; }
+    write("timezone.txt","non-UTC date\n");
+    same(["add","timezone.txt"]);
+    const dated={ GIT_AUTHOR_DATE:"1700001000 +0800", GIT_COMMITTER_DATE:"1700001000 +0800" };
+    const datedSys=launch("sys",roots.sys,["commit","-m","non-UTC date"],0,dated);
+    const datedIso=launch("iso",roots.iso,["commit","-m","non-UTC date"],0,dated);
+    expect({ status:datedIso.status,stdout:datedIso.stdout }).toEqual({ status:datedSys.status,stdout:datedSys.stdout });
+    same(["show","--no-patch","HEAD"]);
+    write("edited-message.txt","worktree stash change\n");
+    same(["stash","push","-m","temporary work"]);
+    same(["stash","list"]);
+    same(["config","--local","user.name"]);
+    same(["status","--porcelain"]);
+    const popped=both(["stash","pop"]);
+    for (const side of ["sys","iso"]) {
+      expect(popped[side].status).toBe(0);
+      expect(popped[side].stdout.replace(/\([0-9a-f]{40}\)\n$/, "(<stash-oid>)\n"))
+        .toBe(popped.sys.stdout.replace(/\([0-9a-f]{40}\)\n$/, "(<stash-oid>)\n"));
+    }
+    same(["status","--porcelain"]);
+    same(["restore","edited-message.txt"]);
+    crossCheck();
+  });
+
+  it("clones a local working repository like Git",()=>{
+    const clones={ sys:join(scratch,"local-sys"), iso:join(scratch,"local-iso") };
+    const sys=launch("sys",scratch,["clone","-q",roots.sys,clones.sys],0);
+    const iso=launch("iso",scratch,["clone","-q",roots.iso,clones.iso],0);
+    expect({ status:iso.status,stderr:iso.stderr }).toEqual({ status:sys.status,stderr:sys.stderr });
+    const describe=(dir)=>Object.fromEntries(["status --porcelain","log --all --format=%H %P %T %s","show-ref","ls-files -s","branch -a","tag","remote -v"]
+      .map((c)=>[c,launch("sys",dir,c.split(" "),0).stdout.split(roots.sys).join("<root>").split(roots.iso).join("<root>")]));
+    expect(describe(clones.iso)).toEqual(describe(clones.sys));
+    const fileClones={ sys:join(scratch,"file-sys"), iso:join(scratch,"file-iso") };
+    expect(launch("sys",scratch,["clone","-q",`file://${roots.sys}`,fileClones.sys],0).status).toBe(0);
+    expect(launch("iso",scratch,["clone","-q",`file://${roots.iso}`,fileClones.iso],0).status).toBe(0);
+    expect(describe(fileClones.iso)).toEqual(describe(fileClones.sys));
   });
 
   it("push, ls-remote, clone, fetch and pull over smart HTTP",async ()=>{
