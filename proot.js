@@ -38,7 +38,8 @@ if (process.argv[2] === "--git") {
   process.exit();
 }
 
-if (!process.env.BUN_FEATURE_FLAG_NO_ORPHANS) {
+if ( !process.env.BUN_FEATURE_FLAG_NO_ORPHANS &&
+     process.platform != 'win32' ) {
   // Drop LD_PRELOAD for the same reason the shell launcher does. The tracer
   // works with Termux's libtermux-exec loaded -- the bootstrap it spawns gets a
   // cleared environment either way -- but upstream reports exec failures on

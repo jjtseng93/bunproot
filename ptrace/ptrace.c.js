@@ -755,7 +755,7 @@ const ID_SETTING_SYSCALLS=[143,144,145,146,147,149,151,152,159];
 // The Android ids the tracer really runs as. A guest's own files are owned by
 // these, which is how fake-id0 tells them apart from everything else it can
 // see, and they are what its fake credentials translate to and from.
-const realUid=process.getuid(), realGid=process.getgid();
+const realUid=process.getuid?.(), realGid=process.getgid?.();
 
 /** The credentials a guest believes it has, mirroring the Config of
  *  src/extension/fake_id0/config.h. It starts as root -- that is what
