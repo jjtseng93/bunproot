@@ -187,8 +187,8 @@ bunproot --android-container ./empty
 From the shell inside the container, Bun can fetch an interactive
 [bunmsh](https://github.com/jjtseng93/bunmsh) shell or use bunproot's
 Git-compatible wrapper around the pure-JavaScript
-[isomorphic-git](https://isomorphic-git.org/) to clone a repository without a
-system Git:
+[isomorphic-git](https://isomorphic-git.org/) to work with a repository
+without a system Git:
 
 ```sh
 bun x bunmsh
@@ -320,22 +320,58 @@ bunproot -S ./bare /bin/bun x bunmsh
 It is not a *small* rootfs — Bun is 70-odd MiB — but it is one you can assemble
 by copying five files, with no distribution to download, unpack or trust.
 
-It can likewise [clone a Git repository without adding Git to those five
-files](#git-clone-without-system-git).
+It can likewise [use Git without adding Git to those five
+files](#git-without-system-git).
 
-## Git clone without system Git
+## Git without system Git
 
 Inside either minimal rootfs, a writable `bun x` installation can fetch
 bunproot and use [isomorphic-git](https://isomorphic-git.org/) without a
-system Git. bunproot runs isomorphic-git underneath but wraps its API in the
-usual `git clone [options] repository [directory]` CLI shape; it does not
-expose isomorphic-git's own CLI. `--git` selects this mode only when it is the
-very first bunproot argument, and the first release supports only `clone`:
+system Git. bunproot runs isomorphic-git underneath but wraps its API in
+Git's own command-line shape -- the same subcommands, options, output and
+exit statuses -- rather than exposing isomorphic-git's CLI. `--git` selects
+this mode only when it is the very first bunproot argument, which is what
+makes an alias work:
 
 ```sh
-bun x bunproot --git clone https://github.com/jjtseng93/bunproot.git
-bun x bunproot --git clone --depth 1 --branch main URL DIRECTORY
+alias git='bun x bunproot --git'
+git clone --depth 1 --branch main URL DIRECTORY
+git status
+git add . && git commit -m "message"
+git push -u origin main
 ```
+
+`git --help` prints the supported command list; `git <command> --help` its
+options. The everyday flow is covered: `init`, `clone`, `add`, `rm`, `mv`,
+`commit`, `status`, `log`, `diff`, `branch`, `checkout`, `switch`,
+`restore`, `reset`, `tag`, `remote`, `fetch`, `pull`, `push`, `merge`,
+`cherry-pick`, `stash`, `config`, `rev-parse`, `ls-files`, `ls-remote`,
+`show-ref`, `cat-file` and `hash-object`. The global `-C <path>` and
+`-c <name>=<value>` options work, identity comes from
+`GIT_AUTHOR_*`/`GIT_COMMITTER_*`, the repository config or `~/.gitconfig`,
+and HTTPS credentials come from `GIT_TOKEN`/`GITHUB_TOKEN`,
+`GIT_USERNAME`/`GIT_PASSWORD` or `~/.git-credentials`; nothing prompts.
+Remotes are HTTP(S) only: there is no SSH, no local-path clone, no `rebase`
+or editor, and `commit` needs `-m` or `-F`. `fetch` follows Git 2.48 in
+creating `refs/remotes/<remote>/HEAD` when it is missing, and honours
+`remote.<remote>.followRemoteHEAD` (`create`, `warn`, `always`, `never`).
+
+`diff` is the one command that is not isomorphic-git underneath: it writes
+the two sides being compared into a scratch directory and has `bun pm diff
+--raw --json` produce the hunks, then prints them in Git's own format
+(`index` lines, modes, hunk ranges, function context). It needs a Bun that has
+`bun pm diff`, and says so otherwise.
+
+Output is coloured with Git's palette whether or not it goes to a pipe, and
+`log` shows its decorations the same way; where Git decides by looking for a
+terminal, this port needs to be told: `--no-color`, `-c color.ui=never` or
+`NO_COLOR` for the colours, `--no-decorate` or `-c log.decorate=no` for the
+decorations, and `-c color.ui=auto` / `-c log.decorate=auto` for Git's
+terminal-sensing behaviour. `--porcelain` is never coloured.
+
+`test/isogit.test.js` runs the same command lines through this wrapper and
+through a system Git in a scratch directory and requires the output and the
+resulting repositories to agree.
 
 To reduce npm supply-chain drift, the published `tools/isomorphic-git/bun.lock`
 fixes isomorphic-git 1.41.9 and all 55 packages in its production dependency
@@ -390,7 +426,7 @@ is an argument to the guest program instead.
 | `--l2s-docs` | Render [link2symlink.md](./link2symlink.md), the on-disk format, in the terminal |
 | `--l2s-ignore-pin` | Enter a rootfs whose link store is pinned, which is otherwise refused. Its emulated hard links do not work while it is pinned |
 | `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
-| `--git clone [OPTION ...] REPOSITORY [DIRECTORY]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, accept Git-compatible clone arguments, clone, then exit |
+| `--git COMMAND [ARG ...]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, run the Git command with Git's own arguments and output, then exit. `--git --help` lists the commands |
 | `--x11-demo` | Open the tiny dependency-free JavaScript X11 smoke-test window |
 | `--readme` | Render this README in the terminal, with links where it has them |
 | `-h`, `--help` | The options and the debug environment variables |

@@ -1,6 +1,13 @@
 #!/usr/bin/env bun
+// The entry point behind `bunproot --git`: makes sure the locked isomorphic-git
+// is installed, reads Git's global options, and hands the command line to the
+// matching entry in commands.js.  Meant to sit behind
+// `alias git='bunx bunproot --git'`.
 import { existsSync, readFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { join } from "node:path";
+import { destination, parseClone } from "./options.js";
+
+export { destination, parseClone };
 
 const directory=import.meta.dir;
 const expected="1.41.9";
@@ -46,57 +53,62 @@ function install() {
     throw new Error(`could not install the locked isomorphic-git ${expected}`);
 }
 
-function value(argv,index,flag) {
-  if (index+1>=argv.length) throw new Error(`option '${flag}' requires a value`);
-  return argv[index+1];
-}
-
-export function destination(url) {
-  const clean=url.replace(/[?#].*$/,"/").replace(/\/+$/,""), tail=clean.slice(clean.lastIndexOf("/")+1);
-  const scp=tail||clean.slice(clean.lastIndexOf(":")+1);
-  return basename(scp).replace(/\.git$/i,"")||"repository";
-}
-
-export function parseClone(argv) {
-  const options={ singleBranch:false, noCheckout:false, noTags:false, quiet:false, remote:"origin" };
-  const positional=[];
-  for (let index=0, parsing=true; index<argv.length; index++) {
+// Git's own global options: the ones that change where or how a command runs.
+// Anything after the command name belongs to the command.
+export function parseGlobal(argv) {
+  const global={ overrides:{}, directories:[] };
+  let index=0;
+  for (; index<argv.length; index++) {
     const argument=argv[index];
-    if (parsing && argument==="--") { parsing=false; continue; }
-    if (!parsing || argument==="-" || !argument.startsWith("-")) { positional.push(argument); continue; }
-    if (argument==="-q" || argument==="--quiet") { options.quiet=true; continue; }
-    if (argument==="-n" || argument==="--no-checkout") { options.noCheckout=true; continue; }
-    if (argument==="--single-branch") { options.singleBranch=true; continue; }
-    if (argument==="--no-single-branch") { options.singleBranch=false; continue; }
-    if (argument==="--no-tags") { options.noTags=true; continue; }
-    if (argument==="-b" || argument==="--branch") { options.ref=value(argv,index,argument); index++; continue; }
-    if (argument.startsWith("--branch=")) { options.ref=argument.slice(9); continue; }
-    if (argument==="-o" || argument==="--origin") { options.remote=value(argv,index,argument); index++; continue; }
-    if (argument.startsWith("--origin=")) { options.remote=argument.slice(9); continue; }
-    if (argument==="--depth") { options.depth=Number(value(argv,index,argument)); index++; }
-    else if (argument.startsWith("--depth=")) options.depth=Number(argument.slice(8));
-    else throw new Error(`unknown option '${argument}'`);
-    if (!Number.isSafeInteger(options.depth) || options.depth<1)
-      throw new Error("depth must be a positive integer");
+    if (argument==="--version") return { ...global, command:"version", argv:[] };
+    if (argument==="--help" || argument==="-h") return { ...global, command:"help", argv:argv.slice(index+1) };
+    if (argument==="-C") { global.directories.push(argv[++index]??"."); continue; }
+    if (argument.startsWith("-C") && argument.length>2) { global.directories.push(argument.slice(2)); continue; }
+    if (argument==="-c") {
+      const setting=argv[++index];
+      if (setting===undefined) throw new Error("option '-c' requires a value");
+      const equals=setting.indexOf("=");
+      global.overrides[equals<0?setting:setting.slice(0,equals)]=equals<0?"true":setting.slice(equals+1);
+      continue;
+    }
+    if (argument.startsWith("-c") && argument.length>2 && argument[2]!=="-") { argv.splice(index+1,0,argument.slice(2)); continue; }
+    if (argument==="-P" || argument==="--no-pager" || argument==="--paginate" || argument==="-p" || argument==="--no-replace-objects" || argument==="--literal-pathspecs") continue;
+    if (argument.startsWith("-")) throw new Error(`unknown option: ${argument}`);
+    break;
   }
-  if (positional.length<1) throw new Error("you must specify a repository to clone");
-  if (positional.length>2) throw new Error("too many arguments");
-  return { ...options, url:positional[0], dir:resolve(positional[1]??destination(positional[0])) };
+  return { ...global, command:argv[index], argv:argv.slice(index+1) };
+}
+
+function help(commands,name) {
+  if (name && commands[name]) return `usage: git ${commands[name].usage}\n`;
+  const names=Object.keys(commands).sort();
+  return `usage: git [-C <path>] [-c <name>=<value>] <command> [<args>]\n\n`+
+    `These are the Git commands this port understands, backed by isomorphic-git ${expected}:\n\n`+
+    names.map((n)=>`   ${n.padEnd(13)}${commands[n].usage.replace(/^\S+\s*/,"")}`).join("\n")+
+    `\n\nSee 'git <command> --help' for a command's options. alias git='bunx bunproot --git'\n`;
 }
 
 export async function run(argv) {
-  if (argv[0]!=="clone") throw new Error(argv.length===0
-    ?"usage: bunproot --git clone [OPTION ...] REPOSITORY [DIRECTORY]"
-    :`'${argv[0]}' is not a supported git command; this version supports only 'clone'`);
-  const options=parseClone(argv.slice(1));
+  const global=parseGlobal([...argv]);
+  if (global.command===undefined) throw new Error(help({}).split("\n")[0].replace(/^usage: /,"usage: ")+"\n"+`use 'bunproot --git --help' for the command list`);
   install();
-  const [{ clone },{ default:http },{ default:fs }]=await Promise.all([
-    import("isomorphic-git"), import("isomorphic-git/http/web"), import("node:fs")
-  ]);
-  if (!options.quiet) console.error(`Cloning into '${options.dir}'...`);
-  const { quiet,...cloneOptions }=options;
-  await clone({ fs, http, ...cloneOptions,
-    onMessage:quiet?undefined:(message)=>process.stderr.write(message),
-  });
-  return 0;
+  const { commands,context,smudgeIndex }=await import("./commands.js");
+  if (global.command==="help") { process.stdout.write(help(commands,global.argv[0])); return 0; }
+  const command=commands[global.command];
+  if (!command) throw new Error(`'${global.command}' is not a git command this port supports. See 'git --help'.`);
+  if (global.argv.includes("--help") || global.argv.includes("-h") && !["log","status","ls-remote"].includes(global.command)) {
+    process.stdout.write(help(commands,global.command)); return 0;
+  }
+  for (const directory of global.directories) process.chdir(directory);
+  const ctx=context({ overrides:global.overrides });
+  try {
+    return (await command.run(ctx,global.argv))??0;
+  } catch (error) {
+    // A Git-level failure is reported the way Git reports it, with Git's
+    // exit status; only the wrapper's own problems propagate to the caller.
+    process.stderr.write(`${error.prefix??"fatal"}: ${error.message}\n`);
+    return error.exitCode??128;
+  } finally {
+    if (ctx.opened()) await smudgeIndex(ctx.opened().gitdir);
+  }
 }

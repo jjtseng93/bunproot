@@ -20,6 +20,19 @@ Covers argument and binding parsing, guest path canonicalization, the
 link2symlink on-disk format, `#!` expansion including the `env` search, and ELF
 `PT_INTERP` reading. Fast, no rootfs needed, so run it first.
 
+`test/isogit.test.js` is the exception to "fast": it drives `bunproot --git`
+and the system `git` through the same command lines in a scratch directory and
+requires their output, exit statuses and resulting repositories -- as read back
+by the system git -- to agree. It needs `git` on `PATH` and the locked
+isomorphic-git already installed under `tools/isomorphic-git`, and skips itself
+otherwise. Its push, fetch and pull steps go to bare repositories it creates in
+that scratch directory behind a local `git http-backend`; the only outside
+contact is a read-only clone of github.com/jjtseng93/bunmsh, skipped when the
+host is unreachable. `HOME` is redirected for the duration, so no real
+credentials or `~/.gitconfig` are involved. The port follows Git 2.48 in
+creating `refs/remotes/<remote>/HEAD` on fetch; against an older system Git
+that one ref is excluded from the repository comparison.
+
 ## Integration checks
 
 Each line names what breaks when it fails, so a red one points somewhere.
