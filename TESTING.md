@@ -31,7 +31,13 @@ contact is a read-only clone of github.com/jjtseng93/bunmsh, skipped when the
 host is unreachable. `HOME` is redirected for the duration, so no real
 credentials or `~/.gitconfig` are involved. The port follows Git 2.48 in
 creating `refs/remotes/<remote>/HEAD` on fetch; against an older system Git
-that one ref is excluded from the repository comparison.
+that one ref is excluded from the repository comparison. On Termux, where a
+process without libtermux-exec preloaded cannot exec anything from the app's
+data directory, the test notices that `LD_PRELOAD=` took the library away and
+routes its own spawns through `/system/bin/linker64` while handing the
+library back to the children, so the `LD_PRELOAD= bun test` above still covers
+it. The 2026-09-17 native run passed all 11 cases both ways against Git
+2.54.0 and Bun 1.4.2.
 
 ## Integration checks
 

@@ -1211,7 +1211,7 @@ async function materialize(root,files) {
   }
 }
 function bunDiff(left,right,context) {
-  const result=Bun.spawnSync({ cmd:[BUN(),"pm","diff","--raw","--json","-U",String(context),left,right], stdout:"pipe", stderr:"pipe", env:{ ...process.env, LD_PRELOAD:"" } });
+  const result=Bun.spawnSync({ cmd:[BUN(),"pm","diff","--raw","--json","-U",String(context),left,right], stdout:"pipe", stderr:"pipe" });
   const text=result.stdout.toString();
   if (result.exitCode!==0 || !text.startsWith("{"))
     throw new Error(`git diff needs a Bun with 'bun pm diff' (running ${Bun.version}): ${result.stderr.toString().trim().split("\n")[0]}`);

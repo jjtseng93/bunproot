@@ -21,6 +21,27 @@ const SYSTEM_GIT=Bun.which("git");
 const INSTALLED=existsSync(resolve(import.meta.dir,"../tools/isomorphic-git/node_modules/isomorphic-git/package.json"));
 const BUNMSH="https://github.com/jjtseng93/bunmsh";
 
+// Termux on recent Android cannot exec a binary from the app's data
+// directory directly; libtermux-exec rewrites every exec to go through the
+// system linker.  `LD_PRELOAD= bun test`, which the tracer's tests need, drops
+// that from this process, so its own spawns fall back to the same trick, and
+// the children get the library back so that Git's helper processes work.
+const LINKER="/system/bin/linker64";
+const TERMUX_EXEC=join(process.env.PREFIX||"/data/data/com.termux/files/usr","lib","libtermux-exec.so");
+// True only where a plain spawn is refused: not inside a glibc PRoot, where
+// the Termux prefix may be visible but its bionic library must not be loaded.
+const NEEDS_LINKER=(()=>{
+  try { Bun.spawnSync({ cmd:[BUN,"--version"], stdout:"pipe", stderr:"pipe" }); return false; }
+  catch (error) { return error.code==="EACCES" && existsSync(LINKER) && existsSync(TERMUX_EXEC); }
+})();
+function spawn(options) {
+  try { return Bun.spawnSync(options); }
+  catch (error) {
+    if (error.code!=="EACCES" || !NEEDS_LINKER) throw error;
+    return Bun.spawnSync({ ...options, cmd:[LINKER,...options.cmd] });
+  }
+}
+
 const scratch=mkdtempSync(join(tmpdir(),"isogit-"));
 const home=join(scratch,"home");
 const roots={ sys:join(scratch,"sys"), iso:join(scratch,"iso") };
@@ -34,7 +55,7 @@ function environment(step) {
     GIT_AUTHOR_NAME:"Test Author", GIT_AUTHOR_EMAIL:"author@example.com",
     GIT_COMMITTER_NAME:"Test Committer", GIT_COMMITTER_EMAIL:"committer@example.com",
     GIT_AUTHOR_DATE:date, GIT_COMMITTER_DATE:date,
-    LD_PRELOAD:"",
+    LD_PRELOAD:NEEDS_LINKER?TERMUX_EXEC:process.env.LD_PRELOAD??"",
   };
 }
 
@@ -44,7 +65,7 @@ function environment(step) {
 // step can still turn colour on for both.
 function launch(side,cwd,args,step) {
   const cmd=side==="sys"?[SYSTEM_GIT,...args]:[BUN,PROOT,"--git","-c","color.ui=auto","-c","log.decorate=auto",...args];
-  const result=Bun.spawnSync({ cmd, cwd, env:environment(step), stdin:"ignore", stdout:"pipe", stderr:"pipe" });
+  const result=spawn({ cmd, cwd, env:environment(step), stdin:"ignore", stdout:"pipe", stderr:"pipe" });
   const scrub=(text)=>text.toString().split(roots.sys).join("<root>").split(roots.iso).join("<root>");
   return { stdout:scrub(result.stdout), stderr:scrub(result.stderr), status:result.exitCode };
 }
@@ -133,7 +154,13 @@ const server=Bun.serve({ port:0, hostname:"127.0.0.1", async fetch(request) {
 console.log(server.port);
 `;
 async function serve(root) {
-  const child=Bun.spawn({ cmd:[BUN,"-e",SERVER], stdout:"pipe", stderr:"inherit", env:{ ...process.env, LD_PRELOAD:"", ISOGIT_ROOT:root, ISOGIT_GIT:SYSTEM_GIT } });
+  const env={ ...environment(0), ISOGIT_ROOT:root, ISOGIT_GIT:SYSTEM_GIT };
+  let child;
+  try { child=Bun.spawn({ cmd:[BUN,"-e",SERVER], stdout:"pipe", stderr:"inherit", env }); }
+  catch (error) {
+    if (error.code!=="EACCES" || !NEEDS_LINKER) throw error;
+    child=Bun.spawn({ cmd:[LINKER,BUN,"-e",SERVER], stdout:"pipe", stderr:"inherit", env });
+  }
   const reader=child.stdout.getReader();
   let text="";
   while (!text.includes("\n")) {
@@ -361,7 +388,7 @@ describe("bunproot --git matches the system git",()=>{
     same(["add","colour.txt"]);
     same(["tag","v3"]);
     // Without the terminal-sensing defaults launch() adds, the pipe still gets colour.
-    const raw=(...args)=>Bun.spawnSync({ cmd:[BUN,PROOT,"--git",...args], cwd:roots.iso, env:environment(0), stdout:"pipe", stderr:"pipe" }).stdout.toString();
+    const raw=(...args)=>spawn({ cmd:[BUN,PROOT,"--git",...args], cwd:roots.iso, env:environment(0), stdout:"pipe", stderr:"pipe" }).stdout.toString();
     const bare=raw("status","-s");
     expect(bare).not.toBe(Bun.stripANSI(bare));
     expect(Bun.stripANSI(bare)).toBe(launch("sys",roots.sys,["status","-s"],0).stdout);
