@@ -86,12 +86,17 @@ export function parseGlobal(argv) {
   return { ...global, command:argv[index], argv:argv.slice(index+1) };
 }
 
+// The everyday commands first, then the rest; both in alphabetical order,
+// the way README.md lists them.
+const EVERYDAY=["add","branch","checkout","clone","commit","config","diff","fetch","init","log","merge","mv","pull","push","remote","reset","restore","rm","show","stash","status","switch","tag"];
 function help(commands,name) {
   if (name && commands[name]) return `usage: git ${commands[name].usage}\n`;
-  const names=Object.keys(commands).sort();
+  const usage=(n)=>`   ${n.padEnd(13)}${commands[n].usage.replace(/^\S+\s*/,"")}`;
+  const everyday=EVERYDAY.filter((n)=>commands[n]);
+  const rest=Object.keys(commands).filter((n)=>!EVERYDAY.includes(n)).sort();
   return `usage: git [--yes] [-C <path>] [-c <name>=<value>] <command> [<args>]\n\n`+
-    `These are the Git commands this port understands, backed by isomorphic-git ${expected}:\n\n`+
-    names.map((n)=>`   ${n.padEnd(13)}${commands[n].usage.replace(/^\S+\s*/,"")}`).join("\n")+
+    `These are the Git commands this port understands, backed by isomorphic-git ${expected}.\n\nThe everyday ones:\n\n`+
+    everyday.map(usage).join("\n")+`\n\nLess often:\n\n`+rest.map(usage).join("\n")+
     `\n\nSee 'git <command> --help' for a command's options and 'git --readme' for the guide. alias git='bunx bunproot --git'\n`;
 }
 

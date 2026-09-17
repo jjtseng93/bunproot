@@ -30,48 +30,90 @@ git --version | --help | --readme
 
 ## Commands
 
-```text
-init          [-q] [--bare] [-b <branch>] [<directory>]
-clone         [--depth <n> | --shallow-since <date>] [--shallow-exclude <ref>] [-b <branch>] [--single-branch] [--no-tags] [-n] [-q] <repository> [<directory>]
-add           [-A | -u] [-n] [-v] [--] <pathspec>...
-rm            [--cached] [-r] [-q] [--] <pathspec>...
-mv            [-f] <source>... <destination>
-commit        [-a] [-q] [--amend] [--reset-author] [--allow-empty] [--author=<author>] [--date=<date>] [-m <msg> | -F <file>] [--] [<pathspec>...]
-status        [-s | --porcelain] [-b] [--ignored] [--] [<pathspec>...]
-log           [--all] [-n <count>] [--oneline] [--format=<format>] [--since=<date>] [--follow] [--reverse] [<revision> | <rev>..<rev> | <rev>...<rev>] [-- <path>]
-show          [--stat | --no-patch] [--oneline] [<object>]
-diff          [--cached] [--check | --stat | --name-only | --name-status] [-U<n>] [--exit-code] [--no-renames] [<commit> [<commit>] | <commit>..<commit> | <commit>...<commit>] [--] [<path>...]
-diff          --no-index [<options>] <path> <path>
-branch        [-a | -r] | <name> [<start-point>] | (-d | -D | -m | -M | -u <upstream>) ... | --show-current
-checkout      [-f] [-q] <branch> | -b <new-branch> [<start-point>] | [<tree-ish>] -- <pathspec>...
-switch        [-f] [-q] <branch> | -c <new-branch> [<start-point>]
-restore       [--staged] [--worktree] [--source=<tree-ish>] [--] <pathspec>...
-reset         [--soft | --mixed | --hard] [-q] [<commit>] | [<tree-ish>] [--] <pathspec>...
-tag           [-l [<pattern>]] | [-a] [-m <msg>] [-f] <tagname> [<commit>] | -d <tagname>...
-merge         [--no-ff | --ff-only] [-m <msg>] [--allow-unrelated-histories] <commit> | --abort
-cherry-pick   [-n] <commit> | (--continue | --skip | --abort)
-stash         [push [-m <msg>] | pop [<n>] | apply [<n>] | drop [<n>] | list | clear]
-remote        [-v] | add <name> <url> | remove <name> | get-url <name> | set-url <name> <url>
-fetch         [--depth <n> | --deepen <n> | --shallow-since <date>] [--shallow-exclude <ref>] [--tags] [-p] [-q] [--all] [<remote> [<branch>]]
-pull          [--ff-only | --no-ff] [-q] [<remote> [<branch>]]
-push          [-u] [-f] [-d] [--tags] [--all] [-q] [<remote> [<refspec>...]]
-ls-remote     [--heads] [--tags] [--refs] [--symref] [--exit-code] [<remote or url> [<pattern>...]]
-config        [--global | --local] <name> [<value>] | --get <name> | --unset <name> | --list | --add <name> <value>
-rev-parse     [--short] [--abbrev-ref] [--verify] <revision>... | --show-toplevel | --git-dir | --is-inside-work-tree | --show-prefix
-ls-files      [-s] [-o] [-z] [--full-name] [--] [<path>...]
-show-ref      [--heads] [--tags] [-d] [-s] [<pattern>...]
-check-ignore  [-q] [--no-index] <pathname>...
-merge-base    [-a] <commit> <commit>... | --is-ancestor <commit> <commit>
-notes         [--ref <notes-ref>] [list | show | add | append | copy | remove | prune | get-ref] [-m <msg> | -F <file>] [--allow-empty] ...
-cat-file      (-t | -s | -e | -p) <object>
-hash-object   [-t <type>] [-w] [--stdin | --stdin-paths | <file>...]
-write-tree
-mktree        [-z] [--missing] [--batch]
-commit-tree   <tree> [-p <parent>]... [-m <message> | -F <file>]...
-mktag
-update-ref    [-m <reason>] <refname> <new-oid> [<old-oid>] | -d <refname> [<old-oid>] | --stdin
-version
-```
+The everyday commands first, then the rest, each in alphabetical order. A
+sub-item gives the option or behaviour worth knowing; `git <command> --help`
+prints the same usage line.
+
+- `add [-A | -u] [-n] [-v] [--] <pathspec>...`
+- `branch [-a | -r] | branch <name> [<start-point>] | branch (-d | -D | -m | -M | -u <upstream>) ... | branch --show-current`
+- `checkout [-f] [-q] <branch> | checkout -b <new-branch> [<start-point>] | checkout [<tree-ish>] -- <pathspec>...`
+  - Staged and unstaged changes are carried across a switch, or refused
+    with Git's messages when they would be overwritten; `-f` discards them.
+    The changes carried across are listed as Git lists them.
+- `clone [--depth <n> | --shallow-since <date>] [--shallow-exclude <ref>] [-b <branch>] [--single-branch] [--no-tags] [-n] [-q] [--progress] <repository> [<directory>]`
+  - HTTP(S), local paths and `file://` URLs.
+- `commit [-a] [-q] [--amend] [--reset-author] [--allow-empty] [--author=<author>] [--date=<date>] [-m <msg> | -F <file>] [--] [<pathspec>...]`
+  - Without `-m`/`-F` the message comes from `GIT_EDITOR`, `VISUAL` or
+    `EDITOR`. `--amend` keeps the original author unless `--reset-author`,
+    `--author` or `--date` says otherwise. With `MERGE_HEAD` or
+    `CHERRY_PICK_HEAD` present the prepared message and parents are used
+    (`--no-edit` keeps the message's comments, as Git does); unmerged paths
+    are refused.
+- `config [--global | --local] <name> [<value>] | config --get <name> | config --unset <name> | config --list | config --add <name> <value>`
+- `diff [--cached] [--check | --stat | --name-only | --name-status] [-U<n>] [--exit-code] [--no-renames] [<commit> [<commit>] | <commit>..<commit> | <commit>...<commit>] [--] [<path>...]`
+- `diff --no-index [<options>] <path> <path>`
+  - File/file and directory/directory; one file against one directory is
+    not implemented.
+- `fetch [--depth <n> | --deepen <n> | --shallow-since <date>] [--shallow-exclude <ref>] [--tags] [-p] [-q] [--all] [--progress] [<remote> [<branch>]]`
+  - Reports the refs it moved the way Git does, and nothing when nothing
+    moved. Follows Git 2.48 in creating `refs/remotes/<remote>/HEAD` when it
+    is missing, under `remote.<remote>.followRemoteHEAD`.
+- `init [-q] [--bare] [-b <branch>] [<directory>]`
+- `log [--all] [-n <count>] [--oneline] [--format=<format>] [--since=<date>] [--follow] [--reverse] [<revision> | <rev>..<rev> | <rev>...<rev>] [-- <path>]`
+  - `--format` takes the common placeholders and `%xNN`; `format:` and
+    `tformat:` differ in their final newline as in Git.
+- `merge [--no-ff | --ff-only] [-m <msg>] [--allow-unrelated-histories] <commit> | merge --abort`
+  - See [Where the port goes beyond a thin wrapper](#where-the-port-goes-beyond-a-thin-wrapper).
+- `mv [-f] <source>... <destination>`
+- `pull [--ff-only | --no-ff] [-q] [--progress] [<remote> [<branch>]]`
+  - A fetch followed by a merge; there is no `--rebase`.
+- `push [-u] [-f] [-d] [--tags] [--all] [-q] [--progress] [<remote> [<refspec>...]]`
+- `remote [-v] | remote add <name> <url> | remote remove <name> | remote get-url <name> | remote set-url <name> <url>`
+- `reset [--soft | --mixed | --hard] [-q] [<commit>] | reset [<tree-ish>] [--] <pathspec>...`
+- `restore [--staged] [--worktree] [--source=<tree-ish>] [--] <pathspec>...`
+- `rm [--cached] [-r] [-q] [--] <pathspec>...`
+- `show [--stat | --no-patch] [--oneline] [<object>]`
+  - One object: a commit with its patch or stat, an annotated tag before
+    what it points to, a blob or tree as `cat-file -p` prints it. A shallow
+    clone's boundary commit is shown as a root commit.
+- `stash [push [-m <msg>] | pop [<n>] | apply [<n>] | drop [<n>] | list | clear]`
+  - Tracked files only, and apply/pop cannot abort on conflicts.
+- `status [-s | --porcelain] [-b] [--ignored] [--] [<pathspec>...]`
+  - Paths are relative to the current directory except with `--porcelain`;
+    a merge in progress is reported with its unmerged paths.
+- `switch [-f] [-q] <branch> | switch -c <new-branch> [<start-point>]`
+  - The same rules as `checkout`.
+- `tag [-l [<pattern>]] | tag [-a] [-m <msg>] [-f] <tagname> [<commit>] | tag -d <tagname>...`
+
+Less often:
+
+- `cat-file (-t | -s | -e | -p) <object>`
+- `check-ignore [-q] [--no-index] <pathname>...`
+- `cherry-pick [-n] <commit> | cherry-pick (--continue | --skip | --abort)`
+  - Single-parent commits. Keeps the picked author; a conflict leaves
+    `CHERRY_PICK_HEAD` and Git's markers, then `--continue` commits.
+- `commit-tree <tree> [-p <parent>]... [-m <message> | -F <file>]...`
+  - The message may also come from stdin.
+- `hash-object [-t <type>] [-w] [--stdin | --stdin-paths | <file>...]`
+  - No attributes or clean filters, no `--path`.
+- `ls-files [-s] [-o] [-z] [--full-name] [--] [<path>...]`
+  - The current directory's subtree, relative to it, unless `--full-name`;
+    `-s` lists conflict stages.
+- `ls-remote [--heads] [--tags] [--refs] [--symref] [--exit-code] [<remote or url> [<pattern>...]]`
+- `merge-base [-a] <commit> <commit>... | merge-base --is-ancestor <commit> <commit>`
+- `mktag`
+  - Reads the tag object from stdin; not every native fsck diagnostic is
+    reproduced.
+- `mktree [-z] [--missing] [--batch]`
+- `notes [--ref <notes-ref>] [list | show | add | append | copy | remove | prune | get-ref] [-m <msg> | -F <file>] [--allow-empty] ...`
+  - No `edit` or `merge`. Notes commits carry Git's messages.
+- `rev-parse [--short] [--abbrev-ref] [--verify] <revision>... | rev-parse --show-toplevel | --git-dir | --is-inside-work-tree | --show-prefix`
+- `show-ref [--heads] [--tags] [-d] [-s] [<pattern>...]`
+- `update-ref [-m <reason>] <refname> <new-oid> [<old-oid>] | update-ref -d <refname> [<old-oid>] | update-ref --stdin`
+  - `--stdin` understands update, create, delete and verify; no
+    transactions, quoting or `-z`.
+- `version`
+- `write-tree`
 
 Revisions are `HEAD`, a ref, a full or abbreviated id, or any of those with
 `~N`, `^N` and `^{}` suffixes. The plumbing commands accept their common

@@ -524,42 +524,110 @@ system Git. bunproot wraps isomorphic-git in Git's own command-line shape --
 subcommands, options, output and exit statuses -- as a deliberately useful
 subset. `--git` selects this mode only when it is the very first bunproot
 argument, which is what makes an alias work. Every command it understands,
-in one sitting:
+the everyday ones first:
 
 ```sh
 alias git='bun x bunproot --git'
-git --yes --version              # --yes installs the locked isomorphic-git without asking
-git clone --depth 1 -b main https://github.com/jjtseng93/jsmdcui && cd jsmdcui
-git config user.name Me && git config user.email me@example.com && git config --get user.name
-git status -s && git log --oneline -3 && git show --stat HEAD && git rev-parse --short HEAD
-git switch -c feature && git branch --show-current && git branch -a
-echo hello > hello.txt && git add hello.txt && git commit -m "add hello"
-git mv hello.txt hi.txt && git commit -am rename && git commit --amend --no-edit
-git diff main --stat && git diff main...feature --name-status && git log --oneline main..feature
-echo more >> hi.txt && git diff && git stash push -m wip && git stash list && git stash pop
-git restore hi.txt && git rm -q hi.txt && git restore --staged hi.txt && git checkout -- hi.txt
-git tag -a v1 -m first && git tag -l "v*" && git show v1 -s && git show-ref --tags
-git checkout main && git cherry-pick feature~1 && git reset -q --hard HEAD~1 && git merge feature
-git merge-base main feature && git ls-files -s && git branch -d feature   # merge --abort undoes a conflict
-git remote -v && git fetch --all && git pull --ff-only && git ls-remote --heads origin
-git push -u origin main          # HTTPS only; the token comes from GIT_TOKEN or ~/.git-credentials
-git notes add -m note HEAD && git notes show HEAD && git check-ignore -q node_modules; echo $?
-git cat-file -p HEAD^{} | head -3 && git hash-object -w hi.txt && git write-tree
-git update-ref refs/heads/backup HEAD && git commit-tree $(git write-tree) -p HEAD -m plumbed
-git mktree </dev/null && git cat-file -p v1 | git mktag
-git init -q ../scratch && git -C ../scratch status && git -c color.ui=never log --all --format="%h %s" -2
-git --readme | less
 ```
 
+- `git add hello.txt`, `git add -A`
+  - `-u` for tracked files only, `-n` to see what would be added.
+- `git branch`, `git branch -a`, `git branch --show-current`
+  - `-d`/`-D` delete, `-m` renames, `-u origin/main` sets the upstream.
+- `git checkout main`, `git checkout -b feature`, `git checkout -- hi.txt`
+  - Staged and unstaged changes are carried across a switch, or refused
+    when they would be overwritten; `-f` discards them.
+- `git clone --depth 1 -b main https://github.com/jjtseng93/jsmdcui`
+  - HTTP(S), local paths and `file://` URLs; `--depth`, `--shallow-since`,
+    `--shallow-exclude`, `--single-branch`, `--no-tags`.
+- `git commit -m "add hello"`, `git commit -am rename`,
+  `git commit --amend --no-edit`
+  - Without `-m`/`-F` the message comes from `GIT_EDITOR`, `VISUAL` or
+    `EDITOR`; `--amend` keeps the original author unless `--reset-author`,
+    `--author` or `--date` says otherwise. During a merge or cherry-pick the
+    prepared message and parents are used.
+- `git config user.name Me`, `git config --get user.name`
+  - `--global` writes `~/.gitconfig`; identity may also come from
+    `GIT_AUTHOR_*`/`GIT_COMMITTER_*`.
+- `git diff`, `git diff --cached`, `git diff main --stat`,
+  `git diff main...feature --name-status`
+  - Runs on `bun pm diff` and pairs exact renames; `--check`, `--name-only`,
+    `-U<n>`, `--exit-code`, `--no-index`.
+- `git fetch`, `git fetch --all`, `git fetch origin main`
+  - Reports the refs it moved like Git; `--depth`, `--deepen`,
+    `--shallow-since`, `--shallow-exclude`, `--tags`, `-p`.
+- `git init -q ../scratch`
+  - `--bare`, `-b <branch>`.
+- `git log --oneline -3`, `git log --oneline main..feature`,
+  `git -c color.ui=never log --all --format="%h %s" -2`
+  - `--format`, `--since`, `--follow`, `--reverse`, `A..B` and `A...B`.
+    Output is coloured and decorated even in a pipe; `-c color.ui=auto`,
+    `--no-color`, `NO_COLOR` or `--no-decorate` turn that off.
+- `git merge feature`, `git merge --no-ff feature`, `git merge --abort`
+  - Lands in the index and worktree and leaves unrelated local changes
+    alone; a conflict leaves `MERGE_HEAD`, Git's markers and an unmerged
+    `status`, then `git add` and `git commit` conclude it.
+- `git mv hello.txt hi.txt`
+- `git pull`, `git pull --ff-only origin main`
+  - A fetch followed by a merge; there is no `--rebase`.
+- `git push -u origin main`, `git push --tags`, `git push -d origin old`
+  - Network remotes are HTTP(S) only, no SSH. Credentials come from
+    `GIT_TOKEN`/`GITHUB_TOKEN`, `GIT_USERNAME`/`GIT_PASSWORD` or
+    `~/.git-credentials`; nothing ever prompts.
+- `git remote -v`, `git remote add upstream URL`, `git remote set-url origin URL`
+- `git reset --hard HEAD`, `git reset --soft HEAD~1`, `git reset hi.txt`
+- `git restore hi.txt`, `git restore --staged hi.txt`
+  - `--source=<tree-ish>` restores from a commit instead of the index.
+- `git rm -q hi.txt`, `git rm --cached hi.txt`
+- `git show --stat HEAD`, `git show v1 -s`
+  - An annotated tag is shown before what it points to; a shallow clone's
+    boundary commit as a root commit.
+- `git stash push -m wip`, `git stash list`, `git stash pop`
+  - Tracked files only, and apply/pop cannot abort on conflicts.
+- `git status -s`, `git status`
+  - `-b`, `--porcelain`, `--ignored`; paths are relative to the current
+    directory except with `--porcelain`.
+- `git switch main`, `git switch -c feature`
+  - The same rules as `checkout`.
+- `git tag -a v1 -m first`, `git tag -l "v*"`, `git tag -d v1`
+
+Less often, in the same alphabetical order:
+
+- `git cat-file -p HEAD^{}`, `git cat-file -t v1`
+- `git check-ignore -q node_modules`
+- `git cherry-pick feature~1`, `git cherry-pick -n feature`
+  - Keeps the picked author; a conflict follows the same course as a merge,
+    with `--continue`, `--skip` and `--abort`.
+- `git commit-tree $(git write-tree) -p HEAD -m plumbed`
+- `git hash-object -w hi.txt`
+  - `--stdin` and `--stdin-paths` too.
+- `git ls-files`, `git ls-files -s`, `git ls-files -o`
+  - The current directory's subtree, relative to it, unless `--full-name`.
+- `git ls-remote --heads origin`
+  - `--tags`, `--refs`, `--symref`, `--exit-code`.
+- `git merge-base main feature`, `git merge-base --is-ancestor main feature`
+- `git mktag < tag.txt`
+- `git mktree </dev/null`, `git mktree --batch`
+- `git notes add -m note HEAD`, `git notes show HEAD`, `git notes list`,
+  `git notes append`, `git notes copy`, `git notes remove`, `git notes prune`
+  - `--ref <notes-ref>` selects another notes namespace.
+- `git rev-parse --short HEAD`, `git rev-parse --show-toplevel`,
+  `git rev-parse --abbrev-ref HEAD`
+- `git show-ref --tags`, `git show-ref --heads`
+- `git update-ref refs/heads/backup HEAD`, `git update-ref -d refs/heads/backup`
+  - `--stdin` understands update, create, delete and verify.
+- `git version`, `git --version`
+- `git write-tree`
+
+The global options go before the command: `git --yes ...` installs the locked
+isomorphic-git without asking (later runs reuse it), `git -C <path> ...` runs
+elsewhere, `git -c <name>=<value> ...` sets a value for one run.
 `git --help` prints the command list, `git <command> --help` one command's
 options, and `git --readme` prints the full guide,
-[`tools/isomorphic-git/README.md`](./tools/isomorphic-git/README.md): global
-options, every command's options, identity and credentials, remotes, what the
-port adds on top of isomorphic-git (branch switches and merges that carry
-local changes, conflicts with Git's `MERGE_HEAD` state, exact renames, `diff`
-through `bun pm diff`), the known limits, colour handling, and the
-supply-chain notes behind the locked install and its `Install now? (Y/n)`
-prompt.
+[`tools/isomorphic-git/README.md`](./tools/isomorphic-git/README.md): every
+command's options, what the port adds on top of isomorphic-git, the known
+limits, and the supply-chain notes behind the locked install and its
+`Install now? (Y/n)` prompt.
 
 ## Use with js-udocker
 

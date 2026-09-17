@@ -2537,7 +2537,7 @@ async function version(ctx) {
 
 export const commands={
   init:        { usage:"init [-q] [--bare] [-b <branch>] [<directory>]", run:init },
-  clone:       { usage:"clone [--depth <n> | --shallow-since <date>] [--shallow-exclude <ref>] [-b <branch>] [--single-branch] [--no-tags] [-n] [-q] <repository> [<directory>]", run:clone },
+  clone:       { usage:"clone [--depth <n> | --shallow-since <date>] [--shallow-exclude <ref>] [-b <branch>] [--single-branch] [--no-tags] [-n] [-q] [--progress] <repository> [<directory>]", run:clone },
   add:         { usage:"add [-A | -u] [-n] [-v] [--] <pathspec>...", run:add },
   rm:          { usage:"rm [--cached] [-r] [-q] [--] <pathspec>...", run:remove },
   mv:          { usage:"mv [-f] <source>... <destination>", run:move },
@@ -2552,9 +2552,9 @@ export const commands={
   reset:       { usage:"reset [--soft | --mixed | --hard] [-q] [<commit>] | reset [<tree-ish>] [--] <pathspec>...", run:reset },
   tag:         { usage:"tag [-l [<pattern>]] | tag [-a] [-m <msg>] [-f] <tagname> [<commit>] | tag -d <tagname>...", run:tag },
   remote:      { usage:"remote [-v] | remote add <name> <url> | remote remove <name> | remote get-url <name> | remote set-url <name> <url>", run:remote },
-  fetch:       { usage:"fetch [--depth <n> | --deepen <n> | --shallow-since <date>] [--shallow-exclude <ref>] [--tags] [-p] [-q] [--all] [<remote> [<branch>]]", run:fetch },
-  pull:        { usage:"pull [--ff-only | --no-ff] [-q] [<remote> [<branch>]]", run:pull },
-  push:        { usage:"push [-u] [-f] [-d] [--tags] [--all] [-q] [<remote> [<refspec>...]]", run:push },
+  fetch:       { usage:"fetch [--depth <n> | --deepen <n> | --shallow-since <date>] [--shallow-exclude <ref>] [--tags] [-p] [-q] [--all] [--progress] [<remote> [<branch>]]", run:fetch },
+  pull:        { usage:"pull [--ff-only | --no-ff] [-q] [--progress] [<remote> [<branch>]]", run:pull },
+  push:        { usage:"push [-u] [-f] [-d] [--tags] [--all] [-q] [--progress] [<remote> [<refspec>...]]", run:push },
   merge:       { usage:"merge [--no-ff | --ff-only] [-m <msg>] [--allow-unrelated-histories] <branch> | merge --abort", run:merge },
   diff:        { usage:"diff [--cached] [--check | --stat | --name-only | --name-status] [-U<n>] [--exit-code] [--no-renames] [<commit> [<commit>] | <commit>..<commit> | <commit>...<commit>] [--] [<path>...] | diff --no-index [<options>] <path> <path>", run:diff },
   "check-ignore":{ usage:"check-ignore [-q] [--no-index] <pathname>...", run:checkIgnore },

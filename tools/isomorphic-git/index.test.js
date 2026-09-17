@@ -42,12 +42,13 @@ test("the option parser follows Git's conventions", () => {
   expect(()=>parse(["-m"],spec)).toThrow("requires a value");
 });
 
-test("--readme prints the guide next to the wrapper", () => {
+test("--readme prints the guide next to the wrapper", async () => {
+  const { commands }=await import("./commands.js");
   expect(parseGlobal(["--readme","ignored"])).toMatchObject({ command:"readme", argv:[] });
   const text=readme();
   expect(text.startsWith("# bunproot --git\n")).toBe(true);
-  // Every command the wrapper dispatches is listed in the guide's reference.
+  // Every command the wrapper dispatches has its own entry in the guide.
   const reference=text.slice(text.indexOf("## Commands"),text.indexOf("## A walk through"));
-  for (const name of ["init","clone","add","commit","diff","merge","stash","ls-files","update-ref","mktag"])
-    expect(reference).toMatch(new RegExp(`^${name}\\b`,"m"));
+  for (const name of Object.keys(commands))
+    expect(reference).toMatch(new RegExp(`^- \`${name}\\b`,"m"));
 });
