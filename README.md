@@ -12,6 +12,7 @@ Linux rootfs you supply. It can be an [empty directory](#a-rootfs-can-be-zero-fi
 that borrows Android's system files, or a self-contained rootfs assembled from
 as few as [five files](#a-rootfs-can-be-five-files).
 
+- Source: [github.com/jjtseng93/bunproot](https://github.com/jjtseng93/bunproot)
 - [Table of contents](#contents)
 - [link2symlink format and recovery](./link2symlink.md)
 
@@ -66,7 +67,9 @@ Licensed **GPL-2.0-or-later**, inherited as a derivative work of PRoot.
 
 ## Quick start
 
-bunproot needs a Bun built for Android/bionic, and how you get one depends on
+- Below, `bunproot` means your route's spelling: `bunx bunproot`, `npx bunproot`, `bun ./proot.js`, or an installed `bunproot`.
+
+- bunproot needs a Bun built for Android/bionic, and how you get one depends on
 where you are. Any build will do; prefer 1.4.1 or newer.
 
 ### Route 1: Termux, from the TUR repository
@@ -216,7 +219,7 @@ bunproot --android-container ./empty -b ./other-bun:/bin/bun /bin/bun app.ts
 ```
 
 With Bun already present, this zero-file container can also [clone a Git
-repository without a system Git](#git-clone-without-system-git).
+repository without a system Git](#git-without-system-git).
 
 Bindings written by the caller come after the preset, so bindings at
 `/bin/sh`, `/bin/bun`, or `/bin/node` replace the corresponding defaults;
