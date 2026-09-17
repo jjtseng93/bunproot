@@ -337,7 +337,7 @@ is an argument to the guest program instead.
 | `--l2s-docs` | Render [link2symlink.md](./link2symlink.md), the on-disk format, in the terminal |
 | `--l2s-ignore-pin` | Enter a rootfs whose link store is pinned, which is otherwise refused. Its emulated hard links do not work while it is pinned |
 | `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
-| `--git [--yes] COMMAND [ARG ...]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, run the Git command with Git's own arguments and output, then exit. Add `--yes` immediately after `--git` to install without asking. `--git --help` lists the commands |
+| `--git [--yes] COMMAND [ARG ...]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, run the Git command with Git's own arguments and output, then exit. Add `--yes` immediately after `--git` to install without asking. `--git --help` lists the commands, `--git --readme` prints the guide |
 | `--x11-demo` | Open the tiny dependency-free JavaScript X11 smoke-test window |
 | `--readme` | Render this README in the terminal, with links where it has them |
 | `-h`, `--help` | The options and the debug environment variables |
@@ -520,111 +520,46 @@ each one tells you when it fails.
 
 Inside either minimal rootfs, a writable `bun x` installation can fetch
 bunproot and use [isomorphic-git](https://isomorphic-git.org/) without a
-system Git. bunproot runs isomorphic-git underneath but wraps its supported
-API surface in Git's own command-line shape -- Git subcommands, options,
-output and exit statuses -- rather than exposing isomorphic-git's CLI. It is
-a deliberately useful subset, not a claim to implement every Git command or
-option. `--git` selects this mode only when it is the very first bunproot
-argument, which is what makes an alias work:
+system Git. bunproot wraps isomorphic-git in Git's own command-line shape --
+subcommands, options, output and exit statuses -- as a deliberately useful
+subset. `--git` selects this mode only when it is the very first bunproot
+argument, which is what makes an alias work. Every command it understands,
+in one sitting:
 
 ```sh
 alias git='bun x bunproot --git'
-git clone --depth 1 --branch main URL DIRECTORY
-git status
-git add . && git commit -m "message"
-git push -u origin main
+git --yes --version              # --yes installs the locked isomorphic-git without asking
+git clone --depth 1 -b main https://github.com/jjtseng93/jsmdcui && cd jsmdcui
+git config user.name Me && git config user.email me@example.com && git config --get user.name
+git status -s && git log --oneline -3 && git show --stat HEAD && git rev-parse --short HEAD
+git switch -c feature && git branch --show-current && git branch -a
+echo hello > hello.txt && git add hello.txt && git commit -m "add hello"
+git mv hello.txt hi.txt && git commit -am rename && git commit --amend --no-edit
+git diff main --stat && git diff main...feature --name-status && git log --oneline main..feature
+echo more >> hi.txt && git diff && git stash push -m wip && git stash list && git stash pop
+git restore hi.txt && git rm -q hi.txt && git restore --staged hi.txt && git checkout -- hi.txt
+git tag -a v1 -m first && git tag -l "v*" && git show v1 -s && git show-ref --tags
+git checkout main && git cherry-pick feature~1 && git reset -q --hard HEAD~1 && git merge feature
+git merge-base main feature && git ls-files -s && git branch -d feature   # merge --abort undoes a conflict
+git remote -v && git fetch --all && git pull --ff-only && git ls-remote --heads origin
+git push -u origin main          # HTTPS only; the token comes from GIT_TOKEN or ~/.git-credentials
+git notes add -m note HEAD && git notes show HEAD && git check-ignore -q node_modules; echo $?
+git cat-file -p HEAD^{} | head -3 && git hash-object -w hi.txt && git write-tree
+git update-ref refs/heads/backup HEAD && git commit-tree $(git write-tree) -p HEAD -m plumbed
+git mktree </dev/null && git cat-file -p v1 | git mktag
+git init -q ../scratch && git -C ../scratch status && git -c color.ui=never log --all --format="%h %s" -2
+git --readme | less
 ```
 
-`git --help` prints the supported command list; `git <command> --help` its
-options. The everyday flow is covered: `init`, `clone`, `add`, `rm`, `mv`,
-`commit`, `status`, `log`, `diff`, `branch`, `checkout`, `switch`,
-`restore`, `reset`, `tag`, `remote`, `fetch`, `pull`, `push`, `merge`,
-`cherry-pick`, `stash`, `config`, `rev-parse`, `ls-files`, `ls-remote`,
-`show`, `show-ref`, `cat-file`, `hash-object`, `check-ignore`, `merge-base`,
-`notes`, `update-ref`, `write-tree`, `mktree`, `commit-tree` and `mktag`.
-`diff --check`, `diff --no-index`, `show --stat --oneline`,
-`log --since/--follow`, `status --ignored`, `ls-remote --symref/--exit-code`,
-and the common shallow clone/fetch controls (`--depth`, fetch `--deepen`,
-`--shallow-since`, `--shallow-exclude`) are also supported. The plumbing
-commands accept their common stdin forms, including
-`hash-object --stdin-paths`, `mktree --batch`, and basic `update-ref --stdin`. The global
-`-C <path>` and `-c <name>=<value>` options work, identity comes from
-`GIT_AUTHOR_*`/`GIT_COMMITTER_*`, the repository config or `~/.gitconfig`,
-and HTTPS credentials come from `GIT_TOKEN`/`GITHUB_TOKEN`,
-`GIT_USERNAME`/`GIT_PASSWORD` or `~/.git-credentials`; authentication never
-prompts.
-Clone accepts HTTP(S), local paths and `file://` URLs. Network remotes are
-HTTP(S) only: there is no SSH or `rebase`. A commit without `-m` or `-F`
-uses `GIT_EDITOR`, `VISUAL` or `EDITOR`. `fetch` follows Git 2.48 in
-creating `refs/remotes/<remote>/HEAD` when it is missing, and honours
-`remote.<remote>.followRemoteHEAD` (`create`, `warn`, `always`, `never`).
-
-The stash command inherits isomorphic-git's narrower semantics: it stashes
-tracked files only, and apply/pop cannot abort on conflicts. Its command-line
-messages, identity lookup and reflog names are adapted to match Git.
-
-Where isomorphic-git stops short of Git's working-tree semantics the port
-fills in: a branch switch carries staged and unstaged changes across and
-refuses when they would be overwritten, a merge lands its changes in the
-index and worktree while leaving unrelated local changes alone, a conflicted
-merge keeps Git's `MERGE_HEAD`/`MERGE_MSG` state so that `status` reports
-the unmerged paths, `commit` concludes it with a merge commit and `--abort`
-resets only what the merge touched. `diff` and `show` pair exact renames;
-similar-content renames and the combined diff of a merge commit are not
-produced.
-
-`diff` is the one command that is not isomorphic-git underneath: it writes
-the two sides being compared into a scratch directory and has `bun pm diff
---raw --json` produce the hunks, then prints them in Git's own format
-(`index` lines, modes, hunk ranges, function context). It needs a Bun that has
-`bun pm diff`, and says so otherwise. `diff --no-index` works without a
-repository for file/file and directory/directory comparisons; comparing one
-file directly with one directory is not implemented.
-
-The `--git` path runs before bunproot's Android tracer and uses Bun/Node
-filesystem and path APIs, so it is intended to run under Windows, macOS and
-Linux as well as Android. Platform handling includes Windows file URLs, drive
-boundaries, editors, file modes and symlinks. The tracer itself remains an
-Android/ARM64 component. The current automated comparison suite and Termux
-device runs do not replace native Windows and macOS CI.
-
-Output is coloured with Git's palette whether or not it goes to a pipe, and
-`log` shows its decorations the same way; where Git decides by looking for a
-terminal, this port needs to be told: `--no-color`, `-c color.ui=never` or
-`NO_COLOR` for the colours, `--no-decorate` or `-c log.decorate=no` for the
-decorations, and `-c color.ui=auto` / `-c log.decorate=auto` for Git's
-terminal-sensing behaviour. `--porcelain` is never coloured.
-
-`test/isogit.test.js` runs the same command lines through this wrapper and
-through a system Git in a scratch directory and requires the output and the
-resulting repositories to agree. The exact supported subsets and the work
-that is intentionally not a thin wrapper are tracked in
-[`tools/isomorphic-git/incomplete.md`](./tools/isomorphic-git/incomplete.md).
-
-To reduce npm supply-chain drift, the published `tools/isomorphic-git/bun.lock`
-fixes isomorphic-git 1.41.9 and all 55 packages in its production dependency
-tree. That tree received a broad AI-assisted static review for install scripts,
-native payloads, dynamic code execution, subprocesses, unexpected network
-targets and known advisories before it was locked. This is not a formal audit
-or a guarantee that the packages or repositories being cloned are safe: use
-this feature at your own risk.
-
-On first use bunproot explains that it will download isomorphic-git and its
-locked dependencies from the npm registry, prints the complete command and
-working directory that it will give `Bun.spawnSync`, and asks:
-
-```text
-Install now? (Y/n)
-```
-
-Only Enter, `y`, or `yes` starts the in-place installation. It uses
-`bun install --frozen-lockfile --ignore-scripts --production`, so the lockfile
-cannot be updated and dependency lifecycle scripts cannot run. Any other
-answer cancels it. `bunproot --git --yes COMMAND` skips this question and
-installs immediately. Later runs reuse the installed, version-checked copy
-without asking again. bunproot verifies the installed package on disk rather than
-trusting `bun install`'s exit status, which was unreliable before
-[oven-sh/bun#39060](https://github.com/oven-sh/bun/issues/39060) was fixed.
+`git --help` prints the command list, `git <command> --help` one command's
+options, and `git --readme` prints the full guide,
+[`tools/isomorphic-git/README.md`](./tools/isomorphic-git/README.md): global
+options, every command's options, identity and credentials, remotes, what the
+port adds on top of isomorphic-git (branch switches and merges that carry
+local changes, conflicts with Git's `MERGE_HEAD` state, exact renames, `diff`
+through `bun pm diff`), the known limits, colour handling, and the
+supply-chain notes behind the locked install and its `Install now? (Y/n)`
+prompt.
 
 ## Use with js-udocker
 
