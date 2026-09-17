@@ -12,6 +12,9 @@ Linux rootfs you supply. It can be an [empty directory](#a-rootfs-can-be-zero-fi
 that borrows Android's system files, or a self-contained rootfs assembled from
 as few as [five files](#a-rootfs-can-be-five-files).
 
+- [Table of contents](#contents)
+- [link2symlink format and recovery](./link2symlink.md)
+
 **This is early work, and it is not trying to replace Termux's PRoot.** That
 one is mature, complete and considerably faster; if you are in Termux and it
 works for you, keep using it. What this port is for is the case after Termux: a
@@ -21,41 +24,20 @@ Termux is not an option — still has a way out to a Linux userspace. Bun is the
 one thing such an environment can be given as a single file, so it is the one
 thing this depends on.
 
-> **A rootfs the original PRoot has used needs `-b /data`.** Both emulate hard
-> links — Android rejects `link(2)` on app storage — but not in the same on-disk
-> format, and this port reads only its own. Add the bind and such a rootfs works partially(read-only):
+> Upstream PRoot and bunproot emulate hard links in different, normally
+> incompatible link2symlink formats: `/.l2s` and `/.proot.l2s`. Do not assume a
+> rootfs written by one can be used directly by the other. The difference is
+> deliberate: upstream records host paths, so moving or renaming its rootfs
+> breaks those links; bunproot records guest paths so its rootfs remains
+> portable. Inspect a rootfs without entering it:
 >
 > ```sh
-> bunproot -S ./that-rootfs -b /data /bin/sh
+> bunproot --l2s-status ./that-rootfs
 > ```
 >
-> If you leave the bind out, any hardlink that was turned into a symlink by the upstream PRoot will become unreadable.
-> That includes a large amount of files.
-> Here is why. Upstream PRoot turns hardlinks into double-layer symlinks which target a *host*
-> pathname. A symlink target inside a guest is read as a guest pathname, so
-> following it re-roots that host path into the rootfs, where it is not present. The
-> bind puts that path inside the guest as well, and it resolves.
->
-> Tell the two formats apart by the store at the rootfs root: `/.l2s` is the
-> original's, `/.proot.l2s` is this port's. A fresh rootfs, or one only ever
-> opened with bunproot, needs nothing. `bunproot --l2s-status ./that-rootfs`
-> reports which store is there without entering it, and for an original-format
-> one says whether the bind above can still reach it -- which depends on the
-> rootfs not having moved since those pathnames were written into it.
->
-> The bind only works while the rootfs has not been moved or renamed away from the original path.
-> What it recovers is a host path recorded at the time the symlink was made. That is the
-> original format's own limitation, not something this port adds: the same move
-> breaks the same rootfs under the original PRoot too.
->
-> And the bind is for getting at what is there, not for moving in. Writing to
-> such a rootfs under this port lays down a second store beside the first, and
-> the two do not know about each other.
->
-> The formats differ deliberately, and that is what the difference buys. This
-> port records guest pathnames, so a rootfs stays readable wherever it is put —
-> which is the whole point of a rootfs you can carry out of Termux. Being unable
-> to read the original's store is the price.
+> For format details, compatibility and recovery tools, read
+> [link2symlink.md](./link2symlink.md) or render it in the terminal with
+> `bunproot --l2s-docs`.
 
 Licensed **GPL-2.0-or-later**, inherited as a derivative work of PRoot.
 [NOTICE.md](./NOTICE.md) records what it was ported from and how to read the
@@ -323,88 +305,6 @@ by copying five files, with no distribution to download, unpack or trust.
 It can likewise [use Git without adding Git to those five
 files](#git-without-system-git).
 
-## Git without system Git
-
-Inside either minimal rootfs, a writable `bun x` installation can fetch
-bunproot and use [isomorphic-git](https://isomorphic-git.org/) without a
-system Git. bunproot runs isomorphic-git underneath but wraps its API in
-Git's own command-line shape -- the same subcommands, options, output and
-exit statuses -- rather than exposing isomorphic-git's CLI. `--git` selects
-this mode only when it is the very first bunproot argument, which is what
-makes an alias work:
-
-```sh
-alias git='bun x bunproot --git'
-git clone --depth 1 --branch main URL DIRECTORY
-git status
-git add . && git commit -m "message"
-git push -u origin main
-```
-
-`git --help` prints the supported command list; `git <command> --help` its
-options. The everyday flow is covered: `init`, `clone`, `add`, `rm`, `mv`,
-`commit`, `status`, `log`, `diff`, `branch`, `checkout`, `switch`,
-`restore`, `reset`, `tag`, `remote`, `fetch`, `pull`, `push`, `merge`,
-`cherry-pick`, `stash`, `config`, `rev-parse`, `ls-files`, `ls-remote`,
-`show`, `show-ref`, `cat-file`, `hash-object`, `check-ignore`, `merge-base`,
-`notes`, `update-ref`, `write-tree`, `mktree`, `commit-tree` and `mktag`.
-`diff --check`, `diff --no-index`, `show --stat --oneline`,
-`log --since/--follow` and `status --ignored` are also supported. The global `-C <path>` and
-`-c <name>=<value>` options work, identity comes from
-`GIT_AUTHOR_*`/`GIT_COMMITTER_*`, the repository config or `~/.gitconfig`,
-and HTTPS credentials come from `GIT_TOKEN`/`GITHUB_TOKEN`,
-`GIT_USERNAME`/`GIT_PASSWORD` or `~/.git-credentials`; nothing prompts.
-Clone accepts HTTP(S), local paths and `file://` URLs. Network remotes are
-HTTP(S) only: there is no SSH or `rebase`. A commit without `-m` or `-F`
-uses `GIT_EDITOR`, `VISUAL` or `EDITOR`. `fetch` follows Git 2.48 in
-creating `refs/remotes/<remote>/HEAD` when it is missing, and honours
-`remote.<remote>.followRemoteHEAD` (`create`, `warn`, `always`, `never`).
-
-The stash command inherits isomorphic-git's narrower semantics: it stashes
-tracked files only, and apply/pop cannot abort on conflicts. Its command-line
-messages, identity lookup and reflog names are adapted to match Git.
-
-`diff` is the one command that is not isomorphic-git underneath: it writes
-the two sides being compared into a scratch directory and has `bun pm diff
---raw --json` produce the hunks, then prints them in Git's own format
-(`index` lines, modes, hunk ranges, function context). It needs a Bun that has
-`bun pm diff`, and says so otherwise.
-
-Output is coloured with Git's palette whether or not it goes to a pipe, and
-`log` shows its decorations the same way; where Git decides by looking for a
-terminal, this port needs to be told: `--no-color`, `-c color.ui=never` or
-`NO_COLOR` for the colours, `--no-decorate` or `-c log.decorate=no` for the
-decorations, and `-c color.ui=auto` / `-c log.decorate=auto` for Git's
-terminal-sensing behaviour. `--porcelain` is never coloured.
-
-`test/isogit.test.js` runs the same command lines through this wrapper and
-through a system Git in a scratch directory and requires the output and the
-resulting repositories to agree.
-
-To reduce npm supply-chain drift, the published `tools/isomorphic-git/bun.lock`
-fixes isomorphic-git 1.41.9 and all 55 packages in its production dependency
-tree. That tree received a broad AI-assisted static review for install scripts,
-native payloads, dynamic code execution, subprocesses, unexpected network
-targets and known advisories before it was locked. This is not a formal audit
-or a guarantee that the packages or repositories being cloned are safe: use
-this feature at your own risk.
-
-On first use bunproot explains that it will download isomorphic-git and its
-locked dependencies from the npm registry, prints the complete command and
-working directory that it will give `Bun.spawnSync`, and asks:
-
-```text
-Install now? (Y/n)
-```
-
-Only Enter, `y`, or `yes` starts the in-place installation. It uses
-`bun install --frozen-lockfile --ignore-scripts --production`, so the lockfile
-cannot be updated and dependency lifecycle scripts cannot run. Any other
-answer cancels it. Later runs reuse the installed, version-checked copy without
-asking again. bunproot verifies the installed package on disk rather than
-trusting `bun install`'s exit status, which was unreliable before
-[oven-sh/bun#39060](https://github.com/oven-sh/bun/issues/39060) was fixed.
-
 ## Usage
 
 ```text
@@ -612,6 +512,137 @@ bunproot -S ./alpine /usr/bin/git clone https://github.com/jjtseng93/jsmdcui /tm
 
 [TESTING.md](./TESTING.md) collects these as the regression checks, with what
 each one tells you when it fails.
+
+## Git without system Git
+
+Inside either minimal rootfs, a writable `bun x` installation can fetch
+bunproot and use [isomorphic-git](https://isomorphic-git.org/) without a
+system Git. bunproot runs isomorphic-git underneath but wraps its supported
+API surface in Git's own command-line shape -- Git subcommands, options,
+output and exit statuses -- rather than exposing isomorphic-git's CLI. It is
+a deliberately useful subset, not a claim to implement every Git command or
+option. `--git` selects this mode only when it is the very first bunproot
+argument, which is what makes an alias work:
+
+```sh
+alias git='bun x bunproot --git'
+git clone --depth 1 --branch main URL DIRECTORY
+git status
+git add . && git commit -m "message"
+git push -u origin main
+```
+
+`git --help` prints the supported command list; `git <command> --help` its
+options. The everyday flow is covered: `init`, `clone`, `add`, `rm`, `mv`,
+`commit`, `status`, `log`, `diff`, `branch`, `checkout`, `switch`,
+`restore`, `reset`, `tag`, `remote`, `fetch`, `pull`, `push`, `merge`,
+`cherry-pick`, `stash`, `config`, `rev-parse`, `ls-files`, `ls-remote`,
+`show`, `show-ref`, `cat-file`, `hash-object`, `check-ignore`, `merge-base`,
+`notes`, `update-ref`, `write-tree`, `mktree`, `commit-tree` and `mktag`.
+`diff --check`, `diff --no-index`, `show --stat --oneline`,
+`log --since/--follow`, `status --ignored`, `ls-remote --symref/--exit-code`,
+and the common shallow clone/fetch controls (`--depth`, fetch `--deepen`,
+`--shallow-since`, `--shallow-exclude`) are also supported. The plumbing
+commands accept their common stdin forms, including
+`hash-object --stdin-paths`, `mktree --batch`, and basic `update-ref --stdin`. The global
+`-C <path>` and `-c <name>=<value>` options work, identity comes from
+`GIT_AUTHOR_*`/`GIT_COMMITTER_*`, the repository config or `~/.gitconfig`,
+and HTTPS credentials come from `GIT_TOKEN`/`GITHUB_TOKEN`,
+`GIT_USERNAME`/`GIT_PASSWORD` or `~/.git-credentials`; authentication never
+prompts.
+Clone accepts HTTP(S), local paths and `file://` URLs. Network remotes are
+HTTP(S) only: there is no SSH or `rebase`. A commit without `-m` or `-F`
+uses `GIT_EDITOR`, `VISUAL` or `EDITOR`. `fetch` follows Git 2.48 in
+creating `refs/remotes/<remote>/HEAD` when it is missing, and honours
+`remote.<remote>.followRemoteHEAD` (`create`, `warn`, `always`, `never`).
+
+The stash command inherits isomorphic-git's narrower semantics: it stashes
+tracked files only, and apply/pop cannot abort on conflicts. Its command-line
+messages, identity lookup and reflog names are adapted to match Git.
+
+`diff` is the one command that is not isomorphic-git underneath: it writes
+the two sides being compared into a scratch directory and has `bun pm diff
+--raw --json` produce the hunks, then prints them in Git's own format
+(`index` lines, modes, hunk ranges, function context). It needs a Bun that has
+`bun pm diff`, and says so otherwise. `diff --no-index` works without a
+repository for file/file and directory/directory comparisons; comparing one
+file directly with one directory is not implemented.
+
+The `--git` path runs before bunproot's Android tracer and uses Bun/Node
+filesystem and path APIs, so it is intended to run under Windows, macOS and
+Linux as well as Android. Platform handling includes Windows file URLs, drive
+boundaries, editors, file modes and symlinks. The tracer itself remains an
+Android/ARM64 component. The current automated comparison suite and Termux
+device runs do not replace native Windows and macOS CI.
+
+Output is coloured with Git's palette whether or not it goes to a pipe, and
+`log` shows its decorations the same way; where Git decides by looking for a
+terminal, this port needs to be told: `--no-color`, `-c color.ui=never` or
+`NO_COLOR` for the colours, `--no-decorate` or `-c log.decorate=no` for the
+decorations, and `-c color.ui=auto` / `-c log.decorate=auto` for Git's
+terminal-sensing behaviour. `--porcelain` is never coloured.
+
+`test/isogit.test.js` runs the same command lines through this wrapper and
+through a system Git in a scratch directory and requires the output and the
+resulting repositories to agree. The exact supported subsets and the work
+that is intentionally not a thin wrapper are tracked in
+[`tools/isomorphic-git/incomplete.md`](./tools/isomorphic-git/incomplete.md).
+
+To reduce npm supply-chain drift, the published `tools/isomorphic-git/bun.lock`
+fixes isomorphic-git 1.41.9 and all 55 packages in its production dependency
+tree. That tree received a broad AI-assisted static review for install scripts,
+native payloads, dynamic code execution, subprocesses, unexpected network
+targets and known advisories before it was locked. This is not a formal audit
+or a guarantee that the packages or repositories being cloned are safe: use
+this feature at your own risk.
+
+On first use bunproot explains that it will download isomorphic-git and its
+locked dependencies from the npm registry, prints the complete command and
+working directory that it will give `Bun.spawnSync`, and asks:
+
+```text
+Install now? (Y/n)
+```
+
+Only Enter, `y`, or `yes` starts the in-place installation. It uses
+`bun install --frozen-lockfile --ignore-scripts --production`, so the lockfile
+cannot be updated and dependency lifecycle scripts cannot run. Any other
+answer cancels it. Later runs reuse the installed, version-checked copy without
+asking again. bunproot verifies the installed package on disk rather than
+trusting `bun install`'s exit status, which was unreliable before
+[oven-sh/bun#39060](https://github.com/oven-sh/bun/issues/39060) was fixed.
+
+## Use with js-udocker
+
+[js-udocker](https://github.com/jjtseng93/js-udocker) can use bunproot as its
+container backend. Neither project bundles the other: bunproot is licensed
+under GPL-2.0-or-later, while js-udocker is licensed under Apache-2.0.
+
+The `bunproot --git clone` steps below are intended to work on Android,
+Linux, Windows and macOS. The final container command is Android-only because
+it starts bunproot's Android/ARM64 tracer. If a first clone fails while Bun is
+installing or updating packages, run `bun pm cache rm` to clear Bun's package
+cache and try it again.
+
+Create a directory containing sibling checkouts of both projects, point
+js-udocker at bunproot's source entry point, and run an Alpine container:
+
+```sh
+mkdir bunproot-udocker
+cd bunproot-udocker
+bunx bunproot --git clone https://github.com/jjtseng93/bunproot
+bunx bunproot --git clone https://github.com/jjtseng93/js-udocker
+cd js-udocker
+export JS_UDOCKER_BUNPROOT="$(realpath ../bunproot/proot.js)"
+bun udocker.js run --name=ap alpine
+
+# In another invocation, list the managed containers:
+bun udocker.js ps
+```
+
+If bunproot is already checked out, clone js-udocker beside it and set
+`JS_UDOCKER_BUNPROOT` to the absolute path of that checkout's `proot.js`; the
+two repositories do not otherwise need to be installed system-wide.
 
 ## Android compatibility
 
@@ -952,3 +983,36 @@ bun run generate-stubs.js
 
 This is not yet a drop-in replacement for upstream PRoot. See
 [PORTING.md](./PORTING.md) for implemented coverage and remaining work.
+
+## Contents
+
+- [Confirmed running (mostly under Alpine)](#confirmed-running-mostly-under-alpine)
+- [Quick start](#quick-start)
+  - [Route 1: Termux, from the TUR repository](#route-1-termux-from-the-tur-repository)
+  - [Route 2: an app built with minapk](#route-2-an-app-built-with-minapk)
+  - [Route 3: an Android shell with npm](#route-3-an-android-shell-with-npm)
+  - [Route 4: from source](#route-4-from-source)
+  - [Get a rootfs](#get-a-rootfs)
+  - [First run](#first-run)
+- [A rootfs can be zero files](#a-rootfs-can-be-zero-files)
+- [A rootfs can be five files](#a-rootfs-can-be-five-files)
+- [Usage](#usage)
+  - [The rootfs](#the-rootfs)
+  - [Bindings](#bindings)
+  - [Environment](#environment)
+  - [Port mapping and low ports](#port-mapping-and-low-ports)
+  - [Hidden compatibility options for PRoot launchers](#hidden-compatibility-options-for-proot-launchers)
+  - [Kernel release identification](#kernel-release-identification)
+  - [The resolver](#the-resolver)
+  - [Waiting for the guest](#waiting-for-the-guest)
+  - [The guest's own tools](#the-guests-own-tools)
+- [Git without system Git](#git-without-system-git)
+- [Use with js-udocker](#use-with-js-udocker)
+- [Android compatibility](#android-compatibility)
+  - [Syscalls Android refuses to run](#syscalls-android-refuses-to-run)
+- [Native bubblewrap](#native-bubblewrap)
+- [Flatpak through stock bwrap](#flatpak-through-stock-bwrap)
+- [What it needs](#what-it-needs)
+- [Debugging](#debugging)
+- [Testing](#testing)
+- [Implementation notes](#implementation-notes)

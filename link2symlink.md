@@ -68,6 +68,37 @@ Removing the `/.proot.l2s/refs` prefix from a ref path recovers the intended
 guest pathname. This makes restoration possible by enumerating `refs` without
 scanning the entire rootfs.
 
+## Adding and removing the host prefix
+
+The normal portable form stores guest-absolute targets such as
+`/.proot.l2s/refs/bin/foo`. A backup, archive or synchronization tool running
+outside the guest sees that as a host-absolute pathname and cannot follow it.
+`--l2s-pin` adds the rootfs's current absolute host pathname to both legs of
+every emulated hard link so outside tools can follow them:
+
+```sh
+bunproot --l2s-status ./rootfs
+bunproot --l2s-pin ./rootfs
+bunproot --l2s-status ./rootfs
+```
+
+The prefix is derived from the rootfs argument; it is not supplied separately.
+A pinned rootfs cannot be moved, and its emulated hard links do not work inside
+the guest. Do not enter it while it is pinned. After the outside tool has
+finished, remove the host prefix and restore the portable guest-absolute form:
+
+```sh
+bunproot --l2s-unpin ./rootfs
+bunproot --l2s-status ./rootfs
+```
+
+Pin and unpin are idempotent. If either operation is interrupted, run the same
+command again to finish it. bunproot normally refuses to enter a pinned or
+partly converted store; `--l2s-ignore-pin` is an emergency inspection override,
+not a way to use the hard links safely. Pinning is refused when the rootfs's
+own pathname contains a `.proot.l2s` segment, because unpinning could not tell
+where the added prefix ended.
+
 ## Link-count metadata
 
 The matching `mets` entry is an intentionally dangling symbolic link:
