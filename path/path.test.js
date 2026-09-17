@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { parseArguments, procVersion } from "../cli/proot.c.js";
 import { createBindings, parseBinding } from "./binding.c.js";
 import { translatePath } from "./path.c.js";
+import pkg from "../package.json" with { type: "json" };
 
 test("legacy argument translation and -S parsing remain deterministic", () => {
   expect(translatePath("/")).toBe("/etc");
@@ -51,6 +52,10 @@ test("bindings are collected in order and never eat the command", () => {
   });
   expect(() => parseArguments(["-b", "/data", "/bin/sh"])).toThrow();
   expect(() => parseArguments(["-S", "/rootfs", "-b"])).toThrow();
+});
+
+test("the no-argument hint includes the version", () => {
+  expect(() => parseArguments([])).toThrow(`version ${pkg.version}\nUsage: bunproot`);
 });
 
 test("--android-container takes a rootfs and defaults only its command", () => {

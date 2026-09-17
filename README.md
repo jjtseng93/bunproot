@@ -631,6 +631,7 @@ js-udocker at bunproot's source entry point, and run an Alpine container:
 mkdir bunproot-udocker
 cd bunproot-udocker
 bunx bunproot --git clone https://github.com/jjtseng93/bunproot
+bunx bunproot
 bunx bunproot --git clone https://github.com/jjtseng93/js-udocker
 cd js-udocker
 export JS_UDOCKER_BUNPROOT="$(realpath ../bunproot/proot.js)"

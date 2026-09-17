@@ -325,7 +325,8 @@ export function parseArguments(argv) {
     break;
   }
   let command = argv.slice(index);
-  if (rootfs === null) throw new Error(`${USAGE}\n${TRY_HELP}`);
+  if (rootfs === null) throw new Error(
+    `${argv.length === 0 ? `version ${pkg.version}\n` : ""}${USAGE}\n${TRY_HELP}`);
   if (command.length === 0) command=[androidContainer?"/system/bin/sh":"/bin/sh"];
   // The default sits ahead of everything the caller wrote, so any binding of
   // theirs on the same pathname is the later one and wins.
