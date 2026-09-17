@@ -1,5 +1,7 @@
 # Overview
 - Read README.md first to get a big picture of the project
+- There is no `bun --check` for checking syntax
+  * It will run that file directly which is not what we expected
 - PRoot is something like chroot but uses ptrace without needing root access.
 - The upstream project was cloned at ../prbun . Take a look when the current problem should already be solved upstream.
 # How to test bunproot

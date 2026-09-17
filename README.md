@@ -346,7 +346,10 @@ options. The everyday flow is covered: `init`, `clone`, `add`, `rm`, `mv`,
 `commit`, `status`, `log`, `diff`, `branch`, `checkout`, `switch`,
 `restore`, `reset`, `tag`, `remote`, `fetch`, `pull`, `push`, `merge`,
 `cherry-pick`, `stash`, `config`, `rev-parse`, `ls-files`, `ls-remote`,
-`show`, `show-ref`, `cat-file` and `hash-object`. The global `-C <path>` and
+`show`, `show-ref`, `cat-file`, `hash-object`, `check-ignore`, `merge-base`,
+`notes`, `update-ref`, `write-tree`, `mktree`, `commit-tree` and `mktag`.
+`diff --check`, `diff --no-index`, `show --stat --oneline`,
+`log --since/--follow` and `status --ignored` are also supported. The global `-C <path>` and
 `-c <name>=<value>` options work, identity comes from
 `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, the repository config or `~/.gitconfig`,
 and HTTPS credentials come from `GIT_TOKEN`/`GITHUB_TOKEN`,
