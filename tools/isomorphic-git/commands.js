@@ -6,9 +6,10 @@
 import * as git from "isomorphic-git";
 import http from "isomorphic-git/http/web";
 import fs from "node:fs";
-import { chmod, copyFile, cp, lstat, mkdtemp, mkdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, cp, lstat, mkdtemp, mkdir, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { count, list, parse, parseClone, positiveDepth } from "./options.js";
 
 const VERSION="1.41.9";
@@ -83,7 +84,9 @@ export function context({ overrides={}, cwd=process.cwd(), out, err, tty=process
     // stores it.  "" is the repository itself.
     async pathspec(argument) {
       const { dir }=await this.repo();
-      const path=relative(dir,resolve(cwd,argument)).split("\\").join("/");
+      const native=relative(dir,resolve(cwd,argument));
+      if (isAbsolute(native)) throw new Error(`'${argument}' is outside repository at '${dir}'`);
+      const path=native.split("\\").join("/");
       if (path.startsWith("../") || path==="..") throw new Error(`'${argument}' is outside repository at '${dir}'`);
       return path==="."?"":path;
     },
@@ -98,6 +101,7 @@ function failure(message,exitCode=1) {
 }
 const short=(oid)=>oid.slice(0,7);
 const isOid=(text)=>/^[0-9a-f]{4,40}$/i.test(text);
+const readStdin=async ()=>Buffer.from(await Bun.stdin.arrayBuffer());
 
 // -- configuration: -c overrides, then the repository, then the user's files.
 // isomorphic-git reads only the repository's config, so the global file is
@@ -234,9 +238,9 @@ async function stageRows(ctx,rows,{ trackedOnly=false }={}) {
     else if (workdir!==stage) await git.add({ ...repo, filepath:path });
   }
 }
-async function statusRows(ctx,filepaths) {
+async function statusRows(ctx,filepaths,ignored=false) {
   const repo=await base(ctx);
-  const rows=await git.statusMatrix({ ...repo, filepaths:filepaths?.length?filepaths:undefined });
+  const rows=await git.statusMatrix({ ...repo, filepaths:filepaths?.length?filepaths:undefined, ignored });
   return rows.filter(([path,h,w,s])=>!(h===1&&w===1&&s===1));
 }
 
@@ -446,8 +450,16 @@ async function editMessage(repo,initial="") {
   await writeFile(file,initial||"\n# Please enter the commit message for your changes.\n");
   const editor=process.env.GIT_EDITOR||process.env.VISUAL||process.env.EDITOR;
   if (!editor) throw new Error("Terminal is dumb, but EDITOR unset");
-  const shell=process.env.SHELL||"/bin/sh";
-  const result=Bun.spawnSync({ cmd:[shell,"-c",`${editor} \"$@\"`,"git-editor",file], cwd:repo.dir, stdin:"inherit", stdout:"inherit", stderr:"inherit" });
+  let cmd;
+  if (process.platform==="win32") {
+    const shell=process.env.ComSpec||process.env.COMSPEC||"cmd.exe";
+    const quoted=file.replace(/"/g,'""');
+    cmd=[shell,"/d","/s","/c",`${editor} \"${quoted}\"`];
+  } else {
+    const shell=process.env.SHELL||"/bin/sh";
+    cmd=[shell,"-c",`${editor} \"$@\"`,"git-editor",file];
+  }
+  const result=Bun.spawnSync({ cmd, cwd:repo.dir, stdin:"inherit", stdout:"inherit", stderr:"inherit" });
   if (result.exitCode!==0) throw new Error(`There was a problem with the editor '${editor}'.`);
   return cleanEditedMessage(await readFile(file,"utf8"));
 }
@@ -494,8 +506,14 @@ function network(ctx,options={}) {
 // isomorphic-git writes the core settings a browser wants; on a Linux host
 // the repository is shared with the system git, so use its defaults.
 async function nativeConfig(gitdir) {
-  await git.setConfig({ fs, gitdir, path:"core.filemode", value:"true" });
-  for (const path of ["core.symlinks","core.ignorecase"]) await git.setConfig({ fs, gitdir, path, value:undefined });
+  if (process.platform==="win32") {
+    await git.setConfig({ fs, gitdir, path:"core.filemode", value:"false" });
+    await git.setConfig({ fs, gitdir, path:"core.symlinks", value:"false" });
+    await git.setConfig({ fs, gitdir, path:"core.ignorecase", value:"true" });
+  } else {
+    await git.setConfig({ fs, gitdir, path:"core.filemode", value:"true" });
+    for (const path of ["core.symlinks","core.ignorecase"]) await git.setConfig({ fs, gitdir, path, value:undefined });
+  }
 }
 async function init(ctx,argv) {
   const { options,positional }=parse(argv,{ q:"quiet", quiet:"quiet", bare:"bare", b:["branch"], "initial-branch":["branch"] });
@@ -512,9 +530,10 @@ async function init(ctx,argv) {
 
 async function clone(ctx,argv) {
   const options=parseClone(argv,ctx.cwd);
+  if (options.since!==undefined) options.since=new Date(parseDate(options.since).timestamp*1000);
   if (!options.quiet) ctx.err(`Cloning into '${relative(ctx.cwd,options.dir)||"."}'...\n`);
   const { quiet,...cloneOptions }=options;
-  const localUrl=options.url.startsWith("file://")?decodeURIComponent(new URL(options.url).pathname):!/^\w+(?::\/\/|::)/.test(options.url)&&!/^\w+@[^:]+:/.test(options.url)?options.url:null;
+  const localUrl=options.url.startsWith("file://")?fileURLToPath(options.url):!/^\w+(?::\/\/|::)/.test(options.url)&&!/^\w+@[^:]+:/.test(options.url)?options.url:null;
   if (localUrl!==null) return cloneLocal(ctx,{ ...cloneOptions, url:options.url, source:resolve(ctx.cwd,localUrl) });
   await git.clone({ fs, ...network(ctx,options), ...cloneOptions });
   await nativeConfig(join(options.dir,".git"));
@@ -636,7 +655,7 @@ async function commit(ctx,argv) {
   }
   let message;
   if (options.message) message=cleanMessage(options.message.join("\n\n"));
-  else if (options.file) message=cleanMessage(await readFile(options.file==="-"?"/dev/stdin":resolve(ctx.cwd,options.file),"utf8"));
+  else if (options.file) message=cleanMessage(options.file==="-"?(await readStdin()).toString("utf8"):await readFile(resolve(ctx.cwd,options.file),"utf8"));
   else {
     let initial="";
     if (options.amend && await head(ctx)) initial=(await git.readCommit({ ...repo, oid:await head(ctx) })).commit.message;
@@ -716,7 +735,7 @@ async function pairRenames(ctx,staged) {
   }
   return staged.filter((r)=>!r.dropped);
 }
-async function statusParts(ctx,filepaths) {
+async function statusParts(ctx,filepaths,includeIgnored=false) {
   const repo=await base(ctx);
   const rows=await statusRows(ctx,filepaths);
   const { tracked,untracked }=porcelainRows(rows);
@@ -724,7 +743,14 @@ async function statusParts(ctx,filepaths) {
   const paired=await pairRenames(ctx,tracked.filter((r)=>r.x!==" "));
   const shown=tracked.filter((r)=>r.x===" " || paired.includes(r)).sort((a,b)=>a.path<b.path?-1:1);
   for (const row of shown) if (row.renamedFrom) row.x="R";
-  return { tracked:shown, untracked:collapse(untracked,all), rows };
+  let ignored=[];
+  if (includeIgnored) {
+    const visible=new Set((await statusRows(ctx,filepaths,true)).map(([path])=>path));
+    for (const [path] of rows) visible.delete(path);
+    for (const path of visible) if (path===".git" || path.startsWith(".git/")) visible.delete(path);
+    ignored=collapse([...visible],all);
+  }
+  return { tracked:shown, untracked:collapse(untracked,all), ignored, rows };
 }
 // Where the branch stands against its upstream, for the status header.
 async function upstreamState(ctx,branch,commitOid) {
@@ -751,7 +777,7 @@ async function statusText(ctx,options,filepaths) {
   const repo=await base(ctx);
   const branch=await branchName(ctx);
   const commitOid=await head(ctx);
-  const { tracked,untracked }=await statusParts(ctx,filepaths);
+  const { tracked,untracked,ignored }=await statusParts(ctx,filepaths,options.ignored);
   const state=await upstreamState(ctx,branch,commitOid);
   if (options.short || options.porcelain) {
     let text="";
@@ -766,6 +792,7 @@ async function statusText(ctx,options,filepaths) {
     for (const { path,x,y,renamedFrom } of tracked)
       text+=`${x===" "?x:ctx.paint("green",x)}${y===" "?y:ctx.paint("red",y)} ${renamedFrom?`${renamedFrom} -> `:""}${path}\n`;
     for (const path of untracked) text+=`${ctx.paint("red","??")} ${path}\n`;
+    for (const path of ignored) text+=`${ctx.paint("red","!!")} ${path}\n`;
     return text;
   }
   const staged=tracked.filter((r)=>r.x!==" "), unstaged=tracked.filter((r)=>r.y!==" ");
@@ -791,13 +818,18 @@ async function statusText(ctx,options,filepaths) {
     for (const path of untracked) text+=`\t${ctx.paint("red",path)}\n`;
     text+="\n";
   }
+  if (ignored.length) {
+    text+=`Ignored files:\n  (use "git add -f <file>..." to include in what will be committed)\n`;
+    for (const path of ignored) text+=`\t${ctx.paint("red",path)}\n`;
+    text+="\n";
+  }
   if (shownStaged.length) return text;
   if (unstaged.length) return text+`no changes added to commit (use "git add" and/or "git commit -a")\n`;
   if (untracked.length) return text+`nothing added to commit but untracked files present (use "git add" to track)\n`;
   return text+(commitOid?"nothing to commit, working tree clean\n":`nothing to commit (create/copy files and use "git add" to track)\n`);
 }
 async function status(ctx,argv) {
-  const { options,positional }=parse(argv,{ s:"short", short:"short", porcelain:"porcelain", b:"branch", branch:"branch", u:"untracked", "untracked-files":["untrackedFiles"], long:"long", color:"color", "no-color":"noColor" });
+  const { options,positional }=parse(argv,{ s:"short", short:"short", porcelain:"porcelain", b:"branch", branch:"branch", u:"untracked", "untracked-files":["untrackedFiles"], ignored:"ignored", long:"long", color:"color", "no-color":"noColor" });
   if (options.color) ctx.colour=true;
   if (options.noColor || options.porcelain) ctx.colour=false;
   const filepaths=await Promise.all(positional.map((p)=>ctx.pathspec(p)));
@@ -808,7 +840,7 @@ async function log(ctx,argv) {
   const parsed=parse(argv,{
     n:["maxCount",count], "max-count":["maxCount",count], "<n>":["maxCount",count],
     oneline:"oneline", format:["format"], pretty:["format"], reverse:"reverse",
-    "no-decorate":"noDecorate", decorate:["decorate",null,true], "first-parent":"firstParent", all:"all", color:"color", "no-color":"noColor", "no-pager":"noPager",
+    "no-decorate":"noDecorate", decorate:["decorate",null,true], "first-parent":"firstParent", all:"all", since:["since"], follow:"follow", color:"color", "no-color":"noColor", "no-pager":"noPager",
   });
   const { options,positional }=parsed;
   if (options.color) ctx.colour=true;
@@ -821,15 +853,18 @@ async function log(ctx,argv) {
   const ref=refs[0]?await revision(ctx,refs[0]):await head(ctx);
   if (!ref && !options.all) throw new Error(`your current branch '${await branchName(ctx)}' does not have any commits yet`);
   const filepath=paths[0]?await ctx.pathspec(paths[0]):undefined;
+  if (options.follow && !filepath) throw new Error("--follow requires exactly one path after --");
+  let since;
+  if (options.since!==undefined) since=new Date(parseDate(options.since).timestamp*1000);
   let commits;
   if (options.all) {
     const tips=[];
     for (const name of await git.listRefs({ ...repo, filepath:"refs" })) {
       try { tips.push(await revision(ctx,`refs/${name}`,"commit")); } catch {}
     }
-    const entries=(await Promise.all([...new Set(tips)].map((tip)=>git.log({ ...repo, ref:tip, filepath, force:true })))).flat();
+    const entries=(await Promise.all([...new Set(tips)].map((tip)=>git.log({ ...repo, ref:tip, filepath, since, follow:!!options.follow, force:true })))).flat();
     commits=[...new Map(entries.map((entry)=>[entry.oid,entry])).values()].sort((a,b)=>b.commit.committer.timestamp-a.commit.committer.timestamp||a.oid.localeCompare(b.oid));
-  } else commits=await git.log({ ...repo, ref, depth:filepath?undefined:options.maxCount, filepath, force:true });
+  } else commits=await git.log({ ...repo, ref, depth:filepath?undefined:options.maxCount, filepath, since, follow:!!options.follow, force:true });
   if (options.maxCount!==undefined) commits=commits.slice(0,options.maxCount);
   if (options.reverse) commits.reverse();
   let format=options.format;
@@ -850,6 +885,38 @@ async function log(ctx,argv) {
     return;
   }
   ctx.out(commits.map((entry)=>mediumCommit(ctx,entry,names)).join("\n"));
+}
+
+async function checkIgnore(ctx,argv) {
+  const { options,positional }=parse(argv,{ q:"quiet", quiet:"quiet", "no-index":"noIndex" });
+  if (positional.length===0) throw new Error("no path specified");
+  const repo=await base(ctx);
+  const tracked=options.noIndex?new Set():new Set(await git.listFiles({ ...repo }));
+  let matched=false;
+  for (const argument of positional) {
+    const filepath=await ctx.pathspec(argument);
+    if (!filepath || tracked.has(filepath)) continue;
+    if (await git.isIgnored({ ...repo, filepath })) {
+      matched=true;
+      if (!options.quiet) ctx.out(`${argument}\n`);
+    }
+  }
+  return matched?0:1;
+}
+
+async function mergeBase(ctx,argv) {
+  const { options,positional }=parse(argv,{ "is-ancestor":"isAncestor", a:"all", all:"all", "octopus":"octopus" });
+  if (options.octopus) throw new Error("--octopus is not available in this port");
+  if (options.isAncestor) {
+    if (positional.length!==2) throw new Error("--is-ancestor takes exactly two commits");
+    const [ancestor,oid]=await Promise.all(positional.map((ref)=>revision(ctx,ref,"commit")));
+    return await git.isDescendent({ ...await base(ctx), oid, ancestor })?0:1;
+  }
+  if (positional.length<2) throw new Error("need two or more commits");
+  const oids=await Promise.all(positional.map((ref)=>revision(ctx,ref,"commit")));
+  const bases=await git.findMergeBase({ ...await base(ctx), oids });
+  for (const oid of options.all?bases:bases.slice(0,1)) ctx.out(`${oid}\n`);
+  return bases.length?0:1;
 }
 
 async function branch(ctx,argv) {
@@ -991,9 +1058,9 @@ async function restoreFromIndex(ctx,shown,filepaths) {
     const { blob }=await git.readBlob({ ...repo, oid });
     const target=join(repo.dir,path);
     await mkdir(dirname(target),{ recursive:true });
-    if (mode===0o120000) { await rm(target,{ force:true }); await symlink(Buffer.from(blob).toString(),target); continue; }
+    if (mode===0o120000 && process.platform!=="win32") { await rm(target,{ force:true }); await symlink(Buffer.from(blob).toString(),target); continue; }
     await writeFile(target,blob,{ mode:mode===0o100755?0o755:0o644 });
-    await chmod(target,mode===0o100755?0o755:0o644);
+    if (process.platform!=="win32") await chmod(target,mode===0o100755?0o755:0o644);
   }
 }
 
@@ -1143,7 +1210,9 @@ async function remote(ctx,argv) {
 }
 
 async function fetch(ctx,argv) {
-  const { options,positional }=parse(argv,{ depth:["depth",positiveDepth], tags:"tags", "no-tags":"noTags", p:"prune", prune:"prune", q:"quiet", quiet:"quiet", all:"all", v:"verbose", "prune-tags":"pruneTags", f:"force", force:"force", u:"update" });
+  const { options,positional }=parse(argv,{ depth:["depth",positiveDepth], deepen:["deepen",positiveDepth], "shallow-since":["since"], "shallow-exclude":["exclude",list], tags:"tags", "no-tags":"noTags", p:"prune", prune:"prune", q:"quiet", quiet:"quiet", all:"all", v:"verbose", "prune-tags":"pruneTags", f:"force", force:"force", u:"update" });
+  if (options.deepen!==undefined) { options.depth=options.deepen; options.relative=true; }
+  if (options.since!==undefined) options.since=new Date(parseDate(options.since).timestamp*1000);
   const repo=await base(ctx);
   const current=await branchName(ctx);
   const remotes=options.all?(await git.listRemotes({ ...repo })).map((r)=>r.remote):[positional[0]??await remoteOf(ctx,current)];
@@ -1156,7 +1225,7 @@ async function fetch(ctx,argv) {
     const follow=(await config(ctx,`remote.${remote}.followRemoteHEAD`))??"create";
     const remoteHead=join(repo.gitdir,"refs","remotes",remote,"HEAD");
     const before=await readFile(remoteHead,"utf8").catch(()=>undefined);
-    const result=await git.fetch({ ...repo, ...network(ctx,options), remote, ref:positional[1], singleBranch:!!positional[1], depth:options.depth, tags:!!options.tags, prune:!!options.prune, pruneTags:!!options.pruneTags });
+    const result=await git.fetch({ ...repo, ...network(ctx,options), remote, ref:positional[1], singleBranch:!!positional[1], depth:options.depth, since:options.since, exclude:options.exclude, relative:!!options.relative, tags:!!options.tags, prune:!!options.prune, pruneTags:!!options.pruneTags });
     const after=await readFile(remoteHead,"utf8").catch(()=>undefined);
     if (follow==="never" || (follow!=="always" && before!==undefined)) {
       if (before===undefined) await rm(remoteHead,{ force:true }); else if (after!==before) await writeFile(remoteHead,before);
@@ -1273,7 +1342,7 @@ async function materialize(root,files) {
     const target=join(root,path);
     await mkdir(dirname(target),{ recursive:true });
     await writeFile(target,content,{ mode:mode==="100755"?0o755:0o644 });
-    await chmod(target,mode==="100755"?0o755:0o644);
+    if (process.platform!=="win32") await chmod(target,mode==="100755"?0o755:0o644);
   }
 }
 function bunDiff(left,right,context) {
@@ -1312,17 +1381,103 @@ function gitHunks(patch,oldText,ctx) {
     return line+reset;
   }).join("\n")+"\n";
 }
+function noIndexName(path) { return path.split("\\").join("/").replace(/^\/+/,""); }
+function renamedPath(left,right) {
+  if (left===right) return right;
+  let start=0, end=0;
+  while (start<left.length && left[start]===right[start]) start++;
+  start=start===0?0:left.lastIndexOf("/",start-1)+1;
+  while (end<left.length-start && end<right.length-start && left[left.length-1-end]===right[right.length-1-end]) end++;
+  const suffixAt=left.indexOf("/",left.length-end);
+  const suffix=suffixAt<0?"":left.slice(suffixAt);
+  const a=left.slice(start,suffixAt<0?left.length:suffixAt), b=right.slice(start,suffixAt<0?right.length:right.length-suffix.length);
+  if (start===0 && !suffix) return `${left} => ${right}`;
+  return `${left.slice(0,start)}{${a} => ${b}}${suffix}`;
+}
+async function noIndexEntries(path) {
+  const root=resolve(path), info=await lstat(root), entries=new Map();
+  const visit=async (target,key)=>{
+    const value=await lstat(target);
+    if (value.isDirectory()) {
+      for (const name of await readdir(target)) await visit(join(target,name),key?`${key}/${name}`:name);
+    } else if (value.isSymbolicLink()) entries.set(key,{ content:Buffer.from(await readlink(target)), mode:"120000" });
+    else entries.set(key,{ content:await readFile(target), mode:value.mode&0o111?"100755":"100644" });
+  };
+  if (info.isDirectory()) await visit(root,""); else await visit(root,".");
+  return { root, directory:info.isDirectory(), entries };
+}
+async function diffNoIndex(ctx,options,positional) {
+  if (positional.length!==2) throw new Error("usage: git diff --no-index [<options>] <path> <path>");
+  const [leftArg,rightArg]=positional;
+  const [left,right]=await Promise.all([noIndexEntries(resolve(ctx.cwd,leftArg)),noIndexEntries(resolve(ctx.cwd,rightArg))]);
+  if (left.directory!==right.directory) throw new Error("this port cannot compare a file with a directory");
+  const scratch=await mkdtemp(join(tmpdir(),"bunproot-git-no-index-"));
+  const pairs=[];
+  try {
+    await mkdir(join(scratch,"a")); await mkdir(join(scratch,"b"));
+    const keys=new Set([...left.entries.keys(),...right.entries.keys()]);
+    for (const key of keys) {
+      const a=left.entries.get(key), b=right.entries.get(key), virtual=key==="."?basename(right.root):key;
+      if (a) { a.oid=(await git.hashBlob({ object:new Uint8Array(a.content) })).oid; await materialize(join(scratch,"a"),[{ path:virtual,...a }]); }
+      if (b) { b.oid=(await git.hashBlob({ object:new Uint8Array(b.content) })).oid; await materialize(join(scratch,"b"),[{ path:virtual,...b }]); }
+      if (!a || !b || a.oid!==b.oid || a.mode!==b.mode) pairs.push({ key,virtual,left:a,right:b });
+    }
+    if (!pairs.length) return 0;
+    const files=bunDiff(join(scratch,"a"),join(scratch,"b"),options.context??3);
+    const byPath=new Map(pairs.map((p)=>[p.virtual,p]));
+    const changes=files.map((f)=>({ ...f,...byPath.get(f.path) })).filter((c)=>c.left||c.right);
+    for (const pair of pairs) if (!changes.some((c)=>c.virtual===pair.virtual) && pair.left && pair.right && pair.left.mode!==pair.right.mode)
+      changes.push({ ...pair,path:pair.virtual,status:"modified",linesAdded:0,linesRemoved:0 });
+    const rootName=(arg,absolute)=>absolute?resolve(ctx.cwd,arg).split("\\").join("/"):arg.split("\\").join("/");
+    for (const c of changes) {
+      const suffix=c.key==="."?"":`/${c.key}`;
+      c.labelA=left.directory?rootName(leftArg,false)+suffix:rootName(leftArg,false);
+      c.labelB=right.directory?rootName(rightArg,false)+suffix:rootName(rightArg,false);
+      c.fullA=left.directory?rootName(leftArg,false)+suffix:rootName(leftArg,false);
+      c.fullB=right.directory?rootName(rightArg,false)+suffix:rootName(rightArg,false);
+      if (!c.left) { c.labelA=c.labelB; c.fullA=c.fullB; }
+      if (!c.right) { c.labelB=c.labelA; c.fullB=c.fullA; }
+    }
+    if (options.check) {
+      let text="", bad=false;
+      for (const c of changes) { let lineNo=0; for (const line of (c.patch??"").split("\n")) {
+        const h=/^@@ -\d+(?:,\d+)? \+(\d+)/.exec(line); if (h) { lineNo=Number(h[1]); continue; }
+        if (line.startsWith("+")) { if (/[ \t]+$/.test(line.slice(1))) { text+=`${c.fullB}:${lineNo}: trailing whitespace.\n${line}\n`; bad=true; } lineNo++; }
+        else if (!line.startsWith("-")) lineNo++;
+      }}
+      if (text) ctx.out(text); return bad?3:1;
+    }
+    if (options.nameOnly) { ctx.out(changes.map((c)=>(c.right?c.fullB:"/dev/null")+"\n").join("")); return 1; }
+    if (options.nameStatus) { ctx.out(changes.map((c)=>`${c.status==="added"?"A":c.status==="deleted"?"D":"M"}\t${c.status==="added"?c.fullB:c.fullA}\n`).join("")); return 1; }
+    if (options.stat) {
+      const rows=changes.map((c)=>({ path:renamedPath(c.left?c.fullA:"/dev/null",c.right?c.fullB:"/dev/null"),insertions:c.linesAdded,deletions:c.linesRemoved,binary:c.binary,bytesBefore:c.bytesBefore,bytesAfter:c.bytesAfter }));
+      ctx.out(statTable(rows)+statLine({ files:rows.length,insertions:rows.reduce((n,r)=>n+r.insertions,0),deletions:rows.reduce((n,r)=>n+r.deletions,0) })); return 1;
+    }
+    let text="";
+    for (const c of changes) {
+      const { left:a,right:b }=c;
+      let header=`diff --git a/${noIndexName(c.labelA)} b/${noIndexName(c.labelB)}\n`;
+      if (!a) header+=`new file mode ${b.mode}\n`; else if (!b) header+=`deleted file mode ${a.mode}\n`; else if (a.mode!==b.mode) header+=`old mode ${a.mode}\nnew mode ${b.mode}\n`;
+      if (!a || !b || a.oid!==b.oid) header+=`index ${short(a?.oid??"0".repeat(40))}..${short(b?.oid??"0".repeat(40))}${a&&b&&a.mode===b.mode?` ${a.mode}`:""}\n`;
+      if (a?.oid===b?.oid) { text+=ctx.paint("bold",header.trimEnd())+"\n"; continue; }
+      if (c.binary) { text+=ctx.paint("bold",header.trimEnd())+`\nBinary files ${a?`a/${noIndexName(c.labelA)}`:"/dev/null"} and ${b?`b/${noIndexName(c.labelB)}`:"/dev/null"} differ\n`; continue; }
+      header+=`--- ${a?`a/${noIndexName(c.labelA)}`:"/dev/null"}\n+++ ${b?`b/${noIndexName(c.labelB)}`:"/dev/null"}`;
+      text+=header.split("\n").map((line)=>ctx.paint("bold",line)).join("\n")+"\n"+gitHunks(c.patch??"",a?Buffer.from(a.content).toString("latin1"):"",ctx);
+    }
+    ctx.out(text); return 1;
+  } finally { await rm(scratch,{ recursive:true,force:true }); }
+}
 async function diff(ctx,argv) {
   const parsed=parse(argv,{
-    cached:"cached", staged:"cached", stat:"stat", "name-only":"nameOnly", "name-status":"nameStatus",
+    cached:"cached", staged:"cached", stat:"stat", check:"check", "name-only":"nameOnly", "name-status":"nameStatus",
     U:["context",count], unified:["context",count], color:"color", "no-color":"noColor", "exit-code":"exitCode", quiet:"quiet",
     "no-ext-diff":"noExt", "no-renames":"noRenames", "no-index":"noIndex", p:"patch", u:"patch", patch:"patch",
   });
   const { options }=parsed;
-  if (options.noIndex) throw new Error("--no-index is not available in this port");
   if (options.quiet) { options.exitCode=true; ctx.out=()=>{}; }
   if (options.color) ctx.colour=true;
   if (options.noColor) ctx.colour=false;
+  if (options.noIndex) return diffNoIndex(ctx,options,parsed.positional);
   const repo=await base(ctx);
   const paths=parsed.paths??[];
   let revs=parsed.positional.slice(0,parsed.positional.length-paths.length);
@@ -1406,6 +1561,26 @@ async function diff(ctx,argv) {
   for (const pair of pairs) if (!changes.some((c)=>c.path===pair.path) && pair.left && pair.right && pair.left.mode!==pair.right.mode) changes.push({ ...pair, status:"modified", linesAdded:0, linesRemoved:0 });
   changes.sort((x,y)=>x.path<y.path?-1:1);
   if (changes.length===0) return options.exitCode?0:undefined;
+  if (options.check) {
+    let text="", bad=false;
+    for (const change of changes) {
+      if (change.binary || !change.patch) continue;
+      let newLine=0;
+      for (const line of change.patch.split("\n")) {
+        const hunk=/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+        if (hunk) { newLine=Number(hunk[1]); continue; }
+        if (line.startsWith("+")) {
+          if (/[ \t]+$/.test(line.slice(1))) {
+            text+=`${change.path}:${newLine}: trailing whitespace.\n${line}\n`;
+            bad=true;
+          }
+          newLine++;
+        } else if (!line.startsWith("-")) newLine++;
+      }
+    }
+    if (text) ctx.out(text);
+    return bad?2:0;
+  }
   if (options.nameOnly) { ctx.out(changes.map((c)=>c.path+"\n").join("")); return options.exitCode?1:undefined; }
   if (options.nameStatus) { ctx.out(changes.map((c)=>`${c.status==="added"?"A":c.status==="deleted"?"D":"M"}\t${c.path}\n`).join("")); return options.exitCode?1:undefined; }
   if (options.stat) {
@@ -1511,7 +1686,7 @@ async function showRef(ctx,argv) {
 }
 
 async function lsRemote(ctx,argv) {
-  const { options,positional }=parse(argv,{ h:"heads", heads:"heads", t:"tags", tags:"tags", refs:"refs", q:"quiet", quiet:"quiet", "get-url":"getUrl" });
+  const { options,positional }=parse(argv,{ h:"heads", heads:"heads", t:"tags", tags:"tags", refs:"refs", q:"quiet", quiet:"quiet", "get-url":"getUrl", symref:"symref", "exit-code":"exitCode" });
   let target=positional[0];
   if (!target || !/^[a-z][a-z0-9+.-]*:\/\//i.test(target)) {
     const current=await branchName(ctx).catch(()=>undefined);
@@ -1528,10 +1703,12 @@ async function lsRemote(ctx,argv) {
     return true;
   };
   const sorted=refs.filter((r)=>keep(r.ref)).sort((a,b)=>a.ref==="HEAD"?-1:b.ref==="HEAD"?1:a.ref<b.ref?-1:1);
-  for (const { ref,oid,peeled } of sorted) {
+  for (const { ref,oid,peeled,target } of sorted) {
+    if (options.symref && target) ctx.out(`ref: ${target}\t${ref}\n`);
     ctx.out(`${oid}\t${ref}\n`);
     if (peeled && !options.refs) ctx.out(`${peeled}\t${ref}^{}\n`);
   }
+  if (options.exitCode && sorted.length===0) return 2;
 }
 
 async function configCommand(ctx,argv) {
@@ -1603,12 +1780,179 @@ async function catFile(ctx,argv) {
 }
 
 async function hashObject(ctx,argv) {
-  const { options,positional }=parse(argv,{ w:"write", stdin:"stdin", t:["type"] });
-  const inputs=options.stdin?[await readFile("/dev/stdin")]:await Promise.all(positional.map((p)=>readFile(resolve(ctx.cwd,p))));
+  const { options,positional }=parse(argv,{ w:"write", stdin:"stdin", "stdin-paths":"stdinPaths", t:["type"], "no-filters":"noFilters", literally:"literally" });
+  const type=options.type??"blob";
+  if (!["blob","tree","commit","tag"].includes(type)) throw new Error(`invalid object type \"${type}\"`);
+  if (options.stdin && options.stdinPaths) throw new Error("cannot use --stdin with --stdin-paths");
+  const paths=options.stdinPaths?(await readStdin()).toString("utf8").split("\n").filter(Boolean):positional;
+  const inputs=options.stdin?[await readStdin()]:await Promise.all(paths.map((p)=>readFile(resolve(ctx.cwd,p))));
   for (const object of inputs) {
-    if (options.write) ctx.out(`${await git.writeBlob({ ...await base(ctx), blob:new Uint8Array(object) })}\n`);
-    else ctx.out(`${(await git.hashBlob({ object:new Uint8Array(object) })).oid}\n`);
+    if (options.write) ctx.out(`${await git.writeObject({ ...await base(ctx), type, object:new Uint8Array(object), format:"content" })}\n`);
+    else {
+      const hasher=new Bun.CryptoHasher("sha1");
+      hasher.update(`${type} ${object.length}\0`); hasher.update(object);
+      ctx.out(`${hasher.digest("hex")}\n`);
+    }
   }
+}
+
+async function writeTreeFromIndex(ctx) {
+  const repo=await base(ctx), root={ dirs:new Map(), files:[] };
+  const entries=await git.walk({ ...repo, trees:[git.STAGE()], map:async (path,[entry])=>{
+    if (path==="." || !entry || await entry.type()!=="blob") return;
+    return { path,mode:(await entry.mode()).toString(8),oid:await entry.oid() };
+  } });
+  for (const entry of entries.filter(Boolean)) {
+    const parts=entry.path.split("/"), name=parts.pop(); let node=root;
+    for (const part of parts) { if (!node.dirs.has(part)) node.dirs.set(part,{ dirs:new Map(),files:[] }); node=node.dirs.get(part); }
+    node.files.push({ mode:entry.mode,path:name,oid:entry.oid,type:"blob" });
+  }
+  const write=async (node)=>{
+    const tree=[...node.files];
+    for (const [path,child] of node.dirs) tree.push({ mode:"040000",path,oid:await write(child),type:"tree" });
+    tree.sort((a,b)=>a.path.localeCompare(b.path));
+    return git.writeTree({ ...repo,tree });
+  };
+  return write(root);
+}
+async function writeTreeCommand(ctx,argv) {
+  if (argv.length) throw new Error("usage: git write-tree");
+  ctx.out(`${await writeTreeFromIndex(ctx)}\n`);
+}
+async function mkTree(ctx,argv) {
+  const { options,positional }=parse(argv,{ z:"nul", missing:"missing", batch:"batch" });
+  if (positional.length) throw new Error("usage: git mktree [-z] [--missing]");
+  const input=(await readStdin()).toString("latin1");
+  const groups=options.batch?input.split(options.nul?"\0\0":"\n\n"):[input];
+  for (const group of groups) {
+    const records=group.split(options.nul?"\0":"\n").filter(Boolean);
+    if (!records.length && options.batch) continue;
+    const tree=[];
+    for (const row of records) {
+      const match=/^(\d+)\s+(blob|tree|commit)\s+([0-9a-f]{40})\t([\s\S]+)$/.exec(row);
+      if (!match) throw new Error(`input format error: ${row}`);
+      const [,mode,type,oid,path]=match;
+      if (!options.missing) await git.readObject({ ...await base(ctx),oid });
+      tree.push({ mode,path,oid,type });
+    }
+    ctx.out(`${await git.writeTree({ ...await base(ctx),tree })}\n`);
+  }
+}
+async function commitTree(ctx,argv) {
+  const { options,positional }=parse(argv,{ p:["parents",list], m:["messages",list], F:["files",list] });
+  if (positional.length!==1) throw new Error("usage: git commit-tree <tree> [-p <parent>]... [-m <message> | -F <file>]...");
+  const tree=await revision(ctx,positional[0],"tree"), parent=await Promise.all((options.parents??[]).map((p)=>revision(ctx,p,"commit")));
+  const pieces=[...(options.messages??[])];
+  for (const file of options.files??[]) pieces.push(file==="-"?(await readStdin()).toString("utf8"):await readFile(resolve(ctx.cwd,file),"utf8"));
+  if (!pieces.length) pieces.push((await readStdin()).toString("utf8"));
+  const author=await identity(ctx,"author"), committer=await identity(ctx,"committer");
+  const oid=await git.writeCommit({ ...await base(ctx),commit:{ tree,parent,author,committer,message:cleanMessage(pieces.join("\n\n")) } });
+  ctx.out(`${oid}\n`);
+}
+async function mkTag(ctx,argv) {
+  const { positional }=parse(argv,{ strict:"strict", "no-strict":"noStrict" });
+  if (positional.length) throw new Error("usage: git mktag");
+  const object=new Uint8Array(await readStdin());
+  ctx.out(`${await git.writeObject({ ...await base(ctx),type:"tag",object,format:"content" })}\n`);
+}
+
+function notesRef(value) {
+  if (!value) return "refs/notes/commits";
+  return value.startsWith("refs/")?value:`refs/notes/${value}`;
+}
+async function notes(ctx,argv) {
+  const parsed=parse(argv,{ ref:["ref"], f:"force", force:"force", m:["message",list], message:["message",list], F:["files",list], file:["files",list], "allow-empty":"allowEmpty" });
+  const { options,positional }=parsed;
+  const verbs=new Set(["add","append","copy","show","remove","list","get-ref","prune"]);
+  const verb=verbs.has(positional[0])?positional.shift():"list";
+  const repo=await base(ctx), ref=notesRef(options.ref);
+  if (verb==="get-ref") { ctx.out(`${ref}\n`); return; }
+  if (verb==="copy") {
+    if (positional.length!==2) throw new Error("notes copy requires two objects");
+    const [from,to]=await Promise.all(positional.map((p)=>revision(ctx,p)));
+    const note=await git.readNote({ ...repo,ref,oid:from });
+    const author=await identity(ctx,"author"), committer=await identity(ctx,"committer");
+    await git.addNote({ ...repo,ref,oid:to,note,force:!!options.force,author,committer }); return;
+  }
+  if (verb==="prune") {
+    const author=await identity(ctx,"author"), committer=await identity(ctx,"committer");
+    for (const entry of await git.listNotes({ ...repo,ref })) {
+      try { await git.readObject({ ...repo,oid:entry.target }); }
+      catch { await git.removeNote({ ...repo,ref,oid:entry.target,author,committer }); }
+    }
+    return;
+  }
+  if (verb==="list") {
+    if (positional.length>1) throw new Error("notes list takes at most one object");
+    const entries=await git.listNotes({ ...repo, ref });
+    if (positional[0]) {
+      const target=await revision(ctx,positional[0]);
+      const found=entries.find((entry)=>entry.target===target);
+      if (!found) return 1;
+      ctx.out(`${found.note}\n`);
+    } else for (const entry of entries.sort((a,b)=>a.target.localeCompare(b.target))) ctx.out(`${entry.note} ${entry.target}\n`);
+    return;
+  }
+  const shown=positional[0]??"HEAD", oid=await revision(ctx,shown);
+  if (verb==="show") {
+    try { ctx.out(Buffer.from(await git.readNote({ ...repo, ref, oid })).toString()); }
+    catch (error) { throw failure(`no note found for object ${oid}.`); }
+    return;
+  }
+  const author=await identity(ctx,"author"), committer=await identity(ctx,"committer");
+  if (verb==="remove") {
+    for (const name of positional.length?positional:["HEAD"]) {
+      await git.removeNote({ ...repo, ref, oid:await revision(ctx,name), author, committer });
+      ctx.err(`Removing note for object ${name}\n`);
+    }
+    return;
+  }
+  const pieces=[...(options.message??[])];
+  for (const file of options.files??[]) pieces.push(file==="-"?(await readStdin()).toString("utf8"):await readFile(resolve(ctx.cwd,file),"utf8"));
+  if (!pieces.length) throw new Error(`notes ${verb} requires -m <message> or -F <file> in this port`);
+  let note=pieces.length?cleanMessage(pieces.join("\n\n")):"";
+  if (verb==="append") {
+    try { note=cleanMessage(Buffer.from(await git.readNote({ ...repo,ref,oid })).toString()+"\n"+note); } catch {}
+  }
+  await git.addNote({ ...repo, ref, oid, note, force:verb==="append"||!!options.force, author, committer });
+}
+
+async function applyRefUpdate(ctx,{ verb="update",ref,value,old }) {
+  const repo=await base(ctx);
+  let current;
+  try { current=await git.resolveRef({ ...repo, ref }); } catch {}
+  const expected=old && old!=="0".repeat(40)?await revision(ctx,old):old;
+  if (expected && expected!=="0".repeat(40) && current!==expected)
+    throw failure(`cannot lock ref '${ref}': is at ${current??"0".repeat(40)} but expected ${old}`);
+  if (old==="0".repeat(40) && current) throw failure(`cannot lock ref '${ref}': reference already exists`);
+  if (verb==="verify") {
+    if (!old && current) throw failure(`cannot lock ref '${ref}': reference already exists`);
+    return;
+  }
+  if (verb==="create" && current) throw failure(`cannot lock ref '${ref}': reference already exists`);
+  if (verb==="delete" || value==="0".repeat(40)) {
+    if (current) await git.deleteRef({ ...repo, ref });
+    return;
+  }
+  const oid=await revision(ctx,value);
+  await git.writeRef({ ...repo, ref, value:oid, force:true });
+}
+async function updateRef(ctx,argv) {
+  const { options,positional }=parse(argv,{ d:"remove", m:["reason"], stdin:"stdin", "no-deref":"noDeref", "create-reflog":"createReflog" });
+  if (options.stdin) {
+    if (positional.length) throw new Error("--stdin does not take command-line ref arguments");
+    const lines=(await readStdin()).toString("utf8").split("\n").map((line)=>line.trim()).filter(Boolean);
+    for (const line of lines) {
+      const [verb,ref,value,old,...extra]=line.split(/\s+/);
+      if (!['update','create','delete','verify'].includes(verb) || !ref || extra.length) throw new Error(`unknown command: ${line}`);
+      if ((verb==="update"||verb==="create")&&!value) throw new Error(`${verb}: missing <new-oid>`);
+      await applyRefUpdate(ctx,{ verb,ref,value,old:verb==="delete"||verb==="verify"?value:old });
+    }
+    return;
+  }
+  const [ref,value,old]=positional;
+  if (!ref || (!options.remove && !value) || positional.length>(options.remove?2:3)) throw new Error("usage: git update-ref [-d] <refname> [<new-oid> [<old-oid>]]");
+  return applyRefUpdate(ctx,{ verb:options.remove?"delete":"update",ref,value,old:options.remove?value:old });
 }
 
 async function stash(ctx,argv) {
@@ -1665,7 +2009,7 @@ async function stash(ctx,argv) {
 }
 
 async function show(ctx,argv) {
-  const { options,positional }=parse(argv,{ stat:"stat", "no-patch":"noPatch", s:"noPatch", color:"color", "no-color":"noColor" });
+  const { options,positional }=parse(argv,{ stat:"stat", oneline:"oneline", "no-patch":"noPatch", s:"noPatch", color:"color", "no-color":"noColor" });
   if (positional.length>1) throw new Error("this port shows one object at a time");
   if (options.color) ctx.colour=true;
   if (options.noColor) ctx.colour=false;
@@ -1674,9 +2018,11 @@ async function show(ctx,argv) {
   const object=await git.readObject({ ...repo, oid, format:"parsed" });
   if (object.type!=="commit") return catFile(ctx,["-p",oid]);
   const entry={ oid,commit:object.object };
-  ctx.out(mediumCommit(ctx,entry,ctx.decorate?await decorations(ctx):undefined));
+  const names=ctx.decorate?await decorations(ctx):undefined;
+  if (options.oneline) ctx.out(`${ctx.paint("yellow",short(oid))}${decorate(ctx,names,oid)} ${subject(entry.commit.message)}\n`);
+  else ctx.out(mediumCommit(ctx,entry,names));
   if (options.noPatch) return;
-  ctx.out("\n");
+  if (!options.oneline) ctx.out("\n");
   const parent=object.object.parent[0];
   return diff(ctx,[...(options.stat?["--stat"]:[]),parent??EMPTY_TREE,oid]);
 }
@@ -1689,14 +2035,14 @@ async function version(ctx) {
 
 export const commands={
   init:        { usage:"init [-q] [--bare] [-b <branch>] [<directory>]", run:init },
-  clone:       { usage:"clone [--depth <n>] [-b <branch>] [--single-branch] [--no-tags] [-n] [-q] <repository> [<directory>]", run:clone },
+  clone:       { usage:"clone [--depth <n> | --shallow-since <date>] [--shallow-exclude <ref>] [-b <branch>] [--single-branch] [--no-tags] [-n] [-q] <repository> [<directory>]", run:clone },
   add:         { usage:"add [-A | -u] [-n] [-v] [--] <pathspec>...", run:add },
   rm:          { usage:"rm [--cached] [-r] [-q] [--] <pathspec>...", run:remove },
   mv:          { usage:"mv [-f] <source>... <destination>", run:move },
   commit:      { usage:"commit [-a] [-q] [--amend] [--allow-empty] [--author=<author>] [--date=<date>] [-m <msg> | -F <file>] [--] [<pathspec>...]", run:commit },
-  status:      { usage:"status [-s | --porcelain] [-b] [--] [<pathspec>...]", run:status },
-  log:         { usage:"log [--all] [-n <count>] [--oneline] [--format=<format>] [--reverse] [<revision>] [-- <path>]", run:log },
-  show:        { usage:"show [--stat | --no-patch] [<object>]", run:show },
+  status:      { usage:"status [-s | --porcelain] [-b] [--ignored] [--] [<pathspec>...]", run:status },
+  log:         { usage:"log [--all] [-n <count>] [--oneline] [--format=<format>] [--since=<date>] [--follow] [--reverse] [<revision>] [-- <path>]", run:log },
+  show:        { usage:"show [--stat | --no-patch] [--oneline] [<object>]", run:show },
   branch:      { usage:"branch [-a | -r] | branch <name> [<start-point>] | branch (-d | -D | -m | -M | -u <upstream>) ... | branch --show-current", run:branch },
   checkout:    { usage:"checkout [-f] [-q] <branch> | checkout -b <new-branch> [<start-point>] | checkout [<tree-ish>] -- <pathspec>...", run:checkout },
   switch:      { usage:"switch [-f] [-q] <branch> | switch -c <new-branch> [<start-point>]", run:switchBranch },
@@ -1704,19 +2050,27 @@ export const commands={
   reset:       { usage:"reset [--soft | --mixed | --hard] [-q] [<commit>] | reset [<tree-ish>] [--] <pathspec>...", run:reset },
   tag:         { usage:"tag [-l [<pattern>]] | tag [-a] [-m <msg>] [-f] <tagname> [<commit>] | tag -d <tagname>...", run:tag },
   remote:      { usage:"remote [-v] | remote add <name> <url> | remote remove <name> | remote get-url <name> | remote set-url <name> <url>", run:remote },
-  fetch:       { usage:"fetch [--depth <n>] [--tags] [-p] [-q] [--all] [<remote> [<branch>]]", run:fetch },
+  fetch:       { usage:"fetch [--depth <n> | --deepen <n> | --shallow-since <date>] [--shallow-exclude <ref>] [--tags] [-p] [-q] [--all] [<remote> [<branch>]]", run:fetch },
   pull:        { usage:"pull [--ff-only | --no-ff] [-q] [<remote> [<branch>]]", run:pull },
   push:        { usage:"push [-u] [-f] [-d] [--tags] [--all] [-q] [<remote> [<refspec>...]]", run:push },
   merge:       { usage:"merge [--no-ff | --ff-only] [-m <msg>] [--allow-unrelated-histories] <branch> | merge --abort", run:merge },
-  diff:        { usage:"diff [--cached] [--stat | --name-only | --name-status] [-U<n>] [--exit-code] [<commit> [<commit>]] [--] [<path>...]", run:diff },
+  diff:        { usage:"diff [--cached] [--check | --stat | --name-only | --name-status] [-U<n>] [--exit-code] [<commit> [<commit>]] [--] [<path>...] | diff --no-index [<options>] <path> <path>", run:diff },
+  "check-ignore":{ usage:"check-ignore [-q] [--no-index] <pathname>...", run:checkIgnore },
+  "merge-base": { usage:"merge-base [-a] <commit> <commit>... | merge-base --is-ancestor <commit> <commit>", run:mergeBase },
   "cherry-pick":{ usage:"cherry-pick [-n] <commit>", run:cherryPick },
   "rev-parse": { usage:"rev-parse [--short] [--abbrev-ref] [--verify] <revision>... | rev-parse --show-toplevel | --git-dir | --is-inside-work-tree | --show-prefix", run:revParse },
   "ls-files":  { usage:"ls-files [-s] [-o] [-z] [--] [<path>...]", run:lsFiles },
   "show-ref":  { usage:"show-ref [--heads] [--tags] [-d] [-s] [<pattern>...]", run:showRef },
-  "ls-remote": { usage:"ls-remote [--heads] [--tags] [--refs] [<remote or url> [<pattern>...]]", run:lsRemote },
+  "ls-remote": { usage:"ls-remote [--heads] [--tags] [--refs] [--symref] [--exit-code] [<remote or url> [<pattern>...]]", run:lsRemote },
   config:      { usage:"config [--global | --local] <name> [<value>] | config --get <name> | config --unset <name> | config --list | config --add <name> <value>", run:configCommand },
   "cat-file":  { usage:"cat-file (-t | -s | -e | -p) <object>", run:catFile },
-  "hash-object":{ usage:"hash-object [-w] [--stdin | <file>...]", run:hashObject },
+  "hash-object":{ usage:"hash-object [-t <type>] [-w] [--stdin | --stdin-paths | <file>...]", run:hashObject },
+  "write-tree":{ usage:"write-tree", run:writeTreeCommand },
+  mktree:      { usage:"mktree [-z] [--missing] [--batch]", run:mkTree },
+  "commit-tree":{ usage:"commit-tree <tree> [-p <parent>]... [-m <message> | -F <file>]...", run:commitTree },
+  mktag:       { usage:"mktag", run:mkTag },
+  notes:       { usage:"notes [--ref <notes-ref>] [list | show | add | append | copy | remove | prune | get-ref] [-m <msg> | -F <file>] [--allow-empty] ...", run:notes },
+  "update-ref":{ usage:"update-ref [-m <reason>] <refname> <new-oid> [<old-oid>] | update-ref -d <refname> [<old-oid>] | update-ref --stdin", run:updateRef },
   stash:       { usage:"stash [push [-m <msg>] | pop [<n>] | apply [<n>] | drop [<n>] | list | clear]", run:stash },
   version:     { usage:"version", run:version },
 };

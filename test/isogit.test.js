@@ -80,6 +80,21 @@ function both(args,{ cwd="" }={}) {
     iso:launch("iso",join(roots.iso,cwd),args,step),
   };
 }
+function bothStdin(args,input,{ cwd="" }={}) {
+  step++;
+  const run=(side)=>{
+    const cmd=side==="sys"?[SYSTEM_GIT,...args]:[BUN,PROOT,"--git","-c","color.ui=auto","-c","log.decorate=auto",...args];
+    const result=spawn({ cmd,cwd:join(roots[side],cwd),env:environment(step),stdin:Buffer.from(input),stdout:"pipe",stderr:"pipe" });
+    return { stdout:result.stdout.toString(),stderr:result.stderr.toString(),status:result.exitCode };
+  };
+  return { sys:run("sys"),iso:run("iso") };
+}
+function sameStdin(args,input,options) {
+  const { sys,iso }=bothStdin(args,input,options);
+  const label=`git ${args.join(" ")}`;
+  expect({ label,status:iso.status,stdout:iso.stdout,stderr:iso.stderr }).toEqual({ label,status:sys.status,stdout:sys.stdout,stderr:sys.stderr });
+  return { sys,iso };
+}
 function same(args,options) {
   const { sys,iso }=both(args,options);
   const label=`git ${args.join(" ")}`;
@@ -433,6 +448,7 @@ describe("bunproot --git matches the system git",()=>{
   it("show, log --all, the commit editor and stash match Git",()=>{
     same(["show","--no-patch","HEAD"]);
     same(["show","--stat","HEAD"]);
+    same(["show","--stat","--oneline","HEAD"]);
     same(["show","HEAD"]);
     const rootCommit=launch("sys",roots.sys,["rev-list","--max-parents=0","HEAD"],0).stdout.trim();
     same(["show",rootCommit]);
@@ -461,6 +477,105 @@ describe("bunproot --git matches the system git",()=>{
     }
     same(["status","--porcelain"]);
     same(["restore","edited-message.txt"]);
+    crossCheck();
+  });
+
+  it("check-ignore, merge-base and diff --check match Git",()=>{
+    write("tracked.tmp","tracked despite later ignore rule\n");
+    same(["add","tracked.tmp"]);
+    write(".gitignore","ignored/\n*.tmp\n");
+    write("ignored/file.txt","ignored\n");
+    write("ignored.tmp","ignored\n");
+    write("kept.txt","kept\n");
+    same(["check-ignore","ignored/file.txt","kept.txt","ignored.tmp"]);
+    expect(both(["check-ignore","-q","kept.txt"]).iso.status).toBe(1);
+    expect(both(["check-ignore","-q","ignored.tmp"]).iso.status).toBe(0);
+    same(["check-ignore","tracked.tmp"]);
+    same(["check-ignore","--no-index","tracked.tmp"]);
+    same(["merge-base","HEAD","HEAD~1"]);
+    expect(both(["merge-base","--is-ancestor","HEAD~1","HEAD"]).iso.status).toBe(0);
+    expect(both(["merge-base","--is-ancestor","HEAD","HEAD~1"]).iso.status).toBe(1);
+    write("whitespace.txt","trailing  \nclean\n");
+    same(["add","whitespace.txt"]);
+    same(["diff","--cached","--check"]);
+    same(["reset","-q","whitespace.txt"]);
+    remove("whitespace.txt");
+    remove("ignored");
+    remove("ignored.tmp");
+    remove("kept.txt");
+    same(["reset","-q","tracked.tmp"]);
+    remove("tracked.tmp");
+    remove(".gitignore");
+    crossCheck();
+  });
+
+  it("log filters, ignored status, notes and update-ref match Git",()=>{
+    write("ignored-dir/file.txt","ignored\n");
+    write(".gitignore","ignored-dir/\n");
+    same(["status","--short","--ignored"]);
+    same(["status","--ignored"]);
+    same(["log","--oneline","--since=2023-11-14T22:21:40Z"]);
+    same(["log","--follow","--oneline","--","renamed.txt"]);
+    same(["notes","add","-m","a test note","HEAD"]);
+    same(["notes","list"]);
+    same(["notes","show","HEAD"]);
+    same(["notes","remove","HEAD"]);
+    same(["update-ref","-d","refs/notes/commits"]);
+    same(["update-ref","refs/test/probe","HEAD"]);
+    same(["rev-parse","refs/test/probe"]);
+    same(["update-ref","-d","refs/test/probe"]);
+    remove("ignored-dir");
+    remove(".gitignore");
+    crossCheck();
+  });
+
+  it("diff --no-index compares files and directory trees like Git",()=>{
+    write("no-index-left/same.txt","same\n");
+    write("no-index-right/same.txt","same\n");
+    write("no-index-left/changed.txt","old\n");
+    write("no-index-right/changed.txt","new\n");
+    write("no-index-left/deleted.txt","gone\n");
+    write("no-index-right/added.txt","added\n");
+    for (const extra of [[],["--stat"],["--name-only"],["--name-status"]])
+      same(["diff","--no-index",...extra,"no-index-left","no-index-right"]);
+    same(["diff","--no-index","no-index-left/changed.txt","no-index-right/changed.txt"]);
+    write("no-index-right/changed.txt","bad trailing whitespace  \n");
+    same(["diff","--no-index","--check","no-index-left/changed.txt","no-index-right/changed.txt"]);
+    remove("no-index-left");
+    remove("no-index-right");
+    crossCheck();
+  });
+
+  it("plumbing objects and extended notes match Git",()=>{
+    write("plumbing.txt","plumbing object\n");
+    same(["hash-object","-t","blob","plumbing.txt"]);
+    sameStdin(["hash-object","--stdin-paths"],"plumbing.txt\n");
+    same(["add","plumbing.txt"]);
+    const tree=same(["write-tree"]).sys.stdout.trim();
+    same(["commit-tree",tree,"-p","HEAD","-m","plumbing commit"]);
+    const blob=same(["hash-object","-w","plumbing.txt"]).sys.stdout.trim();
+    sameStdin(["mktree"],`100644 blob ${blob}\tstandalone.txt\n`);
+    sameStdin(["mktree","--batch"],`100644 blob ${blob}\tone.txt\n\n100644 blob ${blob}\ttwo.txt\n\n`);
+    const head=launch("sys",roots.sys,["rev-parse","HEAD"],0).stdout.trim();
+    const tag=`object ${head}\ntype commit\ntag plumbing-tag\ntagger Test Author <author@example.com> 1700000000 +0000\n\nplumbing tag\n`;
+    sameStdin(["mktag"],tag);
+    same(["notes","add","-m","first","HEAD"]);
+    same(["notes","append","-m","second","HEAD"]);
+    write("note-message.txt","from a file\n");
+    same(["notes","add","-F","note-message.txt","HEAD~1"]);
+    same(["notes","add","--allow-empty","-m","","HEAD~2"]);
+    same(["notes","copy","-f","HEAD","HEAD~1"]);
+    same(["notes","show","HEAD~1"]);
+    same(["notes","get-ref"]);
+    same(["notes","prune"]);
+    same(["notes","remove","HEAD","HEAD~1","HEAD~2"]);
+    same(["update-ref","-d","refs/notes/commits"]);
+    sameStdin(["update-ref","--stdin"],`create refs/test/stdin ${head}\n`);
+    sameStdin(["update-ref","--stdin"],`verify refs/test/stdin ${head}\n`);
+    sameStdin(["update-ref","--stdin"],`delete refs/test/stdin ${head}\n`);
+    same(["reset","-q","plumbing.txt"]);
+    remove("plumbing.txt");
+    remove("note-message.txt");
     crossCheck();
   });
 
@@ -500,6 +615,8 @@ describe("bunproot --git matches the system git",()=>{
       const listed=ok(["ls-remote","origin"]);
       expect(listed.iso.stdout).toContain("\tHEAD\n");
       expect(listed.iso.stdout).toContain("\trefs/tags/v2^{}\n");
+      ok(["ls-remote","--symref","origin"]);
+      expect(both(["ls-remote","--exit-code","origin","refs/heads/does-not-exist"]).iso.status).toBe(2);
       ok(["ls-remote","--heads",url("iso")]);
       ok(["ls-remote","--tags","--refs","origin"]);
       // Clone each bare repository with each implementation into a fresh pair.

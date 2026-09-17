@@ -89,6 +89,8 @@ const cloneSpec={
   b:["ref"], branch:["ref"],
   o:["remote"], origin:["remote"],
   depth:["depth",positiveDepth],
+  "shallow-since":["since"],
+  "shallow-exclude":["exclude",list],
 };
 
 export function parseClone(argv,cwd=process.cwd()) {
