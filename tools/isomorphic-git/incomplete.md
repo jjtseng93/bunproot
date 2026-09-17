@@ -78,6 +78,16 @@ implements Git's behaviour on top of the object-level APIs:
   or left unmerged.
 - status and ls-files -s: conflict stages are read straight from the index
   file, which isomorphic-git keeps but does not expose.
+- cherry-pick: isomorphic-git 1.41.9's cherryPick takes `oid` and lands the
+  tree itself but has no conflict state; the port adds Git's refusals,
+  `-n`, conflict markers, CHERRY_PICK_HEAD, --continue/--skip/--abort and
+  the summary line.  `status` does not yet say "You are currently
+  cherry-picking".
+- log A..B and A...B are computed from two walks; Git's --since cutoff
+  around merges is not reproduced exactly.
+- notes commits are rewritten with Git's messages, since addNote and
+  removeNote hard-code their own.
+- show at a shallow clone's boundary treats the commit as a root commit.
 
 Partial commands and deliberate limits
 --------------------------------------

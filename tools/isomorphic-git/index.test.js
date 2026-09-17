@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { confirmInstall, parseGlobal } from "./index.js";
+import { confirmInstall, parseGlobal, readme } from "./index.js";
 import { destination, list, parse, parseClone } from "./options.js";
 
 test("--yes skips only the installation confirmation", () => {
@@ -40,4 +40,14 @@ test("the option parser follows Git's conventions", () => {
   expect(parse(["--decorate"],optional).options).toEqual({ decorate:true });
   expect(parse(["--decorate=short"],optional).options).toEqual({ decorate:"short" });
   expect(()=>parse(["-m"],spec)).toThrow("requires a value");
+});
+
+test("--readme prints the guide next to the wrapper", () => {
+  expect(parseGlobal(["--readme","ignored"])).toMatchObject({ command:"readme", argv:[] });
+  const text=readme();
+  expect(text.startsWith("# bunproot --git\n")).toBe(true);
+  // Every command the wrapper dispatches is listed in the guide's reference.
+  const reference=text.slice(text.indexOf("## Commands"),text.indexOf("## A walk through"));
+  for (const name of ["init","clone","add","commit","diff","merge","stash","ls-files","update-ref","mktag"])
+    expect(reference).toMatch(new RegExp(`^${name}\\b`,"m"));
 });

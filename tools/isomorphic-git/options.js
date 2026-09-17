@@ -82,7 +82,7 @@ export function destination(url) {
 }
 
 const cloneSpec={
-  q:"quiet", quiet:"quiet",
+  q:"quiet", quiet:"quiet", progress:"progress",
   n:"noCheckout", "no-checkout":"noCheckout",
   "single-branch":"singleBranch", "no-single-branch":"multiBranch",
   "no-tags":"noTags",

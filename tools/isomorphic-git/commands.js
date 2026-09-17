@@ -300,7 +300,10 @@ async function writeMergeState(ctx,theirs,message,conflicts) {
 }
 async function clearMergeState(ctx) {
   const { gitdir }=await base(ctx);
-  for (const name of ["MERGE_HEAD","MERGE_MODE","MERGE_MSG"]) await rm(join(gitdir,name),{ force:true });
+  for (const name of ["MERGE_HEAD","MERGE_MODE","MERGE_MSG","CHERRY_PICK_HEAD"]) await rm(join(gitdir,name),{ force:true });
+}
+async function cherryPickHead(ctx) {
+  try { return (await readFile(join((await base(ctx)).gitdir,"CHERRY_PICK_HEAD"),"utf8")).trim()||undefined; } catch { return undefined; }
 }
 // Git refuses to commit or merge over unresolved conflicts, listing them.
 async function refuseUnmerged(ctx,verb) {
@@ -579,10 +582,15 @@ function onAuth(url) {
 function network(ctx,options={}) {
   return {
     http, onAuth,
-    onMessage:options.quiet?undefined:(message)=>ctx.err(`remote: ${message}`),
+    // The server's sideband chatter is progress: Git shows it only on a
+    // terminal, or with --progress.
+    onMessage:options.quiet || (!options.progress && !process.stderr.isTTY)?undefined:(message)=>ctx.err(`remote: ${message}`),
     headers:{ "User-Agent":`git/isogit-${VERSION}` },
   };
 }
+
+// The URL as Git's fetch and pull print it after "From": no trailing .git or /.
+const shownUrl=(url)=>url.replace(/\/?(\.git)?\/?$/,"");
 
 // ---------------------------------------------------------------- commands
 
@@ -740,9 +748,12 @@ async function commit(ctx,argv) {
   // Concluding a merge: MERGE_HEAD supplies the other parents and MERGE_MSG
   // the message, which --no-edit takes as it is, comments included.
   const mergeParents=options.amend?[]:await mergeHeads(ctx);
+  const picking=options.amend?undefined:await cherryPickHead(ctx);
+  const picked=picking?(await git.readCommit({ ...repo, oid:picking })).commit:undefined;
   let message;
   if (options.message) message=cleanMessage(options.message.join("\n\n"));
   else if (options.file) message=cleanMessage(options.file==="-"?(await readStdin()).toString("utf8"):await readFile(resolve(ctx.cwd,options.file),"utf8"));
+  else if (picked) message=options.noEdit?picked.message:await editMessage(repo,picked.message);
   else if (mergeParents.length) {
     const initial=await readFile(join(repo.gitdir,"MERGE_MSG"),"utf8").catch(()=>"");
     message=options.noEdit?initial.replace(/\n*$/,"\n"):await editMessage(repo,initial);
@@ -758,6 +769,7 @@ async function commit(ctx,argv) {
   // --amend starts from the original author; --author and --date replace
   // only the name/email or the date, and --reset-author all of it.
   let author=await identity(ctx,"author",{ date:options.date, literal:options.author });
+  if (picked && !options.resetAuthor && !options.author && !options.date) author=picked.author;
   if (options.amend && before && !options.resetAuthor) {
     const original=(await git.readCommit({ ...repo, oid:before })).commit.author;
     author={ ...original, ...(options.author?{ name:author.name, email:author.email }:{}),
@@ -774,7 +786,7 @@ async function commit(ctx,argv) {
     ctx.out(await statusText(ctx,{}));
     return 1;
   }
-  if (mergeParents.length) await clearMergeState(ctx);
+  if (mergeParents.length || picked) await clearMergeState(ctx);
   if (options.quiet) return;
   const parent=options.amend&&before?(await git.readCommit({ ...repo, oid:before })).commit.parent[0]:before;
   const label=branch?branch:"detached HEAD";
@@ -783,7 +795,7 @@ async function commit(ctx,argv) {
   let text=`[${label}${root} ${short(oid)}] ${subject(written.message)}\n`;
   if (written.author.name!==written.committer.name || written.author.email!==written.committer.email)
     text+=` Author: ${written.author.name} <${written.author.email}>\n`;
-  if (options.date || (options.amend && !options.resetAuthor)) text+=` Date: ${gitDate(written.author)}\n`;
+  if (options.date || picked || (options.amend && !options.resetAuthor)) text+=` Date: ${gitDate(written.author)}\n`;
   // A merge commit gets no diffstat.
   ctx.out(text+(mergeParents.length?"":await commitSummary(ctx,oid,parent)));
 }
@@ -974,6 +986,14 @@ async function log(ctx,argv) {
   let refs=positional.slice(0,positional.length-paths.length);
   if (paths.length===0 && refs.length>1) throw new Error("this port takes one revision and optionally one path after --");
   if (paths.length>1) throw new Error("this port follows at most one path");
+  // A..B is what B reaches and A does not; A...B what only one of them does.
+  let exclude=[], symmetric;
+  if (refs[0]?.includes("..")) {
+    const [a,b]=refs[0].split(/\.\.\.?/).map((r)=>r||"HEAD");
+    symmetric=refs[0].includes("...")?await revision(ctx,a,"commit"):undefined;
+    exclude=[await revision(ctx,a,"commit")];
+    refs=[b];
+  }
   const ref=refs[0]?await revision(ctx,refs[0]):await head(ctx);
   if (!ref && !options.all) throw new Error(`your current branch '${await branchName(ctx)}' does not have any commits yet`);
   const filepath=paths[0]?await ctx.pathspec(paths[0]):undefined;
@@ -988,7 +1008,16 @@ async function log(ctx,argv) {
     }
     const entries=(await Promise.all([...new Set(tips)].map((tip)=>git.log({ ...repo, ref:tip, filepath, since, follow:!!options.follow, force:true })))).flat();
     commits=[...new Map(entries.map((entry)=>[entry.oid,entry])).values()].sort((a,b)=>b.commit.committer.timestamp-a.commit.committer.timestamp||a.oid.localeCompare(b.oid));
-  } else commits=await git.log({ ...repo, ref, depth:filepath?undefined:options.maxCount, filepath, since, follow:!!options.follow, force:true });
+  } else commits=await git.log({ ...repo, ref, depth:filepath||exclude.length?undefined:options.maxCount, filepath, since, follow:!!options.follow, force:true });
+  if (exclude.length) {
+    const reachable=async (tip)=>new Set((await git.log({ ...repo, ref:tip, force:true })).map((c)=>c.oid));
+    const left=await reachable(exclude[0]);
+    if (symmetric) {
+      const right=await reachable(ref);
+      const only=(await git.log({ ...repo, ref:symmetric, filepath, since, force:true })).filter((c)=>!right.has(c.oid));
+      commits=[...commits.filter((c)=>!left.has(c.oid)),...only].sort((a,b)=>b.commit.committer.timestamp-a.commit.committer.timestamp||a.oid.localeCompare(b.oid));
+    } else commits=commits.filter((c)=>!left.has(c.oid));
+  }
   if (options.maxCount!==undefined) commits=commits.slice(0,options.maxCount);
   if (options.reverse) commits.reverse();
   let format=options.format;
@@ -1374,14 +1403,25 @@ async function remote(ctx,argv) {
 }
 
 async function fetch(ctx,argv) {
-  const { options,positional }=parse(argv,{ depth:["depth",positiveDepth], deepen:["deepen",positiveDepth], "shallow-since":["since"], "shallow-exclude":["exclude",list], tags:"tags", "no-tags":"noTags", p:"prune", prune:"prune", q:"quiet", quiet:"quiet", all:"all", v:"verbose", "prune-tags":"pruneTags", f:"force", force:"force", u:"update" });
+  const { options,positional }=parse(argv,{ depth:["depth",positiveDepth], deepen:["deepen",positiveDepth], "shallow-since":["since"], "shallow-exclude":["exclude",list], tags:"tags", "no-tags":"noTags", p:"prune", prune:"prune", q:"quiet", quiet:"quiet", all:"all", v:"verbose", "prune-tags":"pruneTags", f:"force", force:"force", u:"update", progress:"progress" });
   if (options.deepen!==undefined) { options.depth=options.deepen; options.relative=true; }
   if (options.since!==undefined) options.since=new Date(parseDate(options.since).timestamp*1000);
   const repo=await base(ctx);
   const current=await branchName(ctx);
   const remotes=options.all?(await git.listRemotes({ ...repo })).map((r)=>r.remote):[positional[0]??await remoteOf(ctx,current)];
+  // What Git reports: each remote-tracking ref and tag the fetch changed.
+  const snapshot=async (remote)=>{
+    const refs=new Map();
+    for (const prefix of [`refs/remotes/${remote}`,"refs/tags"]) {
+      for (const name of await git.listRefs({ ...repo, filepath:prefix }).catch(()=>[]))
+        if (name!=="HEAD") refs.set(`${prefix}/${name}`,await git.resolveRef({ ...repo, ref:`${prefix}/${name}` }).catch(()=>undefined));
+    }
+    return refs;
+  };
   for (const remote of remotes) {
     const url=await remoteUrl(ctx,remote);
+    if (options.all && !options.quiet) ctx.err(`Fetching ${remote}\n`);
+    const was=await snapshot(remote);
     // isomorphic-git rewrites refs/remotes/<remote>/HEAD on every full fetch.
     // Git 2.48 creates it when missing and otherwise leaves it alone, under
     // remote.<remote>.followRemoteHEAD: create (the default), warn, always
@@ -1399,12 +1439,23 @@ async function fetch(ctx,argv) {
           ctx.err(`warning: '${remote}/HEAD' points to '${branch(after)}' on the remote, but is set to '${branch(before)}' locally\n`);
       }
     }
-    if (!options.quiet) ctx.err(`From ${url}\n${result.fetchHead?` * branch            ${result.fetchHeadDescription??""}\n`:""}`);
+    if (options.quiet) continue;
+    const lines=[];
+    if (positional[1]) lines.push(` * branch            ${positional[1].padEnd(10)} -> FETCH_HEAD`);
+    for (const [ref,oid] of await snapshot(remote)) {
+      const old=was.get(ref), name=ref.replace(/^refs\/(remotes\/[^/]+|tags)\//,"");
+      const to=ref.startsWith("refs/tags/")?name:`${remote}/${name}`;
+      if (old===oid) continue;
+      if (old===undefined) lines.push(` * [new ${ref.startsWith("refs/tags/")?"tag]   ":"branch]"}      ${name.padEnd(10)} -> ${to}`);
+      else lines.push(`   ${short(old)}..${short(oid)}  ${name.padEnd(10)} -> ${to}`);
+    }
+    for (const [ref,oid] of was) if (oid!==undefined && !(await snapshot(remote)).has(ref)) lines.push(` - [deleted]         (none)     -> ${ref.replace(/^refs\/(remotes\/|tags\/)/,"")}`);
+    if (lines.length) ctx.err(`From ${shownUrl(url)}\n${lines.join("\n")}\n`);
   }
 }
 
 async function pull(ctx,argv) {
-  const { options,positional }=parse(argv,{ "ff-only":"ffOnly", "no-ff":"noFf", ff:"ff", rebase:"rebase", "no-rebase":"noRebase", q:"quiet", quiet:"quiet", depth:["depth",positiveDepth], p:"prune", prune:"prune", tags:"tags", "no-tags":"noTags", "allow-unrelated-histories":"unrelated" });
+  const { options,positional }=parse(argv,{ "ff-only":"ffOnly", "no-ff":"noFf", ff:"ff", rebase:"rebase", "no-rebase":"noRebase", q:"quiet", quiet:"quiet", depth:["depth",positiveDepth], p:"prune", prune:"prune", tags:"tags", "no-tags":"noTags", "allow-unrelated-histories":"unrelated", progress:"progress" });
   if (options.rebase) throw new Error("--rebase is not available in this port");
   const repo=await base(ctx);
   const current=await branchName(ctx);
@@ -1415,13 +1466,13 @@ async function pull(ctx,argv) {
   if (!remoteRef) throw new Error(`There is no tracking information for the current branch.\nPlease specify which branch you want to merge with.\n\n    git pull <remote> <branch>`);
   const url=await remoteUrl(ctx,remote);
   const fetched=await git.fetch({ ...repo, ...network(ctx,options), remote, ref:remoteRef, singleBranch:true, depth:options.depth, tags:!!options.tags, prune:!!options.prune });
-  if (!options.quiet) ctx.err(`From ${url}\n * branch            ${remoteRef.padEnd(10)} -> FETCH_HEAD\n`);
+  if (!options.quiet) ctx.err(`From ${shownUrl(url)}\n * branch            ${remoteRef.padEnd(10)} -> FETCH_HEAD\n`);
   // The rest is `git merge FETCH_HEAD`, so it prints what a merge prints.
   return mergeInto(ctx,{ ...options, theirs:fetched.fetchHead, message:`Merge branch '${remoteRef}' of ${url}` });
 }
 
 async function push(ctx,argv) {
-  const { options,positional }=parse(argv,{ u:"upstream", "set-upstream":"upstream", f:"force", force:"force", d:"remove", delete:"remove", tags:"tags", q:"quiet", quiet:"quiet", v:"verbose", "all":"all", "no-verify":"noVerify", "force-with-lease":"force", "dry-run":"dryRun" });
+  const { options,positional }=parse(argv,{ u:"upstream", "set-upstream":"upstream", f:"force", force:"force", d:"remove", delete:"remove", tags:"tags", q:"quiet", quiet:"quiet", v:"verbose", "all":"all", "no-verify":"noVerify", "force-with-lease":"force", "dry-run":"dryRun", progress:"progress" });
   const repo=await base(ctx);
   const current=await branchName(ctx);
   const remote=positional[0]??await remoteOf(ctx,current);
@@ -1479,11 +1530,14 @@ function gitMergeDriver(label) {
 }
 // The files both sides changed since the merge base, which Git announces
 // with "Auto-merging" whether or not the merge of their lines is clean.
-async function autoMerged(ctx,ours,theirs) {
+async function autoMerged(ctx,ours,theirs,mergeBase) {
   const repo=await base(ctx);
-  const bases=await git.findMergeBase({ ...repo, oids:[ours,theirs] });
-  if (bases.length!==1) return [];
-  const paths=await git.walk({ ...repo, trees:[git.TREE({ ref:bases[0] }),git.TREE({ ref:ours }),git.TREE({ ref:theirs })], map:async (path,[b,o,t])=>{
+  if (!mergeBase) {
+    const bases=await git.findMergeBase({ ...repo, oids:[ours,theirs] });
+    if (bases.length!==1) return [];
+    mergeBase=bases[0];
+  }
+  const paths=await git.walk({ ...repo, trees:[git.TREE({ ref:mergeBase }),git.TREE({ ref:ours }),git.TREE({ ref:theirs })], map:async (path,[b,o,t])=>{
     if (path==="." || !b || !o || !t) return;
     if (await b.type()!=="blob" || await o.type()!=="blob" || await t.type()!=="blob") return;
     const [bo,oo,to]=await Promise.all([b.oid(),o.oid(),t.oid()]);
@@ -1514,11 +1568,14 @@ async function applyTree(ctx,before,after) {
 // content merges, but leaves the other side's own additions, deletions and
 // changes to untouched files out of the index and, for deletions, the
 // worktree.  Git stages all of those; only the conflicts stay unmerged.
-async function applyTheirs(ctx,ours,theirs,conflicts) {
+async function applyTheirs(ctx,ours,theirs,conflicts,mergeBase) {
   const repo=await base(ctx);
-  const bases=await git.findMergeBase({ ...repo, oids:[ours,theirs] });
-  if (bases.length!==1) return;
-  const changes=await git.walk({ ...repo, trees:[git.TREE({ ref:bases[0] }),git.TREE({ ref:ours }),git.TREE({ ref:theirs })], map:async (path,[b,o,t])=>{
+  if (!mergeBase) {
+    const bases=await git.findMergeBase({ ...repo, oids:[ours,theirs] });
+    if (bases.length!==1) return;
+    mergeBase=bases[0];
+  }
+  const changes=await git.walk({ ...repo, trees:[git.TREE({ ref:mergeBase }),git.TREE({ ref:ours }),git.TREE({ ref:theirs })], map:async (path,[b,o,t])=>{
     if (path==="." || conflicts.has(path)) return;
     const blob=async (entry)=>entry && await entry.type()==="blob"?{ oid:await entry.oid(), mode:(await entry.mode()).toString(8) }:undefined;
     const [inBase,inOurs,inTheirs]=await Promise.all([blob(b),blob(o),blob(t)]);
@@ -1589,8 +1646,13 @@ async function guardLocalChanges(ctx,ours,theirs,{ fastForward }) {
   const created=new Set(changes.filter((c)=>!c.oidA).map((c)=>c.path));
   const clobbered=untracked.filter((p)=>created.has(p));
   if (clobbered.length) refuse(`The following untracked working tree files would be overwritten by merge:\n${clobbered.map((p)=>`\t${p}\n`).join("")}Please move or remove them before you merge.\nAborting`);
+  return snapshotWorktree(ctx,tracked.map((r)=>r.path));
+}
+// The worktree copies of some paths, with a restore() to put them back.
+async function snapshotWorktree(ctx,paths) {
+  const repo=await base(ctx);
   const kept=[];
-  for (const { path } of tracked) {
+  for (const path of paths) {
     const target=join(repo.dir,path);
     let info;
     try { info=await lstat(target); } catch { kept.push({ path }); continue; }
@@ -1981,17 +2043,60 @@ async function diff(ctx,argv) {
 }
 
 async function cherryPick(ctx,argv) {
-  const { options,positional }=parse(argv,{ "no-commit":"noCommit", n:"noCommit", x:"record", e:"edit", "allow-empty":"allowEmpty" });
-  if (positional.length!==1) throw new Error("this port cherry-picks exactly one commit at a time");
+  const { options,positional }=parse(argv,{ "no-commit":"noCommit", n:"noCommit", x:"record", e:"edit", "allow-empty":"allowEmpty", abort:"abort", continue:"continue", skip:"skip" });
   const repo=await base(ctx);
+  if (options.abort || options.continue || options.skip) {
+    const picking=await cherryPickHead(ctx);
+    if (!picking) throw new Error("no cherry-pick or revert in progress");
+    if (options.abort || options.skip) { await resetMerge(ctx); await clearMergeState(ctx); return; }
+    await refuseUnmerged(ctx,"Committing");
+    return commit(ctx,["--no-edit"]);
+  }
+  if (positional.length!==1) throw new Error("this port cherry-picks exactly one commit at a time");
   const oid=await revision(ctx,positional[0],"commit");
   const current=await branchName(ctx);
   const before=await head(ctx);
+  const { commit:picked }=await git.readCommit({ ...repo, oid });
+  if (picked.parent.length!==1) throw new Error(`commit ${oid} is a ${picked.parent.length?"merge":"root"} commit; this port cherry-picks single-parent commits only`);
   const committer=await identity(ctx,"committer");
-  const result=await git.cherryPick({ ...repo, ours:current, theirs:oid, committer, noCommit:!!options.noCommit });
-  if (result.conflicts?.length) { for (const path of result.conflicts) ctx.out(`CONFLICT (content): Merge conflict in ${path}\n`); return 1; }
-  await git.checkout({ ...repo, ref:current });
-  if (result.oid) ctx.out(`[${current} ${short(result.oid)}] ${subject((await git.readCommit({ ...repo, oid:result.oid })).commit.message)}\n`+await commitSummary(ctx,result.oid,before));
+  // Git's refusals: any staged change, or a local change to a path the
+  // commit touches; unrelated worktree changes survive.
+  const { tracked }=porcelainRows(await statusRows(ctx));
+  if (tracked.some((r)=>r.x!==" ")) { ctx.err("error: your local changes would be overwritten by cherry-pick.\nhint: commit your changes or stash them to proceed.\n"); throw new Error("cherry-pick failed"); }
+  const touched=new Set((await treeDiff(ctx,picked.parent[0],oid)).flatMap((c)=>c.renamed?[c.renamed,c.path]:[c.path]));
+  const overwritten=tracked.filter((r)=>touched.has(r.path)).map((r)=>r.path);
+  if (overwritten.length) { ctx.err(`error: Your local changes to the following files would be overwritten by merge:\n${overwritten.map((p)=>`\t${p}\n`).join("")}Please commit your changes or stash them before you merge.\nAborting\n`); throw new Error("cherry-pick failed"); }
+  const local=await snapshotWorktree(ctx,tracked.map((r)=>r.path));
+  const label=`${short(oid)} (${subject(picked.message)})`;
+  const merged=await autoMerged(ctx,before,oid,picked.parent[0]);
+  let result;
+  try {
+    result=await git.cherryPick({ ...repo, oid, committer, noUpdateBranch:true, abortOnConflict:false, mergeDriver:gitMergeDriver(label) });
+  } catch (error) {
+    if (error.code!=="MergeConflictError") throw error;
+    await local.restore();
+    const { filepaths,deleteByUs=[],deleteByTheirs=[] }=error.data;
+    for (const path of [...new Set([...merged,...filepaths])].sort()) {
+      if (merged.includes(path)) ctx.out(`Auto-merging ${path}\n`);
+      if (deleteByTheirs.includes(path)) ctx.out(`CONFLICT (modify/delete): ${path} deleted in ${label} and modified in HEAD.  Version HEAD of ${path} left in tree.\n`);
+      else if (deleteByUs.includes(path)) ctx.out(`CONFLICT (modify/delete): ${path} deleted in HEAD and modified in ${label}.  Version ${label} of ${path} left in tree.\n`);
+      else if (filepaths.includes(path)) ctx.out(`CONFLICT (content): Merge conflict in ${path}\n`);
+    }
+    await applyTheirs(ctx,before,oid,new Set(filepaths),picked.parent[0]);
+    await writeFile(join(repo.gitdir,"CHERRY_PICK_HEAD"),`${oid}\n`);
+    ctx.err(`error: could not apply ${short(oid)}... ${subject(picked.message)}\nhint: After resolving the conflicts, mark them with\nhint: "git add/rm <pathspec>", then run\nhint: "git cherry-pick --continue".\nhint: You can instead skip this commit with "git cherry-pick --skip".\nhint: To abort and get back to the state before "git cherry-pick",\nhint: run "git cherry-pick --abort".\nhint: Disable this message with "git config advice.mergeConflict false"\n`);
+    return 1;
+  }
+  // The commit object exists; land its tree, and move the branch unless -n.
+  await applyTree(ctx,before,result);
+  if (options.noCommit) return;
+  await git.writeRef({ ...repo, ref:`refs/heads/${current}`, value:result, force:true });
+  const written=(await git.readCommit({ ...repo, oid:result })).commit;
+  let text=`[${current} ${short(result)}] ${subject(written.message)}\n`;
+  if (written.author.name!==written.committer.name || written.author.email!==written.committer.email)
+    text+=` Author: ${written.author.name} <${written.author.email}>\n`;
+  text+=` Date: ${gitDate(written.author)}\n`;
+  ctx.out(text+await commitSummary(ctx,result,before));
 }
 
 async function revParse(ctx,argv) {
@@ -2233,6 +2338,18 @@ function notesRef(value) {
   if (!value) return "refs/notes/commits";
   return value.startsWith("refs/")?value:`refs/notes/${value}`;
 }
+// isomorphic-git writes every notes commit with its own fixed message;
+// Git's names the notes command.  The tip commit is rewritten with Git's.
+async function renameNotesCommit(ctx,ref,verb) {
+  const repo=await base(ctx);
+  let oid;
+  try { oid=await git.resolveRef({ ...repo, ref }); } catch { return; }
+  const { commit }=await git.readCommit({ ...repo, oid });
+  const message=`Notes ${verb.startsWith("remove")||verb==="prune"?"removed":"added"} by 'git notes ${verb}'\n`;
+  if (commit.message===message) return;
+  const rewritten=await git.writeCommit({ ...repo, commit:{ ...commit, message } });
+  await git.writeRef({ ...repo, ref, value:rewritten, force:true });
+}
 async function notes(ctx,argv) {
   const parsed=parse(argv,{ ref:["ref"], f:"force", force:"force", m:["message",list], message:["message",list], F:["files",list], file:["files",list], "allow-empty":"allowEmpty" });
   const { options,positional }=parsed;
@@ -2245,13 +2362,14 @@ async function notes(ctx,argv) {
     const [from,to]=await Promise.all(positional.map((p)=>revision(ctx,p)));
     const note=await git.readNote({ ...repo,ref,oid:from });
     const author=await identity(ctx,"author"), committer=await identity(ctx,"committer");
-    await git.addNote({ ...repo,ref,oid:to,note,force:!!options.force,author,committer }); return;
+    await git.addNote({ ...repo,ref,oid:to,note,force:!!options.force,author,committer });
+    await renameNotesCommit(ctx,ref,"copy"); return;
   }
   if (verb==="prune") {
     const author=await identity(ctx,"author"), committer=await identity(ctx,"committer");
     for (const entry of await git.listNotes({ ...repo,ref })) {
       try { await git.readObject({ ...repo,oid:entry.target }); }
-      catch { await git.removeNote({ ...repo,ref,oid:entry.target,author,committer }); }
+      catch { await git.removeNote({ ...repo,ref,oid:entry.target,author,committer }); await renameNotesCommit(ctx,ref,"prune"); }
     }
     return;
   }
@@ -2276,6 +2394,7 @@ async function notes(ctx,argv) {
   if (verb==="remove") {
     for (const name of positional.length?positional:["HEAD"]) {
       await git.removeNote({ ...repo, ref, oid:await revision(ctx,name), author, committer });
+      await renameNotesCommit(ctx,ref,"remove");
       ctx.err(`Removing note for object ${name}\n`);
     }
     return;
@@ -2288,6 +2407,7 @@ async function notes(ctx,argv) {
     try { note=cleanMessage(Buffer.from(await git.readNote({ ...repo,ref,oid })).toString()+"\n"+note); } catch {}
   }
   await git.addNote({ ...repo, ref, oid, note, force:verb==="append"||!!options.force, author, committer });
+  await renameNotesCommit(ctx,ref,verb);
 }
 
 async function applyRefUpdate(ctx,{ verb="update",ref,value,old }) {
@@ -2403,7 +2523,9 @@ async function show(ctx,argv) {
   else ctx.out(mediumCommit(ctx,entry,names));
   if (options.noPatch) return;
   if (!options.oneline) ctx.out("\n");
-  const parent=object.object.parent[0];
+  let parent=object.object.parent[0];
+  // At a shallow clone's boundary the parent is not there: a root commit.
+  if (parent) { try { await git.readObject({ ...repo, oid:parent, format:"deflated" }); } catch { parent=undefined; } }
   return diff(ctx,[...(options.stat?["--stat"]:[]),parent??EMPTY_TREE,oid]);
 }
 
@@ -2421,7 +2543,7 @@ export const commands={
   mv:          { usage:"mv [-f] <source>... <destination>", run:move },
   commit:      { usage:"commit [-a] [-q] [--amend] [--reset-author] [--allow-empty] [--author=<author>] [--date=<date>] [-m <msg> | -F <file>] [--] [<pathspec>...]", run:commit },
   status:      { usage:"status [-s | --porcelain] [-b] [--ignored] [--] [<pathspec>...]", run:status },
-  log:         { usage:"log [--all] [-n <count>] [--oneline] [--format=<format>] [--since=<date>] [--follow] [--reverse] [<revision>] [-- <path>]", run:log },
+  log:         { usage:"log [--all] [-n <count>] [--oneline] [--format=<format>] [--since=<date>] [--follow] [--reverse] [<revision> | <rev>..<rev> | <rev>...<rev>] [-- <path>]", run:log },
   show:        { usage:"show [--stat | --no-patch] [--oneline] [<object>]", run:show },
   branch:      { usage:"branch [-a | -r] | branch <name> [<start-point>] | branch (-d | -D | -m | -M | -u <upstream>) ... | branch --show-current", run:branch },
   checkout:    { usage:"checkout [-f] [-q] <branch> | checkout -b <new-branch> [<start-point>] | checkout [<tree-ish>] -- <pathspec>...", run:checkout },
@@ -2434,10 +2556,10 @@ export const commands={
   pull:        { usage:"pull [--ff-only | --no-ff] [-q] [<remote> [<branch>]]", run:pull },
   push:        { usage:"push [-u] [-f] [-d] [--tags] [--all] [-q] [<remote> [<refspec>...]]", run:push },
   merge:       { usage:"merge [--no-ff | --ff-only] [-m <msg>] [--allow-unrelated-histories] <branch> | merge --abort", run:merge },
-  diff:        { usage:"diff [--cached] [--check | --stat | --name-only | --name-status] [-U<n>] [--exit-code] [<commit> [<commit>]] [--] [<path>...] | diff --no-index [<options>] <path> <path>", run:diff },
+  diff:        { usage:"diff [--cached] [--check | --stat | --name-only | --name-status] [-U<n>] [--exit-code] [--no-renames] [<commit> [<commit>] | <commit>..<commit> | <commit>...<commit>] [--] [<path>...] | diff --no-index [<options>] <path> <path>", run:diff },
   "check-ignore":{ usage:"check-ignore [-q] [--no-index] <pathname>...", run:checkIgnore },
   "merge-base": { usage:"merge-base [-a] <commit> <commit>... | merge-base --is-ancestor <commit> <commit>", run:mergeBase },
-  "cherry-pick":{ usage:"cherry-pick [-n] <commit>", run:cherryPick },
+  "cherry-pick":{ usage:"cherry-pick [-n] <commit> | cherry-pick (--continue | --skip | --abort)", run:cherryPick },
   "rev-parse": { usage:"rev-parse [--short] [--abbrev-ref] [--verify] <revision>... | rev-parse --show-toplevel | --git-dir | --is-inside-work-tree | --show-prefix", run:revParse },
   "ls-files":  { usage:"ls-files [-s] [-o] [-z] [--full-name] [--] [<path>...]", run:lsFiles },
   "show-ref":  { usage:"show-ref [--heads] [--tags] [-d] [-s] [<pattern>...]", run:showRef },

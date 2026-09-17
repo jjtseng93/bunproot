@@ -839,6 +839,89 @@ describe("bunproot --git matches the system git",()=>{
     crossCheck();
   });
 
+  it("cherry-pick applies, refuses, conflicts and concludes like Git",()=>{
+    write("cp-a.txt","a\n");
+    write("cp-s.txt","s\n");
+    write("cp-k.txt","k\n");
+    same(["add","cp-a.txt","cp-s.txt","cp-k.txt"]);
+    same(["commit","-m","cherry fixtures"]);
+    same(["checkout","-b","cherries"]);
+    write("cp-f.txt","f\n");
+    same(["add","cp-f.txt"]);
+    same(["commit","-m","cherry one"]);
+    write("cp-a.txt","a2\n");
+    write("cp-g.txt","g\n");
+    same(["add","cp-g.txt"]);
+    same(["commit","-am","cherry two"]);
+    same(["checkout","main"]);
+    // A dirty index, then a dirty touched path, are refused.
+    write("cp-s.txt","x\n");
+    same(["add","cp-s.txt"]);
+    same(["cherry-pick","cherries~1"]);
+    same(["reset","-q","--hard"]);
+    write("cp-a.txt","x\n");
+    same(["cherry-pick","cherries"]);
+    same(["checkout","--","cp-a.txt"]);
+    // A clean pick keeps the author and an unrelated local change.
+    write("cp-k.txt","local\n");
+    same(["cherry-pick","cherries~1"]);
+    same(["status","--porcelain"]);
+    same(["log","-2","--format=%an %s"]);
+    same(["cherry-pick","-n","cherries"]);
+    same(["status","--porcelain"]);
+    same(["log","--oneline","-1"]);
+    same(["reset","-q","--hard"]);
+    // A conflict: Git's markers and state; --abort, then resolve and --continue.
+    write("cp-a.txt","main\n");
+    same(["commit","-am","cherry main"]);
+    same(["cherry-pick","cherries"]);
+    same(["status","--porcelain"]);
+    expect(read("cp-a.txt").iso).toBe(read("cp-a.txt").sys);
+    expect(read("cp-a.txt").iso).toContain(">>>>>>> ");
+    same(["cherry-pick","--abort"]);
+    same(["status","--porcelain"]);
+    same(["cherry-pick","cherries"]);
+    write("cp-a.txt","fixed\n");
+    same(["add","cp-a.txt"]);
+    same(["cherry-pick","--continue"]);
+    same(["log","-2","--format=%an %s"]);
+    same(["status","--porcelain"]);
+    same(["branch","-D","cherries"]);
+    crossCheck();
+  });
+
+  it("log ranges and notes commits match Git",()=>{
+    same(["checkout","-b","range"]);
+    write("range.txt","r\n");
+    same(["add","range.txt"]);
+    same(["commit","-m","range one"]);
+    write("range.txt","r2\n");
+    same(["commit","-am","range two"]);
+    same(["checkout","main"]);
+    write("main-range.txt","m\n");
+    same(["add","main-range.txt"]);
+    same(["commit","-m","main range"]);
+    same(["log","--oneline","main..range"]);
+    same(["log","--oneline","range..main"]);
+    same(["log","--oneline","main...range"]);
+    same(["log","--oneline","..range"]);
+    same(["log","--oneline","range.."]);
+    same(["log","--oneline","-1","main..range"]);
+    same(["log","--format=%s","main..range","--","range.txt"]);
+    same(["log","--oneline","HEAD~1..HEAD"]);
+    same(["log","--oneline","main..main"]);
+    same(["branch","-D","range"]);
+    // Notes commits carry Git's messages, so log --all agrees.
+    same(["notes","add","-m","ranged note","HEAD"]);
+    same(["notes","append","-m","and more","HEAD"]);
+    same(["notes","copy","HEAD","HEAD~1"]);
+    same(["log","--format=%s","refs/notes/commits"]);
+    same(["notes","remove","HEAD~1"]);
+    same(["notes","remove","HEAD"]);
+    same(["log","--format=%s","refs/notes/commits"]);
+    crossCheck();
+  });
+
   it("show prints an annotated tag before what it points to",()=>{
     // Tagging a merge commit would need Git's combined diff, which this port
     // does not produce; the tagged commit is a plain one.
@@ -1048,11 +1131,22 @@ describe("bunproot --git matches the system git",()=>{
       const describeClone=(dir)=>Object.fromEntries(["status --porcelain","log --all --format=%H %P %s","ls-files -s","branch -a","tag","rev-parse HEAD","config branch.main.merge"]
         .map((c)=>[c,launch("sys",dir,c.split(" "),0).stdout]));
       expect(describeClone(clones.iso)).toEqual(describeClone(clones.sys));
+      // At a shallow clone's boundary, show treats the commit as a root.
+      const shallow={ sys:join(scratch,"shallow-sys"), iso:join(scratch,"shallow-iso") };
+      for (const side of ["sys","iso"]) expect(launch(side,scratch,["clone","-q","--depth","1",url("sys"),shallow[side]],0).status).toBe(0);
+      for (const args of [["show","--stat","HEAD"],["show","HEAD"],["log","--oneline"]]) {
+        const sys=launch("sys",shallow.sys,args,0), iso=launch("iso",shallow.iso,args,0);
+        expect({ args,status:iso.status,stdout:iso.stdout }).toEqual({ args,status:sys.status,stdout:sys.stdout });
+      }
       // A commit lands in the shared bare repository from a third party.
       launch("sys",clones.sys,["commit","--allow-empty","-m","upstream change"],step+1);
       launch("sys",clones.sys,["push","-q","origin","main"],0);
       launch("sys",clones.sys,["push","-q",url("iso"),"main"],0);
-      ok(["fetch","origin"]);
+      const fetched=ok(["fetch","origin"]);
+      // Git reports the refs the fetch moved, on stderr; so does the port.
+      const scrubbed=(text)=>text.replace(/http:\/\/127\.0\.0\.1:\d+\/(sys|iso)(\.git)?/g,"<url>");
+      expect(scrubbed(fetched.iso.stderr)).toBe(scrubbed(fetched.sys.stderr));
+      expect(fetched.sys.stderr).toContain("-> origin/main");
       same(["rev-parse","origin/main"]);
       same(["log","--oneline","origin/main","-1"]);
       ok(["pull","origin","main"]);
@@ -1070,7 +1164,9 @@ describe("bunproot --git matches the system git",()=>{
       launch("sys",clones.sys,["commit","--allow-empty","-m","behind by one"],step+1);
       launch("sys",clones.sys,["push","-q","origin","main"],0);
       launch("sys",clones.sys,["push","-q",url("iso"),"main"],0);
-      ok(["fetch"]);
+      const again=ok(["fetch"]);
+      expect(scrubbed(again.iso.stderr)).toBe(scrubbed(again.sys.stderr));
+      expect(ok(["fetch"]).iso.stderr).toBe("");
       same(["status","-sb"]);
       same(["status"]);
       ok(["pull"]);

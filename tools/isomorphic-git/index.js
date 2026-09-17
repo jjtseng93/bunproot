@@ -67,6 +67,7 @@ export function parseGlobal(argv) {
     const argument=argv[index];
     if (argument==="--version") return { ...global, command:"version", argv:[] };
     if (argument==="--help" || argument==="-h") return { ...global, command:"help", argv:argv.slice(index+1) };
+    if (argument==="--readme") return { ...global, command:"readme", argv:[] };
     if (argument==="--yes") { global.yes=true; continue; }
     if (argument==="-C") { global.directories.push(argv[++index]??"."); continue; }
     if (argument.startsWith("-C") && argument.length>2) { global.directories.push(argument.slice(2)); continue; }
@@ -91,12 +92,18 @@ function help(commands,name) {
   return `usage: git [--yes] [-C <path>] [-c <name>=<value>] <command> [<args>]\n\n`+
     `These are the Git commands this port understands, backed by isomorphic-git ${expected}:\n\n`+
     names.map((n)=>`   ${n.padEnd(13)}${commands[n].usage.replace(/^\S+\s*/,"")}`).join("\n")+
-    `\n\nSee 'git <command> --help' for a command's options. alias git='bunx bunproot --git'\n`;
+    `\n\nSee 'git <command> --help' for a command's options and 'git --readme' for the guide. alias git='bunx bunproot --git'\n`;
+}
+
+// The guide next to this file, for `git --readme`; it needs nothing installed.
+export function readme() {
+  return readFileSync(join(directory,"README.md"),"utf8");
 }
 
 export async function run(argv) {
   const global=parseGlobal([...argv]);
   if (global.command===undefined) throw new Error(help({}).split("\n")[0].replace(/^usage: /,"usage: ")+"\n"+`use 'bunproot --git --help' for the command list`);
+  if (global.command==="readme") { process.stdout.write(readme()); return 0; }
   install(global.yes);
   const { commands,context,smudgeIndex }=await import("./commands.js");
   if (global.command==="help") { process.stdout.write(help(commands,global.argv[0])); return 0; }
