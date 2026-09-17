@@ -9,7 +9,9 @@ import diff3Merge from "diff3";
 import http from "isomorphic-git/http/web";
 import fs from "node:fs";
 import { chmod, copyFile, cp, lstat, mkdtemp, mkdir, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { homedir as osHomedir, tmpdir } from "node:os";
+// Git honours $HOME as set, which Bun's os.homedir() does not follow.
+const homedir=()=>process.env.HOME||process.env.USERPROFILE||osHomedir();
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { count, list, parse, parseClone, positiveDepth } from "./options.js";
@@ -142,6 +144,16 @@ async function globalSet(path,value,append) {
     await git.setConfig({ fs, gitdir, path, value, append });
     await copyFile(join(gitdir,"config"),file);
   });
+}
+async function configAll(ctx,path) {
+  if (path in ctx.overrides) return [ctx.overrides[path]];
+  const values=[];
+  try {
+    const { gitdir }=await ctx.repo();
+    values.push(...await git.getConfigAll({ fs, gitdir, path }));
+  } catch {}
+  if (values.length) return values;
+  return globalGet(path,true);
 }
 async function config(ctx,path) {
   if (path in ctx.overrides) return ctx.overrides[path];
@@ -560,28 +572,96 @@ async function remoteUrl(ctx,name) {
 async function remoteOf(ctx,branch) {
   return (branch && await config(ctx,`branch.${branch}.remote`))||"origin";
 }
-// Tokens from the environment or Git's own credential store; interactive
-// prompting is deliberately absent so a script never hangs.
-function onAuth(url) {
+// Credentials, in Git's order: the environment (GIT_USERNAME/GIT_PASSWORD,
+// then a GIT_TOKEN/GITHUB_TOKEN), a username in the URL, the configured
+// credential.helper entries, and finally the `store` helper's file, which
+// is what Git falls back to as well.  Interactive prompting is deliberately
+// absent so a script never hangs.
+export async function credentials(ctx,url) {
   const env=process.env;
   if (env.GIT_USERNAME || env.GIT_PASSWORD) return { username:env.GIT_USERNAME, password:env.GIT_PASSWORD };
   const token=env.GIT_TOKEN||env.GITHUB_TOKEN;
   if (token) return { username:"x-access-token", password:token };
-  try {
-    const host=new URL(url).host;
-    for (const line of fs.readFileSync(join(homedir(),".git-credentials"),"utf8").split("\n")) {
+  let parsed;
+  try { parsed=new URL(url); } catch { return undefined; }
+  const helpers=[...await configAll(ctx,`credential.${parsed.protocol}//${parsed.host}.helper`),...await configAll(ctx,"credential.helper")];
+  for (const helper of helpers) {
+    const found=await runCredentialHelper(helper,parsed);
+    if (found) return found;
+  }
+  return storedCredential(parsed);
+}
+// One credential.helper value, given the `get` operation the way Git gives
+// it: a shell command after `!`, a path, `store [--file=<path>]`, or a
+// git-credential-<name> program on PATH.  `cache` needs Git's own daemon.
+async function runCredentialHelper(helper,parsed) {
+  const [name,...args]=helper.trim().split(/\s+/);
+  if (name==="" || name==="cache") return undefined;
+  if (name==="store") {
+    const file=args.find((a)=>a.startsWith("--file="))?.slice(7);
+    return storedCredential(parsed,file&&resolve(file.replace(/^~(?=\/|$)/,homedir())));
+  }
+  let cmd;
+  if (helper.trim().startsWith("!")) {
+    const shell=helper.trim().slice(1);
+    cmd=process.platform==="win32"?[process.env.ComSpec||"cmd.exe","/d","/s","/c",`${shell} get`]:[process.env.SHELL||"/bin/sh","-c",`${shell} "$@"`,"git-credential","get"];
+  } else {
+    const program=isAbsolute(name)?name:Bun.which(`git-credential-${name}`)||Bun.which(name.startsWith("git-credential-")?name:`git-credential-${name}`);
+    if (!program) return undefined;
+    cmd=[program,...args,"get"];
+  }
+  const input=`protocol=${parsed.protocol.replace(/:$/,"")}\nhost=${parsed.host}\n${parsed.pathname.length>1?`path=${parsed.pathname.slice(1)}\n`:""}${parsed.username?`username=${decodeURIComponent(parsed.username)}\n`:""}\n`;
+  let result;
+  try { result=Bun.spawnSync({ cmd, stdin:Buffer.from(input), stdout:"pipe", stderr:"pipe", env:{ ...process.env, GIT_TERMINAL_PROMPT:"0" }, timeout:30000 }); }
+  catch { return undefined; }
+  if (result.exitCode!==0) return undefined;
+  const reply={};
+  for (const line of result.stdout.toString().split("\n")) {
+    const equals=line.indexOf("=");
+    if (equals>0) reply[line.slice(0,equals)]=line.slice(equals+1);
+  }
+  return reply.password?{ username:reply.username??decodeURIComponent(parsed.username), password:reply.password }:undefined;
+}
+// The `store` helper's file: ~/.git-credentials, then the XDG one.
+function storedCredential(parsed,file) {
+  const files=file?[file]:[join(homedir(),".git-credentials"),join(process.env.XDG_CONFIG_HOME||join(homedir(),".config"),"git","credentials")];
+  for (const candidate of files) {
+    let text;
+    try { text=fs.readFileSync(candidate,"utf8"); } catch { continue; }
+    for (const line of text.split("\n")) {
       try {
         const saved=new URL(line.trim());
-        if (saved.host===host && saved.username)
+        if (saved.host===parsed.host && saved.protocol===parsed.protocol && saved.username && (!parsed.username || decodeURIComponent(saved.username)===decodeURIComponent(parsed.username)))
           return { username:decodeURIComponent(saved.username), password:decodeURIComponent(saved.password) };
       } catch {}
     }
-  } catch {}
+  }
   return undefined;
+}
+// Git's report when a credential was rejected -- or, where Git would have
+// prompted, when none was found, with where this port had looked.
+function authenticationFailed(url,{ none=false }={}) {
+  const shown=url.replace(/\/?$/,"/");
+  const error=new Error(`Authentication failed for '${shown}'`);
+  if (none) error.hint="no credential found and this port never prompts: set GIT_TOKEN/GITHUB_TOKEN or GIT_USERNAME/GIT_PASSWORD, configure credential.helper (store, or a program such as `!gh auth git-credential`), or add a line to ~/.git-credentials";
+  return error;
+}
+// The repository URL of the last request, for Git's wording of a failure.
+let lastUrl;
+export function httpFailure(error) {
+  if (error.code!=="HttpError" || !lastUrl) return undefined;
+  const { statusCode }=error.data;
+  const shown=lastUrl.replace(/\/(info\/refs.*|git-(upload|receive)-pack)$/,"").replace(/\/?$/,"/");
+  if (statusCode===401) return authenticationFailed(shown).message;
+  return `unable to access '${shown}': The requested URL returned error: ${statusCode}`;
 }
 function network(ctx,options={}) {
   return {
-    http, onAuth,
+    http:{ request:(request)=>{ lastUrl=request.url; return http.request(request); } },
+    // No credential at all is where Git would prompt; this port reports the
+    // failure instead.  A rejected credential is reported the same way.
+    onAuth:async (target)=>{ const found=await credentials(ctx,target); if (!found) throw authenticationFailed(target,{ none:true }); return found; },
+    onAuthFailure:(target)=>{ throw authenticationFailed(target); },
     // The server's sideband chatter is progress: Git shows it only on a
     // terminal, or with --progress.
     onMessage:options.quiet || (!options.progress && !process.stderr.isTTY)?undefined:(message)=>ctx.err(`remote: ${message}`),

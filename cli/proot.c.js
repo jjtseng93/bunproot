@@ -141,7 +141,7 @@ These run without entering a rootfs, then exit:
       isomorphic-git 1.41.9 helper in place after confirmation, run the
       Git command with Git's own arguments and output, then exit; suits
       alias git='bunx bunproot --git'. --git --help lists the commands,
-      --git --readme prints the guide
+      --git --readme renders the guide
 
   --x11-demo
       open the tiny dependency-free JavaScript X11 smoke-test window

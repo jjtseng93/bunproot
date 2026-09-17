@@ -337,7 +337,7 @@ is an argument to the guest program instead.
 | `--l2s-docs` | Render [link2symlink.md](./link2symlink.md), the on-disk format, in the terminal |
 | `--l2s-ignore-pin` | Enter a rootfs whose link store is pinned, which is otherwise refused. Its emulated hard links do not work while it is pinned |
 | `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
-| `--git [--yes] COMMAND [ARG ...]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, run the Git command with Git's own arguments and output, then exit. Add `--yes` immediately after `--git` to install without asking. `--git --help` lists the commands, `--git --readme` prints the guide |
+| `--git [--yes] COMMAND [ARG ...]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, run the Git command with Git's own arguments and output, then exit. Add `--yes` immediately after `--git` to install without asking. `--git --help` lists the commands, `--git --readme` renders the guide |
 | `--x11-demo` | Open the tiny dependency-free JavaScript X11 smoke-test window |
 | `--readme` | Render this README in the terminal, with links where it has them |
 | `-h`, `--help` | The options and the debug environment variables |
@@ -571,8 +571,10 @@ alias git='bun x bunproot --git'
 - `git pull`, `git pull --ff-only origin main`
   - A fetch followed by a merge; there is no `--rebase`.
 - `git push -u origin main`, `git push --tags`, `git push -d origin old`
-  - Network remotes are HTTP(S) only, no SSH. Credentials come from
-    `GIT_TOKEN`/`GITHUB_TOKEN`, `GIT_USERNAME`/`GIT_PASSWORD` or
+  - Network remotes are HTTP(S) only, no SSH. Credentials are found the way
+    Git finds them -- `GIT_TOKEN`/`GITHUB_TOKEN` or `GIT_USERNAME`/
+    `GIT_PASSWORD`, then the configured `credential.helper` (`store`,
+    `!gh auth git-credential`, any helper program), then
     `~/.git-credentials`; nothing ever prompts.
 - `git remote -v`, `git remote add upstream URL`, `git remote set-url origin URL`
 - `git reset --hard HEAD`, `git reset --soft HEAD~1`, `git reset hi.txt`
@@ -623,7 +625,8 @@ The global options go before the command: `git --yes ...` installs the locked
 isomorphic-git without asking (later runs reuse it), `git -C <path> ...` runs
 elsewhere, `git -c <name>=<value> ...` sets a value for one run.
 `git --help` prints the command list, `git <command> --help` one command's
-options, and `git --readme` prints the full guide,
+options, and `git --readme` renders the full guide for the terminal, links
+and all, like `bunproot --readme` does (`git --readme | less -R` to page it):
 [`tools/isomorphic-git/README.md`](./tools/isomorphic-git/README.md): every
 command's options, what the port adds on top of isomorphic-git, the known
 limits, and the supply-chain notes behind the locked install and its

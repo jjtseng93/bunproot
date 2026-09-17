@@ -12,8 +12,9 @@ bunproot argument, which is what makes an alias work:
 alias git='bun x bunproot --git'
 ```
 
-This file is what `bunproot --git --readme` prints. `git --help` prints the
-command list, `git <command> --help` one command's options.
+This file is what `bunproot --git --readme` renders, with clickable links
+where the terminal supports them. `git --help` prints the command list,
+`git <command> --help` one command's options.
 
 ## Global options
 
@@ -145,9 +146,21 @@ commit, and `git merge --abort` puts things back.
 ## Identity, credentials and editors
 
 Identity comes from `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, the repository config or
-`~/.gitconfig`. HTTPS credentials come from `GIT_TOKEN`/`GITHUB_TOKEN`,
-`GIT_USERNAME`/`GIT_PASSWORD` or `~/.git-credentials`; authentication never
-prompts. A commit without `-m` or `-F` uses `GIT_EDITOR`, `VISUAL` or
+`~/.gitconfig`. HTTPS credentials are looked up in Git's order and never
+prompted for:
+
+1. `GIT_USERNAME`/`GIT_PASSWORD`, then a `GIT_TOKEN` or `GITHUB_TOKEN`.
+2. The configured `credential.<url>.helper` and `credential.helper` entries,
+   from the repository, `~/.gitconfig` or `-c`: `store [--file=<path>]`, a
+   shell command after `!` such as `!gh auth git-credential`, a program by
+   path, or a `git-credential-<name>` program on `PATH`. Each is given Git's
+   `get` request on stdin (`protocol`, `host`, `path`, `username`) and read
+   back the same way. `cache` needs Git's own daemon and is skipped.
+3. `~/.git-credentials`, then `$XDG_CONFIG_HOME/git/credentials`.
+
+With nothing found, or a credential rejected, the command fails with Git's
+`Authentication failed for '<url>'`; the first case adds a hint saying where
+it looked. A commit without `-m` or `-F` uses `GIT_EDITOR`, `VISUAL` or
 `EDITOR`.
 
 ## Remotes
@@ -205,7 +218,8 @@ Git's semantics on top of the object-level APIs:
   is not produced.
 
 The exact supported subsets and the work that is intentionally not a thin
-wrapper are tracked in [incomplete.md](./incomplete.md).
+wrapper are tracked in
+[incomplete.md](https://github.com/jjtseng93/bunproot/blob/main/tools/isomorphic-git/incomplete.md).
 
 ## Colour and decorations
 

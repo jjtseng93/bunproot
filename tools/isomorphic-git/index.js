@@ -100,9 +100,15 @@ function help(commands,name) {
     `\n\nSee 'git <command> --help' for a command's options and 'git --readme' for the guide. alias git='bunx bunproot --git'\n`;
 }
 
-// The guide next to this file, for `git --readme`; it needs nothing installed.
-export function readme() {
-  return readFileSync(join(directory,"README.md"),"utf8");
+// The guide next to this file, for `git --readme`; it needs nothing
+// installed.  Rendered the way `bunproot --readme` renders its own: Bun's
+// ANSI markdown with clickable links, coloured whether or not it goes to a
+// pipe, at the terminal's width when there is one.  `raw` returns the
+// markdown itself.
+export function readme({ raw=false, columns=process.stdout.columns }={}) {
+  const markdown=readFileSync(join(directory,"README.md"),"utf8");
+  if (raw) return markdown;
+  return Bun.markdown.ansi(markdown,columns?{ hyperlinks:true, columns }:{ hyperlinks:true });
 }
 
 export async function run(argv) {
@@ -110,7 +116,7 @@ export async function run(argv) {
   if (global.command===undefined) throw new Error(help({}).split("\n")[0].replace(/^usage: /,"usage: ")+"\n"+`use 'bunproot --git --help' for the command list`);
   if (global.command==="readme") { process.stdout.write(readme()); return 0; }
   install(global.yes);
-  const { commands,context,smudgeIndex }=await import("./commands.js");
+  const { commands,context,smudgeIndex,httpFailure }=await import("./commands.js");
   if (global.command==="help") { process.stdout.write(help(commands,global.argv[0])); return 0; }
   const command=commands[global.command];
   if (!command) throw new Error(`'${global.command}' is not a git command this port supports. See 'git --help'.`);
@@ -124,7 +130,7 @@ export async function run(argv) {
   } catch (error) {
     // A Git-level failure is reported the way Git reports it, with Git's
     // exit status; only the wrapper's own problems propagate to the caller.
-    process.stderr.write(`${error.prefix??"fatal"}: ${error.message}\n`);
+    process.stderr.write(`${error.prefix??"fatal"}: ${httpFailure(error)??error.message}\n${error.hint?`hint: ${error.hint}\n`:""}`);
     return error.exitCode??128;
   } finally {
     if (ctx.opened()) await smudgeIndex(ctx.opened().gitdir);
