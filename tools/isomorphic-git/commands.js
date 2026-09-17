@@ -4,11 +4,13 @@
 // for the everyday flow.  index.js finds the command in the table exported at
 // the bottom and calls its `run(ctx,argv)`; nothing here parses global options.
 import * as git from "isomorphic-git";
+// isomorphic-git's own three-way line merger, from the locked tree.
+import diff3Merge from "diff3";
 import http from "isomorphic-git/http/web";
 import fs from "node:fs";
 import { chmod, copyFile, cp, lstat, mkdtemp, mkdir, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { count, list, parse, parseClone, positiveDepth } from "./options.js";
 
@@ -89,6 +91,14 @@ export function context({ overrides={}, cwd=process.cwd(), out, err, tty=process
       const path=native.split("\\").join("/");
       if (path.startsWith("../") || path==="..") throw new Error(`'${argument}' is outside repository at '${dir}'`);
       return path==="."?"":path;
+    },
+    // The repository-relative path as Git shows it from the current
+    // directory: relative to it, with a directory's trailing slash kept.
+    async display(path) {
+      const prefix=await this.pathspec(".");
+      if (!prefix) return path;
+      const slash=path.endsWith("/")?"/":"";
+      return posix.relative(prefix,path.slice(0,path.length-slash.length))+slash;
     },
   };
   return ctx;
@@ -244,6 +254,63 @@ async function statusRows(ctx,filepaths,ignored=false) {
   return rows.filter(([path,h,w,s])=>!(h===1&&w===1&&s===1));
 }
 
+// -- a merge in progress: conflict stages in the index, and MERGE_HEAD.
+// isomorphic-git keeps the conflict stages but exposes no API for them, and
+// has no notion of MERGE_HEAD at all, so the index file is read directly and
+// the state files are the port's own, in Git's layout.
+async function indexEntries(ctx) {
+  const repo=await base(ctx);
+  let data;
+  try { data=await readFile(join(repo.gitdir,"index")); } catch { return []; }
+  const entries=[];
+  if (data.length<12 || data.toString("latin1",0,4)!=="DIRC") return entries;
+  const version=data.readUInt32BE(4), count=data.readUInt32BE(8);
+  if (version!==2 && version!==3) return entries;
+  let offset=12;
+  for (let i=0; i<count && offset+62<=data.length; i++) {
+    const flags=data.readUInt16BE(offset+60);
+    const nameStart=offset+62+(version===3 && flags&0x4000?2:0);
+    let nameLength=flags&0xfff;
+    if (nameLength===0xfff) nameLength=data.indexOf(0,nameStart)-nameStart;
+    entries.push({ path:data.toString("utf8",nameStart,nameStart+nameLength), mode:data.readUInt32BE(offset+24).toString(8),
+      oid:data.toString("hex",offset+40,offset+60), stage:(flags>>12)&3 });
+    offset+=Math.ceil((nameStart+nameLength+1-offset)/8)*8;
+  }
+  return entries;
+}
+async function unmergedPaths(ctx) {
+  const stages=new Map();
+  for (const { path,stage } of await indexEntries(ctx)) if (stage) stages.set(path,(stages.get(path)??new Set()).add(stage));
+  return new Map([...stages].sort(([a],[b])=>a<b?-1:1));
+}
+// Git's two-letter code and long description for a set of conflict stages.
+function unmergedKind(stages) {
+  const key=[...stages].sort().join("");
+  return { "123":["UU","both modified"], "12":["UD","deleted by them"], "13":["DU","deleted by us"],
+    "23":["AA","both added"], "2":["AU","added by us"], "3":["UA","added by them"] }[key]??["UU","both modified"];
+}
+async function mergeHeads(ctx) {
+  try { return (await readFile(join((await base(ctx)).gitdir,"MERGE_HEAD"),"utf8")).split("\n").filter(Boolean); } catch { return []; }
+}
+async function writeMergeState(ctx,theirs,message,conflicts) {
+  const { gitdir }=await base(ctx);
+  await writeFile(join(gitdir,"MERGE_HEAD"),`${theirs}\n`);
+  await writeFile(join(gitdir,"MERGE_MODE"),"");
+  await writeFile(join(gitdir,"MERGE_MSG"),`${message}\n\n# Conflicts:\n${conflicts.map((p)=>`#\t${p}\n`).join("")}`);
+}
+async function clearMergeState(ctx) {
+  const { gitdir }=await base(ctx);
+  for (const name of ["MERGE_HEAD","MERGE_MODE","MERGE_MSG"]) await rm(join(gitdir,name),{ force:true });
+}
+// Git refuses to commit or merge over unresolved conflicts, listing them.
+async function refuseUnmerged(ctx,verb) {
+  const unmerged=await unmergedPaths(ctx);
+  if (unmerged.size===0) return;
+  ctx.err(`error: ${verb} is not possible because you have unmerged files.\nhint: Fix them up in the work tree, and then use 'git add/rm <file>'\nhint: as appropriate to mark resolution and make a commit.\n`);
+  if (verb==="Committing") for (const path of unmerged.keys()) ctx.out(`U\t${path}\n`);
+  throw new Error("Exiting because of an unresolved conflict.");
+}
+
 // -- the summary `git commit` prints
 function lines(buffer) {
   const text=Buffer.from(buffer).toString("latin1");
@@ -319,8 +386,21 @@ function statLine({ files,insertions,deletions }) {
   return parts.join(",")+"\n";
 }
 // Git's --stat table at its default 80 columns, scaled the way diff.c does.
+// "old => new" with the shared directory prefix and suffix outside the
+// braces, the way Git's diffstat abbreviates a rename.
+function renameLabel(a,b) {
+  let pfx=0, i=0;
+  while (i<a.length && i<b.length && a[i]===b[i]) { if (a[i]==="/") pfx=i+1; i++; }
+  const at=(text,k)=>k<text.length?text[k]:"\0";
+  const adjust=pfx?1:0;
+  let sfx=0, ia=a.length, ib=b.length;
+  while (pfx-adjust<=ia && pfx-adjust<=ib && at(a,ia)===at(b,ib)) { if (at(a,ia)==="/") sfx=a.length-ia; ia--; ib--; }
+  const aMid=Math.max(0,a.length-pfx-sfx), bMid=Math.max(0,b.length-pfx-sfx);
+  if (!(pfx+sfx)) return `${a} => ${b}`;
+  return `${a.slice(0,pfx)}{${a.slice(pfx,pfx+aMid)} => ${b.slice(pfx,pfx+bMid)}}${a.slice(a.length-sfx)}`;
+}
 function statTable(changes) {
-  const name=(c)=>c.renamed?`${c.renamed} => ${c.path}`:c.path;
+  const name=(c)=>c.renamed?renameLabel(c.renamed,c.path):c.path;
   const nameWidth=Math.max(...changes.map((c)=>name(c).length));
   const maxChange=Math.max(...changes.map((c)=>c.insertions+c.deletions));
   const numberWidth=Math.max(String(maxChange).length,changes.some((c)=>c.binary)?3:0);
@@ -330,7 +410,8 @@ function statTable(changes) {
   for (const c of changes) {
     if (c.binary) { text+=` ${name(c).padEnd(nameWidth)} | Bin ${c.bytesBefore} -> ${c.bytesAfter} bytes\n`; continue; }
     const total=c.insertions+c.deletions;
-    text+=` ${name(c).padEnd(nameWidth)} | ${String(total).padStart(numberWidth)} ${"+".repeat(scale(c.insertions))}${"-".repeat(scale(c.deletions))}\n`;
+    const graph="+".repeat(scale(c.insertions))+"-".repeat(scale(c.deletions));
+    text+=` ${name(c).padEnd(nameWidth)} | ${String(total).padStart(numberWidth)}${graph?` ${graph}`:""}\n`;
   }
   return text;
 }
@@ -340,7 +421,7 @@ async function commitSummary(ctx,oid,parentOid,{ table=false }={}) {
   const totals=await changeStats(ctx,changes);
   let text=(table?statTable(changes):"")+statLine(totals);
   for (const change of changes) {
-    if (change.renamed) text+=` rename ${change.renamed} => ${change.path} (100%)\n`;
+    if (change.renamed) text+=` rename ${renameLabel(change.renamed,change.path)} (100%)\n`;
     else if (!change.oidA) text+=` create mode ${change.modeB} ${change.path}\n`;
     else if (!change.oidB) text+=` delete mode ${change.modeA} ${change.path}\n`;
     else if (change.modeA!==change.modeB) text+=` mode change ${change.modeA} => ${change.modeB} ${change.path}\n`;
@@ -422,14 +503,16 @@ function formatCommit(format,{ oid,commit },names,ctx) {
     s:subject(commit.message), b:body(commit.message), B:commit.message,
     d:decorated, D:decorated.slice(2,-1), n:"\n", "%":"%",
   };
-  return format.replace(/%(aD|aI|ai|ad|ae|an|at|cD|cI|ci|cd|ce|cn|ct|[HhTtPpsbBdDn%])/g,(whole,key)=>fields[key]);
+  return format.replace(/%x([0-9a-fA-F]{2})|%(aD|aI|ai|ad|ae|an|at|cD|cI|ci|cd|ce|cn|ct|[HhTtPpsbBdDn%])/g,(whole,hex,key)=>hex?String.fromCharCode(parseInt(hex,16)):fields[key]);
 }
 function mediumCommit(ctx,{ oid,commit },names) {
   const decorated=names?decorate(ctx,names,oid):"";
   let text=ctx.paint("yellow",`commit ${oid}`)+decorated+"\n";
   if (commit.parent.length>1) text+=`Merge: ${commit.parent.map(short).join(" ")}\n`;
   text+=`Author: ${commit.author.name} <${commit.author.email}>\nDate:   ${gitDate(commit.author)}\n\n`;
-  return text+commit.message.replace(/\n$/,"").split("\n").map((line)=>`    ${line}`).join("\n")+"\n";
+  // Git expands tabs to 8-column stops in the formats that indent the message.
+  const expand=(line)=>{ let out=""; for (const ch of line) out+=ch==="\t"?" ".repeat(8-out.length%8):ch; return out; };
+  return text+commit.message.replace(/\n$/,"").split("\n").map((line)=>`    ${expand(line)}`).join("\n")+"\n";
 }
 
 // Git's --cleanup=whitespace: trailing blanks off, blank runs collapsed.
@@ -645,7 +728,7 @@ async function commit(ctx,argv) {
     m:["message",list], message:["message",list], F:["file"], file:["file"],
     a:"all", all:"all", q:"quiet", quiet:"quiet", "allow-empty":"allowEmpty", amend:"amend",
     author:["author"], date:["date"], "no-verify":"noVerify", n:"noVerify", "no-edit":"noEdit",
-    "allow-empty-message":"allowEmptyMessage", v:"verbose", verbose:"verbose",
+    "allow-empty-message":"allowEmptyMessage", v:"verbose", verbose:"verbose", "reset-author":"resetAuthor",
   });
   const repo=await base(ctx);
   // -a stages every tracked change; named paths stage those paths' changes.
@@ -653,9 +736,17 @@ async function commit(ctx,argv) {
     const filepaths=await Promise.all(positional.map((p)=>ctx.pathspec(p)));
     await stageRows(ctx,await statusRows(ctx,filepaths.filter(Boolean)),{ trackedOnly:true });
   }
+  await refuseUnmerged(ctx,"Committing");
+  // Concluding a merge: MERGE_HEAD supplies the other parents and MERGE_MSG
+  // the message, which --no-edit takes as it is, comments included.
+  const mergeParents=options.amend?[]:await mergeHeads(ctx);
   let message;
   if (options.message) message=cleanMessage(options.message.join("\n\n"));
   else if (options.file) message=cleanMessage(options.file==="-"?(await readStdin()).toString("utf8"):await readFile(resolve(ctx.cwd,options.file),"utf8"));
+  else if (mergeParents.length) {
+    const initial=await readFile(join(repo.gitdir,"MERGE_MSG"),"utf8").catch(()=>"");
+    message=options.noEdit?initial.replace(/\n*$/,"\n"):await editMessage(repo,initial);
+  }
   else {
     let initial="";
     if (options.amend && await head(ctx)) initial=(await git.readCommit({ ...repo, oid:await head(ctx) })).commit.message;
@@ -664,17 +755,26 @@ async function commit(ctx,argv) {
   if (message==="\n" && !options.allowEmptyMessage) throw new Error("Aborting commit due to empty commit message.");
   const before=await head(ctx);
   const branch=await branchName(ctx);
-  const author=await identity(ctx,"author",{ date:options.date, literal:options.author });
+  // --amend starts from the original author; --author and --date replace
+  // only the name/email or the date, and --reset-author all of it.
+  let author=await identity(ctx,"author",{ date:options.date, literal:options.author });
+  if (options.amend && before && !options.resetAuthor) {
+    const original=(await git.readCommit({ ...repo, oid:before })).commit.author;
+    author={ ...original, ...(options.author?{ name:author.name, email:author.email }:{}),
+      ...(options.date?{ timestamp:author.timestamp, timezoneOffset:author.timezoneOffset }:{}) };
+  }
   const committer=await identity(ctx,"committer");
   let oid;
   try {
-    oid=await git.commit({ ...repo, message, author, committer, amend:!!options.amend, disallowEmpty:!options.allowEmpty && !options.amend });
+    oid=await git.commit({ ...repo, message, author, committer, amend:!!options.amend, disallowEmpty:!options.allowEmpty && !options.amend && !mergeParents.length,
+      ...(mergeParents.length?{ parent:[before,...mergeParents] }:{}) });
   } catch (error) {
     if (error.code!=="EmptyCommitError") throw error;
     // Git shows the status and exits 1 when there is nothing to commit.
     ctx.out(await statusText(ctx,{}));
     return 1;
   }
+  if (mergeParents.length) await clearMergeState(ctx);
   if (options.quiet) return;
   const parent=options.amend&&before?(await git.readCommit({ ...repo, oid:before })).commit.parent[0]:before;
   const label=branch?branch:"detached HEAD";
@@ -683,8 +783,9 @@ async function commit(ctx,argv) {
   let text=`[${label}${root} ${short(oid)}] ${subject(written.message)}\n`;
   if (written.author.name!==written.committer.name || written.author.email!==written.committer.email)
     text+=` Author: ${written.author.name} <${written.author.email}>\n`;
-  if (options.date || options.amend) text+=` Date: ${gitDate(written.author)}\n`;
-  ctx.out(text+await commitSummary(ctx,oid,parent));
+  if (options.date || (options.amend && !options.resetAuthor)) text+=` Date: ${gitDate(written.author)}\n`;
+  // A merge commit gets no diffstat.
+  ctx.out(text+(mergeParents.length?"":await commitSummary(ctx,oid,parent)));
 }
 
 // -- status, in Git's long and short forms
@@ -738,11 +839,18 @@ async function pairRenames(ctx,staged) {
 async function statusParts(ctx,filepaths,includeIgnored=false) {
   const repo=await base(ctx);
   const rows=await statusRows(ctx,filepaths);
-  const { tracked,untracked }=porcelainRows(rows);
+  const unmerged=await unmergedPaths(ctx);
+  const { tracked,untracked }=porcelainRows(rows.filter(([path])=>!unmerged.has(path)));
   const all=(await git.listFiles({ ...repo }));
   const paired=await pairRenames(ctx,tracked.filter((r)=>r.x!==" "));
   const shown=tracked.filter((r)=>r.x===" " || paired.includes(r)).sort((a,b)=>a.path<b.path?-1:1);
   for (const row of shown) if (row.renamedFrom) row.x="R";
+  for (const [path,stages] of unmerged) {
+    if (filepaths?.length && !filepaths.some((p)=>p==="" || path===p || path.startsWith(p+"/"))) continue;
+    const [code,kind]=unmergedKind(stages);
+    shown.push({ path, x:code[0], y:code[1], unmerged:kind });
+  }
+  shown.sort((a,b)=>a.path<b.path?-1:1);
   let ignored=[];
   if (includeIgnored) {
     const visible=new Set((await statusRows(ctx,filepaths,true)).map(([path])=>path));
@@ -750,7 +858,7 @@ async function statusParts(ctx,filepaths,includeIgnored=false) {
     for (const path of visible) if (path===".git" || path.startsWith(".git/")) visible.delete(path);
     ignored=collapse([...visible],all);
   }
-  return { tracked:shown, untracked:collapse(untracked,all), ignored, rows };
+  return { tracked:shown, untracked:collapse(untracked,all), ignored, rows, merging:(await mergeHeads(ctx)).length>0 };
 }
 // Where the branch stands against its upstream, for the status header.
 async function upstreamState(ctx,branch,commitOid) {
@@ -777,8 +885,16 @@ async function statusText(ctx,options,filepaths) {
   const repo=await base(ctx);
   const branch=await branchName(ctx);
   const commitOid=await head(ctx);
-  const { tracked,untracked,ignored }=await statusParts(ctx,filepaths,options.ignored);
+  let { tracked,untracked,ignored,merging }=await statusParts(ctx,filepaths,options.ignored);
+  // Only --porcelain keeps repository-relative paths; the human forms show
+  // them relative to the current directory.
+  if (!options.porcelain) {
+    for (const row of tracked) { row.path=await ctx.display(row.path); if (row.renamedFrom) row.renamedFrom=await ctx.display(row.renamedFrom); }
+    untracked=await Promise.all(untracked.map((p)=>ctx.display(p)));
+    ignored=await Promise.all(ignored.map((p)=>ctx.display(p)));
+  }
   const state=await upstreamState(ctx,branch,commitOid);
+  const conflicts=tracked.filter((r)=>r.unmerged);
   if (options.short || options.porcelain) {
     let text="";
     if (options.branch) {
@@ -789,23 +905,31 @@ async function statusText(ctx,options,filepaths) {
       }
       text+=line+"\n";
     }
-    for (const { path,x,y,renamedFrom } of tracked)
-      text+=`${x===" "?x:ctx.paint("green",x)}${y===" "?y:ctx.paint("red",y)} ${renamedFrom?`${renamedFrom} -> `:""}${path}\n`;
+    for (const { path,x,y,renamedFrom,unmerged } of tracked)
+      text+=unmerged?`${ctx.paint("red",x+y)} ${path}\n`:`${x===" "?x:ctx.paint("green",x)}${y===" "?y:ctx.paint("red",y)} ${renamedFrom?`${renamedFrom} -> `:""}${path}\n`;
     for (const path of untracked) text+=`${ctx.paint("red","??")} ${path}\n`;
     for (const path of ignored) text+=`${ctx.paint("red","!!")} ${path}\n`;
     return text;
   }
-  const staged=tracked.filter((r)=>r.x!==" "), unstaged=tracked.filter((r)=>r.y!==" ");
+  const staged=tracked.filter((r)=>r.x!==" " && !r.unmerged), unstaged=tracked.filter((r)=>r.y!==" " && !r.unmerged);
   let text=(branch?`On branch ${branch}\n`:`${ctx.paint("red","HEAD detached at ")}${short(commitOid)}\n`)+upstreamHeader(state);
+  if (conflicts.length) text+=`You have unmerged paths.\n  (fix conflicts and run "git commit")\n  (use "git merge --abort" to abort the merge)\n\n`;
+  else if (merging) text+=`All conflicts fixed but you are still merging.\n  (use "git commit" to conclude merge)\n\n`;
   if (!commitOid) text+="\nNo commits yet\n\n";
   const label=(word)=>(word+":").padEnd(12);
   const shownStaged=staged;
   if (shownStaged.length) {
-    text+=`Changes to be committed:\n  (use "git ${commitOid?"restore --staged":"rm --cached"} <file>..." to unstage)\n`;
+    text+=`Changes to be committed:\n`+(merging?"":`  (use "git ${commitOid?"restore --staged":"rm --cached"} <file>..." to unstage)\n`);
     for (const r of shownStaged) {
       if (r.renamedFrom) text+=`\t${ctx.paint("green",`${label("renamed")}${r.renamedFrom} -> ${r.path}`)}\n`;
       else text+=`\t${ctx.paint("green",`${label(r.x==="A"?"new file":r.x==="D"?"deleted":"modified")}${r.path}`)}\n`;
     }
+    text+="\n";
+  }
+  if (conflicts.length) {
+    const deletions=conflicts.some((r)=>r.unmerged.startsWith("deleted"));
+    text+=`Unmerged paths:\n  (use "git add${deletions?"/rm":""} <file>..."${deletions?" as appropriate":""} to mark resolution)\n`;
+    for (const r of conflicts) text+=`\t${ctx.paint("red",`${(r.unmerged+":").padEnd(17)}${r.path}`)}\n`;
     text+="\n";
   }
   if (unstaged.length) {
@@ -824,7 +948,7 @@ async function statusText(ctx,options,filepaths) {
     text+="\n";
   }
   if (shownStaged.length) return text;
-  if (unstaged.length) return text+`no changes added to commit (use "git add" and/or "git commit -a")\n`;
+  if (unstaged.length || conflicts.length) return text+`no changes added to commit (use "git add" and/or "git commit -a")\n`;
   if (untracked.length) return text+`nothing added to commit but untracked files present (use "git add" to track)\n`;
   return text+(commitOid?"nothing to commit, working tree clean\n":`nothing to commit (create/copy files and use "git add" to track)\n`);
 }
@@ -868,6 +992,9 @@ async function log(ctx,argv) {
   if (options.maxCount!==undefined) commits=commits.slice(0,options.maxCount);
   if (options.reverse) commits.reverse();
   let format=options.format;
+  // `format:` separates commits with a newline where `tformat:` (and
+  // --format) terminates each one with it.
+  const separator=format?.startsWith("format:")?"\n":"";
   if (format?.startsWith("format:") || format?.startsWith("tformat:")) format=format.slice(format.indexOf(":")+1);
   else if (format!==undefined && !format.includes("%") && ["medium","short","full","fuller","raw"].includes(format)) format=undefined;
   // log.decorate=auto: decorations appear on a terminal, or when asked for.
@@ -875,7 +1002,8 @@ async function log(ctx,argv) {
   const oneline=options.oneline || format==="oneline";
   if (format!==undefined && !oneline) {
     const names=/%[dD]/.test(format)?await decorations(ctx):undefined;
-    for (const entry of commits) ctx.out(formatCommit(format,entry,names,ctx)+"\n");
+    if (separator) ctx.out(commits.map((entry)=>formatCommit(format,entry,names,ctx)).join(separator));
+    else for (const entry of commits) ctx.out(formatCommit(format,entry,names,ctx)+"\n");
     return;
   }
   const names=decorateWanted?await decorations(ctx):undefined;
@@ -983,6 +1111,13 @@ async function branch(ctx,argv) {
   ctx.out(text);
 }
 
+// After switching branches Git lists the local changes it carried across,
+// as diff-index --name-status against the new HEAD would -- except for a
+// new branch made at the same commit, where nothing had to move.
+async function carriedChanges(ctx) {
+  const { tracked }=porcelainRows(await statusRows(ctx));
+  return tracked.sort((a,b)=>a.path<b.path?-1:1).map(({ path,x,y })=>`${x==="A"?"A":x==="D"||y==="D"?"D":"M"}\t${path}\n`).join("");
+}
 async function checkout(ctx,argv) {
   const parsed=parse(argv,{ b:["create"], B:["forceCreate"], f:"force", force:"force", q:"quiet", quiet:"quiet", "no-track":"noTrack", t:"track", track:"track", detach:"detach", "orphan":["orphan"] });
   const { options,positional }=parsed;
@@ -995,8 +1130,8 @@ async function checkout(ctx,argv) {
     const start=refs[0]?await revision(ctx,refs[0],"commit"):await head(ctx);
     if (!start) throw new Error("not a valid object name: 'HEAD'");
     await git.branch({ ...repo, ref:create, object:start, force:!!options.forceCreate, checkout:false });
-    await git.checkout({ ...repo, ref:create, force:!!options.force });
-    if (!options.quiet) ctx.err(`Switched to a new branch '${create}'\n`);
+    const moved=await switchTo(ctx,{ branch:create, force:options.force });
+    if (!options.quiet) { if (moved) ctx.out(await carriedChanges(ctx)); ctx.err(`Switched to a new branch '${create}'\n`); }
     return;
   }
   // `checkout <ref> -- <paths>` and `checkout <paths>` restore files.
@@ -1026,20 +1161,49 @@ async function checkout(ctx,argv) {
   const current=await branchName(ctx);
   if (local.includes(target)) {
     if (target===current) { if (!options.quiet) ctx.err(`Already on '${target}'\n`); return; }
-    await git.checkout({ ...repo, ref:target, force:!!options.force });
-    if (!options.quiet) ctx.err(`Switched to branch '${target}'\n`);
+    await switchTo(ctx,{ branch:target, force:options.force });
+    if (!options.quiet) { ctx.out(await carriedChanges(ctx)); ctx.err(`Switched to branch '${target}'\n`); }
     return;
   }
   for (const { remote } of await git.listRemotes({ ...repo })) {
     if ((await git.listBranches({ ...repo, remote })).includes(target)) {
-      await git.checkout({ ...repo, ref:target, remote, force:!!options.force });
-      if (!options.quiet) ctx.err(`branch '${target}' set up to track '${remote}/${target}'.\nSwitched to a new branch '${target}'\n`);
+      const oid=await git.resolveRef({ ...repo, ref:`refs/remotes/${remote}/${target}` });
+      await git.branch({ ...repo, ref:target, object:oid, checkout:false });
+      await git.setConfig({ ...repo, path:`branch.${target}.remote`, value:remote });
+      await git.setConfig({ ...repo, path:`branch.${target}.merge`, value:`refs/heads/${target}` });
+      await switchTo(ctx,{ branch:target, force:options.force });
+      if (!options.quiet) { ctx.out(await carriedChanges(ctx)); ctx.err(`branch '${target}' set up to track '${remote}/${target}'.\nSwitched to a new branch '${target}'\n`); }
       return;
     }
   }
   const oid=await revision(ctx,target,"commit");
-  await git.checkout({ ...repo, ref:oid, force:!!options.force });
-  if (!options.quiet) ctx.err(`Note: switching to '${target}'.\nHEAD is now at ${short(oid)} ${subject((await git.readCommit({ ...repo, oid })).commit.message)}\n`);
+  await switchTo(ctx,{ oid, force:options.force });
+  if (!options.quiet) { ctx.out(await carriedChanges(ctx)); ctx.err(`Note: switching to '${target}'.\nHEAD is now at ${short(oid)} ${subject((await git.readCommit({ ...repo, oid })).commit.message)}\n`); }
+}
+
+// Moving HEAD to a branch or a commit.  isomorphic-git's checkout rewrites
+// the index and worktree from the target tree, which throws staged changes
+// away; Git carries local changes across and only touches the paths the two
+// commits differ in, refusing when one of those has local changes.  --force
+// discards them the way Git does.
+async function switchTo(ctx,{ branch,oid,force }) {
+  const repo=await base(ctx);
+  const before=await head(ctx);
+  const after=oid??await git.resolveRef({ ...repo, ref:`refs/heads/${branch}` });
+  if (force) { await git.checkout({ ...repo, ref:branch??after, force:true }); return before!==after; }
+  if (before!==after) {
+    const changes=await treeDiff(ctx,before,after);
+    const touched=new Set(changes.flatMap((c)=>c.renamed?[c.renamed,c.path]:[c.path]));
+    const { tracked,untracked }=porcelainRows(await statusRows(ctx));
+    const overwritten=tracked.filter((r)=>touched.has(r.path)).map((r)=>r.path);
+    if (overwritten.length) throw failure(`Your local changes to the following files would be overwritten by checkout:\n${overwritten.map((p)=>`\t${p}\n`).join("")}Please commit your changes or stash them before you switch branches.\nAborting`);
+    const clobbered=untracked.filter((p)=>changes.some((c)=>c.oidB && !c.oidA && c.path===p));
+    if (clobbered.length) throw failure(`The following untracked working tree files would be overwritten by checkout:\n${clobbered.map((p)=>`\t${p}\n`).join("")}Please move or remove them before you switch branches.\nAborting`);
+    await applyTree(ctx,before,after);
+  }
+  if (branch) await git.writeRef({ ...repo, ref:"HEAD", value:`refs/heads/${branch}`, symbolic:true, force:true });
+  else await git.writeRef({ ...repo, ref:"HEAD", value:after, force:true });
+  return before!==after;
 }
 
 // `checkout -- <path>` and `restore <path>`: the worktree copy comes from
@@ -1149,7 +1313,7 @@ async function tag(ctx,argv) {
       try { oid=await git.resolveRef({ ...repo, ref:`refs/tags/${name}` }); }
       catch { throw new Error(`tag '${name}' not found.`); }
       await git.deleteTag({ ...repo, ref:name });
-      ctx.out(`Deleted tag '${name}' (was ${short(await peel(ctx,oid))})\n`);
+      ctx.out(`Deleted tag '${name}' (was ${short(oid)})\n`);
     }
     return;
   }
@@ -1295,40 +1459,226 @@ async function push(ctx,argv) {
   }
 }
 
-async function mergeInto(ctx,{ theirs,message,noFf,ffOnly,quiet,unrelated }) {
+// Git labels conflict hunks HEAD and the other side as it was named on the
+// command line (pull: the fetched id); isomorphic-git labels them with the
+// branch names it resolved, which for the id this port passes is the id.
+// Same line merge, Git's labels.
+function gitMergeDriver(label) {
+  return ({ contents:[base,ours,theirs] })=>{
+    const split=(text)=>text.match(/^.*(\r?\n|$)/gm)??[];
+    let mergedText="", cleanMerge=true;
+    for (const item of diff3Merge(split(ours),split(base),split(theirs))) {
+      if (item.ok) mergedText+=item.ok.join("");
+      if (item.conflict) {
+        cleanMerge=false;
+        mergedText+=`<<<<<<< HEAD\n${item.conflict.a.join("")}=======\n${item.conflict.b.join("")}>>>>>>> ${label}\n`;
+      }
+    }
+    return { cleanMerge, mergedText };
+  };
+}
+// The files both sides changed since the merge base, which Git announces
+// with "Auto-merging" whether or not the merge of their lines is clean.
+async function autoMerged(ctx,ours,theirs) {
+  const repo=await base(ctx);
+  const bases=await git.findMergeBase({ ...repo, oids:[ours,theirs] });
+  if (bases.length!==1) return [];
+  const paths=await git.walk({ ...repo, trees:[git.TREE({ ref:bases[0] }),git.TREE({ ref:ours }),git.TREE({ ref:theirs })], map:async (path,[b,o,t])=>{
+    if (path==="." || !b || !o || !t) return;
+    if (await b.type()!=="blob" || await o.type()!=="blob" || await t.type()!=="blob") return;
+    const [bo,oo,to]=await Promise.all([b.oid(),o.oid(),t.oid()]);
+    return bo!==oo && bo!==to && oo!==to?path:undefined;
+  } });
+  return paths.filter(Boolean).sort();
+}
+
+// Write the paths that differ between two commits into the worktree and the
+// index, the way a merge lands them, leaving every other path -- and any
+// unrelated local change -- alone.
+async function applyTree(ctx,before,after) {
+  const repo=await base(ctx);
+  for (const change of await treeDiff(ctx,before,after)) {
+    if (change.renamed) { await rm(join(repo.dir,change.renamed),{ force:true }); await git.remove({ ...repo, filepath:change.renamed }); }
+    if (!change.oidB) { await rm(join(repo.dir,change.path),{ force:true }); await git.remove({ ...repo, filepath:change.path }); continue; }
+    const target=join(repo.dir,change.path);
+    const { blob }=await git.readBlob({ ...repo, oid:change.oidB });
+    await rm(target,{ force:true, recursive:true });
+    await mkdir(dirname(target),{ recursive:true });
+    if (change.modeB==="120000") await symlink(Buffer.from(blob).toString(),target);
+    else await materialize(repo.dir,[{ path:change.path, content:blob, mode:change.modeB }]);
+    await git.add({ ...repo, filepath:change.path, force:true });
+  }
+}
+
+// On a conflicted merge isomorphic-git records the conflicts and the clean
+// content merges, but leaves the other side's own additions, deletions and
+// changes to untouched files out of the index and, for deletions, the
+// worktree.  Git stages all of those; only the conflicts stay unmerged.
+async function applyTheirs(ctx,ours,theirs,conflicts) {
+  const repo=await base(ctx);
+  const bases=await git.findMergeBase({ ...repo, oids:[ours,theirs] });
+  if (bases.length!==1) return;
+  const changes=await git.walk({ ...repo, trees:[git.TREE({ ref:bases[0] }),git.TREE({ ref:ours }),git.TREE({ ref:theirs })], map:async (path,[b,o,t])=>{
+    if (path==="." || conflicts.has(path)) return;
+    const blob=async (entry)=>entry && await entry.type()==="blob"?{ oid:await entry.oid(), mode:(await entry.mode()).toString(8) }:undefined;
+    const [inBase,inOurs,inTheirs]=await Promise.all([blob(b),blob(o),blob(t)]);
+    if (inBase?.oid!==inOurs?.oid || inBase?.mode!==inOurs?.mode) return;
+    if (inBase?.oid===inTheirs?.oid && inBase?.mode===inTheirs?.mode) return;
+    return { path, oidB:inTheirs?.oid, modeB:inTheirs?.mode };
+  } });
+  for (const change of changes.filter(Boolean)) {
+    const target=join(repo.dir,change.path);
+    if (!change.oidB) { await rm(target,{ force:true }); await git.remove({ ...repo, filepath:change.path }); continue; }
+    const { blob }=await git.readBlob({ ...repo, oid:change.oidB });
+    await rm(target,{ force:true, recursive:true });
+    await mkdir(dirname(target),{ recursive:true });
+    if (change.modeB==="120000") await symlink(Buffer.from(blob).toString(),target);
+    else await materialize(repo.dir,[{ path:change.path, content:blob, mode:change.modeB }]);
+    await git.add({ ...repo, filepath:change.path, force:true });
+  }
+}
+
+// `merge --abort` is `reset --merge`: every path the merge staged or left
+// unmerged goes back to HEAD in the index and worktree, and paths that only
+// differ in the worktree keep their local changes.  isomorphic-git's
+// abortMerge rewrites every clean path too, without its mode or stats, and
+// decodes it as text on the way.
+async function resetMerge(ctx) {
+  const repo=await base(ctx);
+  const commitOid=await head(ctx);
+  const touched=new Set([...await unmergedPaths(ctx)].map(([path])=>path));
+  for (const [path,h,,st] of await git.statusMatrix({ ...repo })) if (st!==1 && (h||st)) touched.add(path);
+  const inHead=new Map(commitOid?await git.walk({ ...repo, trees:[git.TREE({ ref:commitOid })], map:async (path,[entry])=>
+    touched.has(path) && entry && await entry.type()==="blob"?[path,{ oid:await entry.oid(), mode:(await entry.mode()).toString(8) }]:undefined }):[]);
+  for (const path of [...touched].sort()) {
+    const target=join(repo.dir,path), was=inHead.get(path);
+    await rm(target,{ force:true, recursive:true });
+    if (!was) { await git.remove({ ...repo, filepath:path }); continue; }
+    const { blob }=await git.readBlob({ ...repo, oid:was.oid });
+    await mkdir(dirname(target),{ recursive:true });
+    if (was.mode==="120000") await symlink(Buffer.from(blob).toString(),target);
+    else await materialize(repo.dir,[{ path, content:blob, mode:was.mode }]);
+    await git.add({ ...repo, filepath:path, force:true });
+  }
+}
+
+// The local changes a merge must not lose.  Git's checks, in its order: a
+// true merge needs the index to match HEAD; the other side's changes since
+// the merge base must not land on locally changed paths; a file it adds
+// must not land on an untracked one.  A fast-forward reports the last two
+// with status 1 after its "Updating" line, a true merge with status 2.
+// isomorphic-git's conflict path then rewrites the whole result tree into
+// the worktree, so the worktree copies of every other locally changed path
+// are snapshotted, with a restore() to put them back.
+async function guardLocalChanges(ctx,ours,theirs,{ fastForward }) {
+  const repo=await base(ctx);
+  const { tracked,untracked }=porcelainRows(await statusRows(ctx));
+  if (!ours || (tracked.length===0 && untracked.length===0)) return { restore:async ()=>{} };
+  const bases=await git.findMergeBase({ ...repo, oids:[ours,theirs] });
+  const ff=fastForward && bases.length===1 && bases[0]===ours;
+  const refuse=(message)=>{
+    if (ff) { ctx.out(`Updating ${short(ours)}..${short(theirs)}\n`); throw failure(message); }
+    throw failure(`${message}\nMerge with strategy ort failed.`,2);
+  };
+  const staged=tracked.filter((r)=>r.x!==" ").map((r)=>r.path);
+  if (!ff && staged.length) throw failure(`Your local changes to the following files would be overwritten by merge:\n${staged.map((p)=>`  ${p}\n`).join("")}Merge with strategy ort failed.`,2);
+  const changes=await treeDiff(ctx,bases.length===1?bases[0]:ours,theirs);
+  const touched=new Set(changes.flatMap((c)=>c.renamed?[c.renamed,c.path]:[c.path]));
+  const overwritten=tracked.filter((r)=>touched.has(r.path)).map((r)=>r.path);
+  if (overwritten.length) refuse(`Your local changes to the following files would be overwritten by merge:\n${overwritten.map((p)=>`\t${p}\n`).join("")}Please commit your changes or stash them before you merge.\nAborting`);
+  const created=new Set(changes.filter((c)=>!c.oidA).map((c)=>c.path));
+  const clobbered=untracked.filter((p)=>created.has(p));
+  if (clobbered.length) refuse(`The following untracked working tree files would be overwritten by merge:\n${clobbered.map((p)=>`\t${p}\n`).join("")}Please move or remove them before you merge.\nAborting`);
+  const kept=[];
+  for (const { path } of tracked) {
+    const target=join(repo.dir,path);
+    let info;
+    try { info=await lstat(target); } catch { kept.push({ path }); continue; }
+    if (info.isSymbolicLink()) kept.push({ path, link:await readlink(target) });
+    else if (!info.isDirectory()) kept.push({ path, content:await readFile(target), mode:info.mode&0o111?"100755":"100644" });
+  }
+  return { restore:async ()=>{
+    for (const { path,link,content,mode } of kept) {
+      const target=join(repo.dir,path);
+      await rm(target,{ force:true, recursive:true });
+      if (link!==undefined) { await mkdir(dirname(target),{ recursive:true }); await symlink(link,target); }
+      else if (content!==undefined) await materialize(repo.dir,[{ path, content, mode }]);
+    }
+  } };
+}
+
+async function mergeInto(ctx,{ theirs,label,message,noFf,ffOnly,quiet,unrelated }) {
   const repo=await base(ctx);
   const current=await branchName(ctx);
   if (!current) throw new Error("You are not currently on a branch.");
   const before=await head(ctx);
   const author=await identity(ctx,"author"), committer=await identity(ctx,"committer");
+  const merged=before?await autoMerged(ctx,before,theirs):[];
+  // Git refuses to merge over local changes to the paths the other side
+  // changed, and leaves other local changes alone.  isomorphic-git's
+  // conflict path rewrites the whole result tree into the worktree, so
+  // those other changes are snapshotted here and put back afterwards.
+  const local=await guardLocalChanges(ctx,before,theirs,{ fastForward:!noFf });
   let result;
   try {
-    result=await git.merge({ ...repo, ours:current, theirs, author, committer, message, fastForward:!noFf, fastForwardOnly:!!ffOnly, abortOnConflict:false, allowUnrelatedHistories:!!unrelated });
+    result=await git.merge({ ...repo, ours:current, theirs, author, committer, message, fastForward:!noFf, fastForwardOnly:!!ffOnly, abortOnConflict:false, allowUnrelatedHistories:!!unrelated, mergeDriver:gitMergeDriver(label??theirs) });
   } catch (error) {
     if (error.code!=="MergeConflictError") throw error;
-    for (const path of error.data.filepaths) ctx.out(`CONFLICT (content): Merge conflict in ${path}\n`);
+    await local.restore();
+    const { filepaths,deleteByUs=[],deleteByTheirs=[] }=error.data;
+    const name=label??theirs;
+    for (const path of [...new Set([...merged,...filepaths])].sort()) {
+      if (merged.includes(path)) ctx.out(`Auto-merging ${path}\n`);
+      if (deleteByTheirs.includes(path)) ctx.out(`CONFLICT (modify/delete): ${path} deleted in ${name} and modified in HEAD.  Version HEAD of ${path} left in tree.\n`);
+      else if (deleteByUs.includes(path)) ctx.out(`CONFLICT (modify/delete): ${path} deleted in HEAD and modified in ${name}.  Version ${name} of ${path} left in tree.\n`);
+      else if (filepaths.includes(path)) ctx.out(`CONFLICT (content): Merge conflict in ${path}\n`);
+    }
     ctx.out("Automatic merge failed; fix conflicts and then commit the result.\n");
+    await applyTheirs(ctx,before,theirs,new Set(filepaths));
+    await writeMergeState(ctx,theirs,message,[...filepaths].sort());
     return 1;
   }
-  // A fast-forward only moves the ref; bring the index and worktree along.
-  if (result.fastForward && !result.alreadyMerged) await git.checkout({ ...repo, ref:current });
+  // isomorphic-git only moves the ref (a fast-forward) or writes the merged
+  // tree and commit (a true merge); bring the index and worktree along.
+  if (!result.alreadyMerged) await applyTree(ctx,before,result.oid);
   if (quiet) return;
   if (result.alreadyMerged) ctx.out("Already up to date.\n");
   else if (result.fastForward) {
     ctx.out(`Updating ${short(before)}..${short(result.oid)}\nFast-forward\n`);
     ctx.out(await commitSummary(ctx,result.oid,before,{ table:true }));
   }
-  else ctx.out("Merge made by the 'ort' strategy.\n"+await commitSummary(ctx,result.oid,before,{ table:true }));
+  else ctx.out(merged.map((path)=>`Auto-merging ${path}\n`).join("")+"Merge made by the 'ort' strategy.\n"+await commitSummary(ctx,result.oid,before,{ table:true }));
 }
 
 async function merge(ctx,argv) {
   const { options,positional }=parse(argv,{ "no-ff":"noFf", "ff-only":"ffOnly", ff:"ff", m:["message",list], abort:"abort", q:"quiet", quiet:"quiet", "no-edit":"noEdit", "allow-unrelated-histories":"unrelated", "no-commit":"noCommit" });
   const repo=await base(ctx);
-  if (options.abort) { await git.abortMerge({ ...repo }); return; }
+  if (options.abort) {
+    if ((await mergeHeads(ctx)).length===0) throw new Error("There is no merge to abort (MERGE_HEAD missing).");
+    await resetMerge(ctx);
+    await clearMergeState(ctx);
+    return;
+  }
   if (positional.length!==1) throw new Error("this port merges exactly one branch at a time");
+  await refuseUnmerged(ctx,"Merging");
+  if ((await mergeHeads(ctx)).length) throw new Error("You have not concluded your merge (MERGE_HEAD exists).\nPlease, commit your changes before you merge.");
   const theirs=await revision(ctx,positional[0],"commit");
-  const message=options.message?cleanMessage(options.message.join("\n\n")):undefined;
-  return mergeInto(ctx,{ ...options, theirs, message });
+  const message=options.message?cleanMessage(options.message.join("\n\n")):await mergeMessage(ctx,positional[0]);
+  return mergeInto(ctx,{ ...options, theirs, label:positional[0], message });
+}
+
+// Git's default merge message names what was merged -- a branch, a
+// remote-tracking branch, a tag or a commit -- and says which branch it went
+// into unless that is main or master.
+async function mergeMessage(ctx,name) {
+  const repo=await base(ctx);
+  const exists=async (ref)=>{ try { await git.resolveRef({ ...repo, ref }); return true; } catch { return false; } };
+  const what=await exists(`refs/heads/${name}`)?`branch '${name}'`
+    :await exists(`refs/remotes/${name}`)?`remote-tracking branch '${name}'`
+    :await exists(`refs/tags/${name}`)?`tag '${name}'`
+    :`commit '${name}'`;
+  const current=await branchName(ctx);
+  return `Merge ${what}`+(current==="main"||current==="master"?"":` into ${current}`);
 }
 
 // -- diff, with the line diffing done by `bun pm diff` over two scratch trees.
@@ -1481,7 +1831,14 @@ async function diff(ctx,argv) {
   const repo=await base(ctx);
   const paths=parsed.paths??[];
   let revs=parsed.positional.slice(0,parsed.positional.length-paths.length);
-  if (revs.length===1 && revs[0].includes("..")) revs=revs[0].split(/\.\.\.?/);
+  if (revs.length===1 && revs[0].includes("...")) {
+    // A...B compares B with the merge base of the two.
+    const [a,b]=await Promise.all(revs[0].split("...").map((r)=>revision(ctx,r||"HEAD","commit")));
+    const bases=await git.findMergeBase({ ...repo, oids:[a,b] });
+    if (bases.length===0) throw new Error(`no merge base found for ${revs[0]}`);
+    revs=[bases[0],b];
+  }
+  else if (revs.length===1 && revs[0].includes("..")) revs=revs[0].split("..").map((r)=>r||"HEAD");
   // Without `--`, trailing arguments that are not revisions are paths.
   if (!parsed.paths) {
     while (revs.length) {
@@ -1539,11 +1896,26 @@ async function diff(ctx,argv) {
     const commitOid=revs[0]?await revision(ctx,revs[0],"commit"):undefined;
     const left=commitOid?await tree(commitOid):await stage();
     const rows=await git.statusMatrix({ ...repo, ref:commitOid, filepaths:filepaths.length?filepaths.filter(Boolean):undefined });
+    // A path outside the index is untracked on the worktree side whichever
+    // tree is on the left: a file added since the commit is new, and a file
+    // the commit has but the index no longer does is deleted.
     for (const [path,h,w,st] of rows) {
-      if (!left.has(path) && !(commitOid?h:st)) continue;
+      if (!left.has(path) && !st) continue;
       if (h===1 && w===1 && st===1) continue;
-      await record(path,left.get(path),await worktree(path));
+      await record(path,left.get(path),st?await worktree(path):undefined);
     }
+  }
+  // Exact renames, the way Git pairs a deleted file with an added one of
+  // the same content; --no-renames keeps them apart.  Similar-content
+  // renames are not detected.
+  if (!options.noRenames) {
+    const added=pairs.filter((p)=>!p.left);
+    for (const gone of pairs.filter((p)=>!p.right)) {
+      const twin=added.find((p)=>p.right.oid===gone.left.oid && !p.renamed);
+      if (!twin) continue;
+      twin.renamed=gone.path; twin.left=gone.left; gone.dropped=true;
+    }
+    for (let i=pairs.length; i-->0;) if (pairs[i].dropped) pairs.splice(i,1);
   }
   pairs.sort((x,y)=>x.path<y.path?-1:1);
   if (pairs.length===0) return options.exitCode?0:undefined;
@@ -1558,7 +1930,7 @@ async function diff(ctx,argv) {
   const byPath=new Map(pairs.map((p)=>[p.path,p]));
   const changes=files.map((file)=>({ ...file, ...byPath.get(file.path) })).filter((c)=>c.left||c.right);
   // A mode-only change has no patch but is still a change.
-  for (const pair of pairs) if (!changes.some((c)=>c.path===pair.path) && pair.left && pair.right && pair.left.mode!==pair.right.mode) changes.push({ ...pair, status:"modified", linesAdded:0, linesRemoved:0 });
+  for (const pair of pairs) if (!changes.some((c)=>c.path===pair.path) && pair.left && pair.right && (pair.renamed || pair.left.mode!==pair.right.mode)) changes.push({ ...pair, status:"modified", linesAdded:0, linesRemoved:0 });
   changes.sort((x,y)=>x.path<y.path?-1:1);
   if (changes.length===0) return options.exitCode?0:undefined;
   if (options.check) {
@@ -1582,19 +1954,20 @@ async function diff(ctx,argv) {
     return bad?2:0;
   }
   if (options.nameOnly) { ctx.out(changes.map((c)=>c.path+"\n").join("")); return options.exitCode?1:undefined; }
-  if (options.nameStatus) { ctx.out(changes.map((c)=>`${c.status==="added"?"A":c.status==="deleted"?"D":"M"}\t${c.path}\n`).join("")); return options.exitCode?1:undefined; }
+  if (options.nameStatus) { ctx.out(changes.map((c)=>c.renamed?`R100\t${c.renamed}\t${c.path}\n`:`${c.status==="added"?"A":c.status==="deleted"?"D":"M"}\t${c.path}\n`).join("")); return options.exitCode?1:undefined; }
   if (options.stat) {
-    const rows=changes.map((c)=>({ path:c.path, insertions:c.linesAdded, deletions:c.linesRemoved, binary:c.binary, bytesBefore:c.bytesBefore, bytesAfter:c.bytesAfter }));
+    const rows=changes.map((c)=>({ path:c.path, renamed:c.renamed, insertions:c.linesAdded, deletions:c.linesRemoved, binary:c.binary, bytesBefore:c.bytesBefore, bytesAfter:c.bytesAfter }));
     ctx.out(statTable(rows)+statLine({ files:rows.length, insertions:rows.reduce((n,r)=>n+r.insertions,0), deletions:rows.reduce((n,r)=>n+r.deletions,0) }));
     return options.exitCode?1:undefined;
   }
   let text="";
   for (const c of changes) {
     const { left,right }=c;
-    let header=`diff --git a/${c.path} b/${c.path}\n`;
+    let header=`diff --git a/${c.renamed??c.path} b/${c.path}\n`;
     if (!left) header+=`new file mode ${right.mode}\n`;
     else if (!right) header+=`deleted file mode ${left.mode}\n`;
     else if (left.mode!==right.mode) header+=`old mode ${left.mode}\nnew mode ${right.mode}\n`;
+    if (c.renamed) header+=`similarity index 100%\nrename from ${c.renamed}\nrename to ${c.path}\n`;
     const same=left && right && left.oid===right.oid;
     if (!same) header+=`index ${short(left?.oid??"0".repeat(40))}..${short(right?.oid??"0".repeat(40))}${left && right && left.mode===right.mode?` ${left.mode}`:""}\n`;
     if (same) { text+=ctx.paint("bold",header.trimEnd()).replace(/\n/g,"\n")+"\n"; continue; }
@@ -1643,23 +2016,23 @@ async function revParse(ctx,argv) {
 }
 
 async function lsFiles(ctx,argv) {
-  const { options,positional }=parse(argv,{ s:"stage", stage:"stage", c:"cached", cached:"cached", z:"nul", o:"others", others:"others", "exclude-standard":"excludeStandard" });
+  const { options,positional }=parse(argv,{ s:"stage", stage:"stage", c:"cached", cached:"cached", z:"nul", o:"others", others:"others", "exclude-standard":"excludeStandard", "full-name":"fullName" });
   const repo=await base(ctx);
-  const filter=positional.length?await Promise.all(positional.map((p)=>ctx.pathspec(p))):[""];
+  // Without a pathspec Git lists the current directory's subtree, and shows
+  // every path relative to that directory unless --full-name.
+  const filter=positional.length?await Promise.all(positional.map((p)=>ctx.pathspec(p))):[await ctx.pathspec(".")];
   const keep=(f)=>filter.some((p)=>p==="" || f===p || f.startsWith(p+"/"));
+  const name=async (f)=>options.fullName?f:ctx.display(f);
   if (options.others) {
     const { untracked }=porcelainRows(await statusRows(ctx));
-    for (const path of untracked.filter(keep).sort()) ctx.out(`${path}\n`);
+    for (const path of untracked.filter(keep).sort()) ctx.out(`${await name(path)}\n`);
     return;
   }
   const files=(await git.listFiles({ ...repo })).filter(keep).sort();
-  if (!options.stage) { ctx.out(files.map((f)=>f+(options.nul?"\0":"\n")).join("")); return; }
-  const entries=await git.walk({ ...repo, trees:[git.STAGE()], map:async (path,[entry])=>{
-    if (path==="." || !entry || !keep(path)) return;
-    if (await entry.type()!=="blob") return;
-    return `${(await entry.mode()).toString(8)} ${await entry.oid()} 0\t${path}\n`;
-  } });
-  ctx.out(entries.sort().join(""));
+  if (!options.stage) { for (const f of files) ctx.out(await name(f)+(options.nul?"\0":"\n")); return; }
+  // Straight from the index, so conflict stages come out as Git lists them.
+  const entries=(await indexEntries(ctx)).filter((e)=>keep(e.path)).sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:a.stage-b.stage);
+  for (const { path,mode,oid,stage } of entries) ctx.out(`${mode} ${oid} ${stage}\t${await name(path)}\n`);
 }
 
 async function showRef(ctx,argv) {
@@ -2016,6 +2389,13 @@ async function show(ctx,argv) {
   const oid=await revision(ctx,positional[0]??"HEAD");
   const repo=await base(ctx);
   const object=await git.readObject({ ...repo, oid, format:"parsed" });
+  // An annotated tag: its header and message, then what it points to.
+  if (object.type==="tag") {
+    const { tag }=object.object, { tagger,message }=object.object;
+    const body=message.replace(/\n*$/,"\n");
+    ctx.out(options.oneline?`${ctx.paint("yellow",`tag ${tag}`)}\n\n${body}`:`${ctx.paint("yellow",`tag ${tag}`)}\nTagger: ${tagger.name} <${tagger.email}>\nDate:   ${gitDate(tagger)}\n\n${body}\n`);
+    return show(ctx,[...argv.filter((a)=>a!==positional[0]),object.object.object]);
+  }
   if (object.type!=="commit") return catFile(ctx,["-p",oid]);
   const entry={ oid,commit:object.object };
   const names=ctx.decorate?await decorations(ctx):undefined;
@@ -2039,7 +2419,7 @@ export const commands={
   add:         { usage:"add [-A | -u] [-n] [-v] [--] <pathspec>...", run:add },
   rm:          { usage:"rm [--cached] [-r] [-q] [--] <pathspec>...", run:remove },
   mv:          { usage:"mv [-f] <source>... <destination>", run:move },
-  commit:      { usage:"commit [-a] [-q] [--amend] [--allow-empty] [--author=<author>] [--date=<date>] [-m <msg> | -F <file>] [--] [<pathspec>...]", run:commit },
+  commit:      { usage:"commit [-a] [-q] [--amend] [--reset-author] [--allow-empty] [--author=<author>] [--date=<date>] [-m <msg> | -F <file>] [--] [<pathspec>...]", run:commit },
   status:      { usage:"status [-s | --porcelain] [-b] [--ignored] [--] [<pathspec>...]", run:status },
   log:         { usage:"log [--all] [-n <count>] [--oneline] [--format=<format>] [--since=<date>] [--follow] [--reverse] [<revision>] [-- <path>]", run:log },
   show:        { usage:"show [--stat | --no-patch] [--oneline] [<object>]", run:show },
@@ -2059,7 +2439,7 @@ export const commands={
   "merge-base": { usage:"merge-base [-a] <commit> <commit>... | merge-base --is-ancestor <commit> <commit>", run:mergeBase },
   "cherry-pick":{ usage:"cherry-pick [-n] <commit>", run:cherryPick },
   "rev-parse": { usage:"rev-parse [--short] [--abbrev-ref] [--verify] <revision>... | rev-parse --show-toplevel | --git-dir | --is-inside-work-tree | --show-prefix", run:revParse },
-  "ls-files":  { usage:"ls-files [-s] [-o] [-z] [--] [<path>...]", run:lsFiles },
+  "ls-files":  { usage:"ls-files [-s] [-o] [-z] [--full-name] [--] [<path>...]", run:lsFiles },
   "show-ref":  { usage:"show-ref [--heads] [--tags] [-d] [-s] [<pattern>...]", run:showRef },
   "ls-remote": { usage:"ls-remote [--heads] [--tags] [--refs] [--symref] [--exit-code] [<remote or url> [<pattern>...]]", run:lsRemote },
   config:      { usage:"config [--global | --local] <name> [<value>] | config --get <name> | config --unset <name> | config --list | config --add <name> <value>", run:configCommand },

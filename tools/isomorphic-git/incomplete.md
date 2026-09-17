@@ -51,8 +51,43 @@ The previously requested compatibility probes are covered as well:
 - merge-base
 
 
+Working-tree semantics supplied by the port
+-------------------------------------------
+
+isomorphic-git's checkout, merge and abortMerge treat the index as the old
+tree: checkout drops staged changes and deletes staged new files, merge only
+moves the ref (or, on conflicts, rewrites the whole result tree into the
+worktree without staging the other side's clean changes), and abortMerge
+rewrites every clean index entry without its mode or stats.  The port
+implements Git's behaviour on top of the object-level APIs:
+
+- checkout/switch: HEAD moves and only the paths the two commits differ in
+  are written; local changes are carried across, or refused with Git's
+  messages when they would be overwritten; the carried changes are listed.
+- merge: the paths the merge changed are written to the index and worktree;
+  Git's pre-merge refusals (dirty index, dirty touched paths, untracked
+  files in the way) with Git's statuses; `Auto-merging` lines; conflict
+  markers labelled `HEAD` and the name as given; modify/delete conflicts;
+  the other side's clean changes staged on a conflict; MERGE_HEAD,
+  MERGE_MODE and MERGE_MSG written.
+- commit: refuses over unmerged paths, concludes a merge with the MERGE_HEAD
+  parents and MERGE_MSG (`--no-edit` keeps its comments, as Git does), and
+  `--amend` keeps the original author unless `--reset-author`, `--author`
+  or `--date` says otherwise.
+- merge --abort: `reset --merge` semantics over the paths the merge staged
+  or left unmerged.
+- status and ls-files -s: conflict stages are read straight from the index
+  file, which isomorphic-git keeps but does not expose.
+
 Partial commands and deliberate limits
 --------------------------------------
+
+- diff pairs only exact (100%) renames; similar-content rename detection is
+  not implemented.
+- diff during a conflicted merge and show of a merge commit do not produce
+  Git's combined (`--cc`) format; show diffs against the first parent.
+- `git merge name~N` names the merge `Merge commit 'name~N'` where Git
+  strips the suffix; the conflict markers use the name as given like Git.
 
 - show supports one object and the common patch/stat/oneline forms.  It does
   not implement Git's complete formatting and pathspec surface.

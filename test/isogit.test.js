@@ -11,7 +11,7 @@
 // is a read-only clone, skipped when the host is unreachable.  HOME is
 // redirected to the scratch directory, so no real credentials are in reach.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -406,6 +406,70 @@ describe("bunproot --git matches the system git",()=>{
     crossCheck();
   });
 
+  // `git diff <commit>` compares the commit with the worktree, but only for
+  // the paths the index tracks: a file committed since then is new, one
+  // removed from the index is deleted, and an untracked file is invisible.
+  it("diff against an older commit sees the files the index tracks",()=>{
+    const base=same(["rev-parse","HEAD"]).sys.stdout.trim();
+    write("added.txt","added after base\n");
+    write("nested/deep/added.txt","nested and added\n");
+    write("tool.sh","#!/bin/sh\necho tool\n");
+    for (const root of Object.values(roots)) chmodSync(join(root,"tool.sh"),0o755);
+    same(["add","added.txt","nested","tool.sh"]);
+    same(["commit","-m","files added after base"]);
+    // The hash itself, the way it is pasted from `log`, and the relative names.
+    same(["diff",base]);
+    same(["diff",base.slice(0,7)]);
+    same(["diff","HEAD~1"]);
+    same(["diff","HEAD~1","--stat"]);
+    same(["diff","--name-only","HEAD~1"]);
+    same(["diff","--name-status","HEAD~1"]);
+    same(["diff","HEAD~1","--","added.txt"]);
+    same(["diff","HEAD~1","--","nested"]);
+    same(["diff","HEAD~1","--","code.js"]);
+    same(["diff","-U0","HEAD~1","nested/deep/added.txt"]);
+    expect(same(["diff","--exit-code","HEAD~1"]).iso.status).toBe(1);
+    same(["diff","--quiet","HEAD~1"]);
+    same(["tag","base-plus-one"]);
+    same(["diff","base-plus-one"]);
+    // From a subdirectory: relative paths, and only that subtree.
+    same(["diff","HEAD~1"],{ cwd:"nested" });
+    same(["diff","HEAD~1","--stat"],{ cwd:"nested/deep" });
+    same(["diff","HEAD~1","--","."],{ cwd:"nested" });
+    // Worktree edits on top: a committed file changed again, a new file only
+    // staged and then edited, a staged file gone from disk, an untracked one.
+    write("added.txt","added after base\nand edited\n");
+    write("staged.txt","staged\n");
+    same(["add","staged.txt"]);
+    write("staged.txt","staged\nthen edited\n");
+    write("gone.txt","staged then deleted\n");
+    same(["add","gone.txt"]);
+    remove("gone.txt");
+    write("untracked.txt","never added\n");
+    same(["diff","HEAD~1"]);
+    same(["diff","HEAD~1","--stat"]);
+    same(["diff","--name-status","HEAD~1"]);
+    same(["diff","HEAD"]);
+    same(["diff","--cached","HEAD~1","--stat"]);
+    same(["diff"]);
+    // Committed files leaving the index or the disk read as deleted.
+    same(["rm","--cached","noeol.txt"]);
+    remove("code.js");
+    same(["diff","HEAD~1","--name-status"]);
+    same(["diff","HEAD~1","--","noeol.txt"]);
+    same(["diff","HEAD~1","--","code.js"]);
+    same(["diff","HEAD","--stat"]);
+    same(["diff","--stat",base]);
+    same(["status","--porcelain"]);
+    // Back to a clean tree for the later steps.
+    same(["reset","-q","--hard","HEAD"]);
+    remove("staged.txt");
+    remove("untracked.txt");
+    same(["tag","-d","base-plus-one"]);
+    same(["status","--porcelain"]);
+    crossCheck();
+  });
+
   it("colours like Git, and by default even in a pipe",()=>{
     write("colour.txt","colour\n");
     write("dir/nested/b.txt","one\nthree\nfour\n");
@@ -538,6 +602,339 @@ describe("bunproot --git matches the system git",()=>{
     crossCheck();
   });
 
+  it("--amend keeps the author unless told otherwise",()=>{
+    write("amend.txt","first\n");
+    same(["add","amend.txt"]);
+    same(["commit","-m","to be amended"]);
+    write("amend.txt","second\n");
+    same(["add","amend.txt"]);
+    // Later steps have later dates: the author date must stay the original.
+    same(["commit","--amend","--no-edit"]);
+    same(["log","-1","--format=%an %ae %ad%n%cn %ce %cd"]);
+    same(["commit","--amend","--no-edit","--author=Someone Else <else@example.com>"]);
+    same(["log","-1","--format=%an %ae %ad"]);
+    same(["commit","--amend","--no-edit","--date=2021-02-03T04:05:06+0000"]);
+    same(["log","-1","--format=%an %ae %ad"]);
+    same(["commit","--amend","--no-edit","--reset-author"]);
+    same(["log","-1","--format=%an %ae %ad%n%cd"]);
+    crossCheck();
+  });
+
+  it("a true merge updates the index and worktree and names the branch",()=>{
+    same(["checkout","-b","topic"]);
+    write("topic-only.txt","added on topic\n");
+    write("main.txt","right\nand topic\n");
+    same(["add","topic-only.txt","main.txt"]);
+    same(["commit","-m","topic work"]);
+    same(["checkout","main"]);
+    write("main-only.txt","added on main\n");
+    same(["add","main-only.txt"]);
+    same(["commit","-m","main work"]);
+    same(["merge","topic"]);
+    // The file added on topic exists, the one it changed is updated, and
+    // nothing is left staged or modified.
+    expect(read("topic-only.txt").iso).toBe("added on topic\n");
+    expect(read("main.txt").iso).toBe("right\nand topic\n");
+    same(["status","--porcelain"]);
+    same(["ls-files","-s"]);
+    same(["log","-1","--format=%s%n%P"]);
+    // Merging into a branch other than main/master says so, and other
+    // argument forms are named as given.
+    same(["checkout","topic"]);
+    same(["merge","main"]);
+    same(["log","-1","--format=%s"]);
+    write("topic2.txt","more\n");
+    same(["add","topic2.txt"]);
+    same(["commit","-m","topic again"]);
+    same(["checkout","main"]);
+    same(["merge","--no-ff",same(["rev-parse","--short","topic"]).sys.stdout.trim()]);
+    same(["log","-1","--format=%s"]);
+    same(["merge","--no-ff","refs/heads/topic"]);
+    same(["log","-3","--format=%s"]);
+    same(["branch","-D","topic"]);
+    crossCheck();
+  });
+
+  it("a conflicted merge is labelled, reported and concluded like Git",()=>{
+    write("both.txt","1\n2\n3\n4\n5\n6\n7\n8\n9\n");
+    write("gone.txt","to be deleted\n");
+    same(["add","both.txt","gone.txt"]);
+    same(["commit","-m","conflict fixtures"]);
+    same(["checkout","-b","other"]);
+    write("main.txt","other side\n");
+    write("both.txt","1\n2\n3\n4\n5\n6\n7\n8\nnine\n");
+    same(["rm","-q","gone.txt"]);
+    same(["commit","-am","other side"]);
+    same(["checkout","main"]);
+    write("main.txt","main side\n");
+    write("both.txt","one\n2\n3\n4\n5\n6\n7\n8\n9\n");
+    write("gone.txt","modified here\n");
+    same(["commit","-am","main side"]);
+    // Auto-merging lines, content and modify/delete conflicts, HEAD and the
+    // name as given on the conflict markers, and the clean merge of both.txt.
+    same(["merge","other"]);
+    expect(read("main.txt").iso).toBe("<<<<<<< HEAD\nmain side\n=======\nother side\n>>>>>>> other\n");
+    expect(read("both.txt")).toEqual({ sys:"one\n2\n3\n4\n5\n6\n7\n8\nnine\n", iso:"one\n2\n3\n4\n5\n6\n7\n8\nnine\n" });
+    same(["status"]);
+    same(["status","-s"]);
+    same(["status","--porcelain"]);
+    same(["status","--","main.txt"]);
+    // Neither committing nor merging over unresolved conflicts.
+    same(["commit","-m","too early"]);
+    same(["merge","other"]);
+    same(["merge","--abort"]);
+    same(["status","--porcelain"]);
+    same(["merge","--abort"]);
+    // Resolve, and the commit that concludes the merge has both parents.
+    same(["merge","other"]);
+    write("main.txt","both sides\n");
+    same(["add","main.txt"]);
+    same(["status"]);
+    same(["rm","-q","gone.txt"]);
+    same(["status"]);
+    same(["status","-s"]);
+    same(["commit","-m","resolved"]);
+    same(["log","-1","--format=%s%n%P"]);
+    same(["status","--porcelain"]);
+    // Without -m the prepared merge message is used, comments and all.
+    write("main.txt","main again\n");
+    same(["commit","-am","main again"]);
+    same(["checkout","other"]);
+    write("main.txt","other again\n");
+    same(["commit","-am","other again"]);
+    same(["checkout","main"]);
+    same(["merge","other"]);
+    write("main.txt","resolved again\n");
+    same(["add","main.txt"]);
+    same(["commit","--no-edit"]);
+    same(["log","-1","--format=%B%n%P"]);
+    same(["branch","-D","other"]);
+    crossCheck();
+  });
+
+  it("checkout carries local changes across branches like Git",()=>{
+    write("carry-a.txt","a\n");
+    write("carry-b.txt","b\n");
+    write("carry-c.txt","c\n");
+    same(["add","carry-a.txt","carry-b.txt","carry-c.txt"]);
+    same(["commit","-m","carry fixtures"]);
+    same(["checkout","-b","carry-other"]);
+    write("carry-c.txt","c on other\n");
+    write("carry-o.txt","o\n");
+    same(["add","carry-o.txt"]);
+    same(["commit","-am","carry other"]);
+    same(["checkout","main"]);
+    // Staged, unstaged and untracked changes survive -b at the same commit
+    // and a switch to another commit, and are listed when the tree moved.
+    write("carry-a.txt","a2\n");
+    write("carry-n.txt","n\n");
+    same(["add","carry-n.txt"]);
+    write("carry-b.txt","b2\n");
+    same(["add","carry-b.txt"]);
+    write("carry-u.txt","untracked\n");
+    same(["status","--porcelain"]);
+    same(["checkout","-b","carry-topic"]);
+    same(["status","--porcelain"]);
+    same(["checkout","main"]);
+    same(["switch","carry-topic"]);
+    same(["switch","-c","carry-topic2"]);
+    same(["checkout","-q","main"]);
+    same(["checkout","carry-other"]);
+    same(["status","--porcelain"]);
+    expect(read("carry-b.txt").iso).toBe("b2\n");
+    expect(read("carry-c.txt").iso).toBe("c on other\n");
+    same(["checkout","main"]);
+    same(["status","--porcelain"]);
+    // A path the switch would change must not have local changes; an
+    // untracked file must not be in the way; -f discards them.
+    write("carry-c.txt","c local\n");
+    same(["checkout","carry-other"]);
+    same(["status","--porcelain"]);
+    same(["checkout","-f","carry-other"]);
+    same(["status","--porcelain"]);
+    same(["checkout","main"]);
+    write("carry-o.txt","in the way\n");
+    same(["checkout","carry-other"]);
+    remove("carry-o.txt");
+    same(["checkout",same(["rev-parse","--short","carry-other"]).sys.stdout.trim()]);
+    same(["status","--porcelain"]);
+    same(["checkout","main"]);
+    same(["commit","-m","carried"]);
+    remove("carry-u.txt");
+    same(["branch","-D","carry-other"]);
+    same(["branch","-D","carry-topic"]);
+    same(["branch","-D","carry-topic2"]);
+    same(["status","--porcelain"]);
+    crossCheck();
+  });
+
+  it("merge refuses or keeps local changes like Git and aborts cleanly",()=>{
+    write("mg-a.txt","a\n");
+    write("mg-keep.txt","k\n");
+    write("mg-s.txt","s\n");
+    write("mg-m.txt","m\n");
+    write("mg-tool.sh","#!/bin/sh\n");
+    for (const root of Object.values(roots)) chmodSync(join(root,"mg-tool.sh"),0o755);
+    same(["add","mg-a.txt","mg-keep.txt","mg-s.txt","mg-m.txt","mg-tool.sh"]);
+    same(["commit","-m","merge guard fixtures"]);
+    same(["checkout","-b","mg-other"]);
+    write("mg-a.txt","other\n");
+    write("mg-add.txt","x\n");
+    same(["add","mg-add.txt"]);
+    same(["commit","-am","mg other"]);
+    same(["checkout","main"]);
+    same(["checkout","-b","mg-ffbase"]);
+    same(["checkout","main"]);
+    write("mg-m.txt","m2\n");
+    same(["commit","-am","mg main"]);
+    // A true merge: untracked in the way, a dirty index, a dirty touched file.
+    write("mg-add.txt","u\n");
+    same(["merge","mg-other"]);
+    remove("mg-add.txt");
+    write("mg-s.txt","st\n");
+    same(["add","mg-s.txt"]);
+    write("mg-a.txt","d\n");
+    same(["merge","mg-other"]);
+    same(["reset","-q","--hard"]);
+    write("mg-a.txt","d\n");
+    same(["merge","mg-other"]);
+    same(["checkout","--","mg-a.txt"]);
+    // Local changes to untouched paths survive a conflicted merge and its
+    // abort, as does the executable bit of an untouched file.
+    write("mg-keep.txt","edit\n");
+    remove("mg-tool.sh");
+    same(["merge","mg-other"]);
+    same(["status","--porcelain"]);
+    same(["ls-files","-s"]);
+    expect(read("mg-keep.txt").iso).toBe("edit\n");
+    same(["merge","--abort"]);
+    same(["status","--porcelain"]);
+    same(["ls-files","-s"]);
+    same(["checkout","--","mg-keep.txt","mg-tool.sh"]);
+    same(["merge","mg-other"]);
+    same(["status","--porcelain"]);
+    // A fast-forward: the same refusals with Git's other status, and a dirty
+    // index on an untouched path is fine.
+    same(["checkout","mg-ffbase"]);
+    write("mg-add.txt","u\n");
+    same(["merge","mg-other"]);
+    remove("mg-add.txt");
+    write("mg-a.txt","d\n");
+    same(["merge","mg-other"]);
+    same(["add","mg-a.txt"]);
+    same(["merge","mg-other"]);
+    same(["checkout","--","mg-a.txt"]);
+    same(["reset","-q"]);
+    same(["checkout","--","mg-a.txt"]);
+    write("mg-s.txt","st\n");
+    same(["add","mg-s.txt"]);
+    write("mg-keep.txt","edit\n");
+    same(["merge","mg-other"]);
+    same(["status","--porcelain"]);
+    same(["reset","-q","--hard"]);
+    same(["checkout","main"]);
+    same(["branch","-D","mg-other"]);
+    same(["branch","-D","mg-ffbase"]);
+    same(["status","--porcelain"]);
+    crossCheck();
+  });
+
+  it("show prints an annotated tag before what it points to",()=>{
+    // Tagging a merge commit would need Git's combined diff, which this port
+    // does not produce; the tagged commit is a plain one.
+    write("tagged.txt","tagged\n");
+    same(["add","tagged.txt"]);
+    same(["commit","-m","tagged commit\n\n\tindented with a tab"]);
+    same(["tag","-a","shown","-m","shown tag\n\nwith a body"]);
+    same(["show","shown"]);
+    same(["show","shown","--stat"]);
+    same(["show","-s","shown"]);
+    same(["show","--oneline","-s","shown"]);
+    same(["-c","color.ui=always","show","-s","shown"]);
+    same(["tag","-d","shown"]);
+  });
+
+  it("status and ls-files are relative to the current directory",()=>{
+    write("nested/one/inner.txt","inner\n");
+    write("nested/two/other.txt","other\n");
+    same(["add","nested"]);
+    same(["commit","-m","nested files"]);
+    write("nested/one/inner.txt","changed\n");
+    write("main.txt","changed at the top\n");
+    write("nested/one/new.txt","new\n");
+    write("nested/untracked/x.txt","x\n");
+    same(["mv","nested/two/other.txt","nested/one/moved.txt"]);
+    for (const cwd of ["nested/one","nested"]) {
+      same(["status"],{ cwd });
+      same(["status","-s"],{ cwd });
+      same(["status","-sb"],{ cwd });
+      same(["status","--porcelain"],{ cwd });
+      same(["ls-files"],{ cwd });
+      same(["ls-files","."],{ cwd });
+      same(["ls-files","-s"],{ cwd });
+      same(["ls-files","-o"],{ cwd });
+      same(["ls-files","--full-name"],{ cwd });
+    }
+    same(["ls-files","../../main.txt"],{ cwd:"nested/one" });
+    same(["status","-s","."],{ cwd:"nested/one" });
+    same(["commit","-am","nested changes"],{ cwd:"nested/one" });
+    remove("nested/one/new.txt");
+    remove("nested/untracked");
+    same(["status","--porcelain"]);
+    crossCheck();
+  });
+
+  it("log --pretty=format: and %xNN match Git",()=>{
+    same(["log","--pretty=format:%s","-3"]);
+    same(["log","--pretty=tformat:%s","-3"]);
+    same(["log","--format=%s","-3"]);
+    same(["log","--pretty=format:%h%x20%s%x09%an","-2"]);
+    same(["log","--format=format:%s","-1"]);
+  });
+
+  it("diff pairs exact renames and takes A...B from the merge base",()=>{
+    write("lib/x.js","x\n");
+    write("lib/y.js","y\n");
+    write("sub/z.js","z\n");
+    same(["add","lib","sub"]);
+    same(["commit","-m","rename fixtures"]);
+    same(["mv","main.txt","renamed.txt"]);
+    same(["mv","lib/x.js","lib/x2.js"]);
+    same(["mv","sub/z.js","lib/z.js"]);
+    same(["diff","--cached"]);
+    same(["diff","--cached","--stat"]);
+    same(["diff","--cached","--name-status"]);
+    same(["diff","--cached","--name-only"]);
+    same(["diff","--cached","--no-renames","--stat"]);
+    same(["commit","-m","renames"]);
+    same(["diff","HEAD~1"]);
+    same(["diff","HEAD~1","--stat"]);
+    same(["diff","HEAD~1","--name-status"]);
+    same(["show","--stat","HEAD"]);
+    same(["mv","lib/y.js","sub/y.js"]);
+    same(["commit","-m","move y"]);
+    same(["show","--stat","HEAD"]);
+    same(["diff","HEAD~2..HEAD","--stat"]);
+    same(["checkout","-b","three-dot"]);
+    write("three.txt","three\n");
+    same(["add","three.txt"]);
+    same(["commit","-m","on three-dot"]);
+    same(["checkout","main"]);
+    write("renamed.txt","changed on main\n");
+    same(["commit","-am","on main"]);
+    same(["diff","main...three-dot","--stat"]);
+    same(["diff","three-dot...main","--stat"]);
+    same(["diff","main..three-dot","--stat"]);
+    same(["diff","...three-dot","--stat"]);
+    same(["diff","three-dot...","--stat"]);
+    same(["diff","main...three-dot"]);
+    same(["merge","three-dot"]);
+    same(["branch","-d","three-dot"]);
+    same(["mv","renamed.txt","main.txt"]);
+    same(["commit","-m","named back"]);
+    crossCheck();
+  });
+
   it("diff --no-index compares files and directory trees like Git",()=>{
     write("no-index-left/same.txt","same\n");
     write("no-index-right/same.txt","same\n");
@@ -596,6 +993,20 @@ describe("bunproot --git matches the system git",()=>{
     const describe=(dir)=>Object.fromEntries(["status --porcelain","log --all --format=%H %P %T %s","show-ref","ls-files -s","branch -a","tag","remote -v"]
       .map((c)=>[c,launch("sys",dir,c.split(" "),0).stdout.split(roots.sys).join("<root>").split(roots.iso).join("<root>")]));
     expect(describe(clones.iso)).toEqual(describe(clones.sys));
+    // In the clone: commit a new file, then diff against the hash that was
+    // HEAD before it, and against the remote-tracking branch still there.
+    const before=launch("sys",clones.sys,["rev-parse","HEAD"],0).stdout.trim();
+    for (const side of ["sys","iso"]) {
+      writeFileSync(join(clones[side],"after-clone.txt"),"committed in the clone\n");
+      expect(launch(side,clones[side],["add","after-clone.txt"],step+1).status).toBe(0);
+      expect(launch(side,clones[side],["commit","-m","in the clone"],step+1).status).toBe(0);
+    }
+    step++;
+    for (const args of [["diff",before],["diff","--stat",before],["diff","origin/main"],["diff","--name-status","origin/HEAD"],["diff",before,"HEAD"]]) {
+      const sys=launch("sys",clones.sys,args,0), iso=launch("iso",clones.iso,args,0);
+      expect({ args,status:iso.status,stdout:iso.stdout }).toEqual({ args,status:sys.status,stdout:sys.stdout });
+      expect(sys.stdout).toContain("after-clone.txt");
+    }
     const fileClones={ sys:join(scratch,"file-sys"), iso:join(scratch,"file-iso") };
     expect(launch("sys",scratch,["clone","-q",`file://${roots.sys}`,fileClones.sys],0).status).toBe(0);
     expect(launch("iso",scratch,["clone","-q",`file://${roots.iso}`,fileClones.iso],0).status).toBe(0);

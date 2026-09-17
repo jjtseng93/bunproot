@@ -563,6 +563,16 @@ The stash command inherits isomorphic-git's narrower semantics: it stashes
 tracked files only, and apply/pop cannot abort on conflicts. Its command-line
 messages, identity lookup and reflog names are adapted to match Git.
 
+Where isomorphic-git stops short of Git's working-tree semantics the port
+fills in: a branch switch carries staged and unstaged changes across and
+refuses when they would be overwritten, a merge lands its changes in the
+index and worktree while leaving unrelated local changes alone, a conflicted
+merge keeps Git's `MERGE_HEAD`/`MERGE_MSG` state so that `status` reports
+the unmerged paths, `commit` concludes it with a merge commit and `--abort`
+resets only what the merge touched. `diff` and `show` pair exact renames;
+similar-content renames and the combined diff of a merge commit are not
+produced.
+
 `diff` is the one command that is not isomorphic-git underneath: it writes
 the two sides being compared into a scratch directory and has `bun pm diff
 --raw --json` produce the hunks, then prints them in Git's own format
