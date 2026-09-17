@@ -200,6 +200,15 @@ beforeAll(()=>{
 afterAll(()=>{ rmSync(scratch,{ recursive:true, force:true }); });
 
 describe("bunproot --git matches the system git",()=>{
+  it("accepts --yes before the Git command",()=>{
+    const result=spawn({
+      cmd:[BUN,PROOT,"--git","--yes","--version"], cwd:roots.iso,
+      env:environment(0), stdin:"ignore", stdout:"pipe", stderr:"pipe",
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain("isomorphic-git.1.41.9 (bunproot)");
+  });
+
   it("init, status and rev-parse in an empty repository",()=>{
     same(["init","."]);
     same(["status"]);

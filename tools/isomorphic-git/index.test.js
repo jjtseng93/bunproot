@@ -1,6 +1,15 @@
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
+import { confirmInstall, parseGlobal } from "./index.js";
 import { destination, list, parse, parseClone } from "./options.js";
+
+test("--yes skips only the installation confirmation", () => {
+  expect(parseGlobal(["--yes","clone","URL"])).toMatchObject({ yes:true,command:"clone",argv:["URL"] });
+  let prompted=false;
+  confirmInstall(true,()=>{ prompted=true; return "n"; });
+  expect(prompted).toBe(false);
+  expect(()=>confirmInstall(false,()=>"n")).toThrow("installation cancelled");
+});
 
 test("clone arguments use Git's repository then directory order", () => {
   expect(destination("https://example.com/owner/project.git")).toBe("project");

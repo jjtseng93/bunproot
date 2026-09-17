@@ -337,7 +337,7 @@ is an argument to the guest program instead.
 | `--l2s-docs` | Render [link2symlink.md](./link2symlink.md), the on-disk format, in the terminal |
 | `--l2s-ignore-pin` | Enter a rootfs whose link store is pinned, which is otherwise refused. Its emulated hard links do not work while it is pinned |
 | `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
-| `--git COMMAND [ARG ...]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, run the Git command with Git's own arguments and output, then exit. `--git --help` lists the commands |
+| `--git [--yes] COMMAND [ARG ...]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, run the Git command with Git's own arguments and output, then exit. Add `--yes` immediately after `--git` to install without asking. `--git --help` lists the commands |
 | `--x11-demo` | Open the tiny dependency-free JavaScript X11 smoke-test window |
 | `--readme` | Render this README in the terminal, with links where it has them |
 | `-h`, `--help` | The options and the debug environment variables |
@@ -610,8 +610,9 @@ Install now? (Y/n)
 Only Enter, `y`, or `yes` starts the in-place installation. It uses
 `bun install --frozen-lockfile --ignore-scripts --production`, so the lockfile
 cannot be updated and dependency lifecycle scripts cannot run. Any other
-answer cancels it. Later runs reuse the installed, version-checked copy without
-asking again. bunproot verifies the installed package on disk rather than
+answer cancels it. `bunproot --git --yes COMMAND` skips this question and
+installs immediately. Later runs reuse the installed, version-checked copy
+without asking again. bunproot verifies the installed package on disk rather than
 trusting `bun install`'s exit status, which was unreliable before
 [oven-sh/bun#39060](https://github.com/oven-sh/bun/issues/39060) was fixed.
 

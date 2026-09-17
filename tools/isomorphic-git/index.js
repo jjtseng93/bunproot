@@ -19,7 +19,17 @@ function installed() {
   } catch { return false; }
 }
 
-function install() {
+export function confirmInstall(yes, ask=prompt) {
+  if (yes) return;
+  // Bun can return null for an empty interactive line when no default is
+  // supplied, making Enter indistinguishable from EOF. Give prompt an
+  // explicit default so the conventional uppercase Y really means yes.
+  const answer=ask("Install now? (Y/n)","y");
+  if (answer===null || !["","y","yes"].includes(answer.trim().toLowerCase()))
+    throw new Error("isomorphic-git installation cancelled");
+}
+
+function install(yes=false) {
   if (installed()) return;
   const bun=Bun.which("bun")||process.argv0;
   const command=[bun,"install","--frozen-lockfile","--ignore-scripts","--production"];
@@ -35,12 +45,7 @@ function install() {
     "  cmd:",
   ].join("\n"));
   console.error(command);
-  // Bun can return null for an empty interactive line when no default is
-  // supplied, making Enter indistinguishable from EOF. Give prompt an
-  // explicit default so the conventional uppercase Y really means yes.
-  const answer=prompt("Install now? (Y/n)","y");
-  if (answer===null || !["","y","yes"].includes(answer.trim().toLowerCase()))
-    throw new Error("isomorphic-git installation cancelled");
+  confirmInstall(yes);
   Bun.spawnSync({
     cmd:command,
     cwd:directory,
@@ -56,12 +61,13 @@ function install() {
 // Git's own global options: the ones that change where or how a command runs.
 // Anything after the command name belongs to the command.
 export function parseGlobal(argv) {
-  const global={ overrides:{}, directories:[] };
+  const global={ overrides:{}, directories:[], yes:false };
   let index=0;
   for (; index<argv.length; index++) {
     const argument=argv[index];
     if (argument==="--version") return { ...global, command:"version", argv:[] };
     if (argument==="--help" || argument==="-h") return { ...global, command:"help", argv:argv.slice(index+1) };
+    if (argument==="--yes") { global.yes=true; continue; }
     if (argument==="-C") { global.directories.push(argv[++index]??"."); continue; }
     if (argument.startsWith("-C") && argument.length>2) { global.directories.push(argument.slice(2)); continue; }
     if (argument==="-c") {
@@ -82,7 +88,7 @@ export function parseGlobal(argv) {
 function help(commands,name) {
   if (name && commands[name]) return `usage: git ${commands[name].usage}\n`;
   const names=Object.keys(commands).sort();
-  return `usage: git [-C <path>] [-c <name>=<value>] <command> [<args>]\n\n`+
+  return `usage: git [--yes] [-C <path>] [-c <name>=<value>] <command> [<args>]\n\n`+
     `These are the Git commands this port understands, backed by isomorphic-git ${expected}:\n\n`+
     names.map((n)=>`   ${n.padEnd(13)}${commands[n].usage.replace(/^\S+\s*/,"")}`).join("\n")+
     `\n\nSee 'git <command> --help' for a command's options. alias git='bunx bunproot --git'\n`;
@@ -91,7 +97,7 @@ function help(commands,name) {
 export async function run(argv) {
   const global=parseGlobal([...argv]);
   if (global.command===undefined) throw new Error(help({}).split("\n")[0].replace(/^usage: /,"usage: ")+"\n"+`use 'bunproot --git --help' for the command list`);
-  install();
+  install(global.yes);
   const { commands,context,smudgeIndex }=await import("./commands.js");
   if (global.command==="help") { process.stdout.write(help(commands,global.argv[0])); return 0; }
   const command=commands[global.command];
