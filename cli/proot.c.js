@@ -136,6 +136,9 @@ These run without entering a rootfs, then exit:
   --download-alpine
       download and verify an Alpine minirootfs
 
+  --download-alpine-x64
+      download and verify an x86_64 Alpine minirootfs
+
   --git COMMAND [ARG ...]
       when --git is the very first argument, install the locked
       isomorphic-git 1.41.9 helper in place after confirmation, run the

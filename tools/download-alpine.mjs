@@ -5,7 +5,7 @@ import https from 'node:https';
 import { createInterface } from 'node:readline/promises';
 
 const ALPINE_VERSION = '3.24.1';
-const ARCH = 'aarch64';
+const ARCH = process.argv[2] === '--download-alpine-x64' ? 'x86_64' : 'aarch64';
 const MAIN_VERSION = ALPINE_VERSION.split('.').slice(0, 2).join('.');
 const FILE = `alpine-minirootfs-${ALPINE_VERSION}-${ARCH}.tar.gz`;
 const BASE_URL = 'https://dl-cdn.alpinelinux.org/alpine';

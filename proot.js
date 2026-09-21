@@ -19,7 +19,7 @@
 // and someone who reached bunproot through `bunx` has no checkout to run
 // tools/download-alpine.mjs from. It needs nothing the tracer sets up, so it
 // runs before the re-exec below and takes the process with it.
-if (process.argv[2] === "--download-alpine") {
+if (["--download-alpine", "--download-alpine-x64"].includes(process.argv[2])) {
   await import("./tools/download-alpine.mjs");
   process.exit(0);
 }
