@@ -133,6 +133,9 @@ run:
 
 These run without entering a rootfs, then exit:
 
+  --setup.pulse
+      print the setup PulseAudio recipe, then exit
+
   --download-alpine
       download and verify an Alpine minirootfs
 

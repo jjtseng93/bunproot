@@ -336,6 +336,7 @@ is an argument to the guest program instead.
 | `--l2s-unpin ROOTFS` | Rewrite it back, so the guest can follow them again and the rootfs can move |
 | `--l2s-docs` | Render [link2symlink.md](./link2symlink.md), the on-disk format, in the terminal |
 | `--l2s-ignore-pin` | Enter a rootfs whose link store is pinned, which is otherwise refused. Its emulated hard links do not work while it is pinned |
+| `--setup.pulse` | Print the setup PulseAudio recipe from `tools/setup.pulse.sh`, then exit |
 | `--download-alpine` | Fetch and checksum an Alpine minirootfs, then exit. It must be the first argument, and takes no others |
 | `--download-alpine-x64` | The same download flow, but fetch an x86_64 Alpine minirootfs |
 | `--git [--yes] COMMAND [ARG ...]` | Only as the first argument, ask before installing the separately locked isomorphic-git dependencies in place with scripts disabled, run the Git command with Git's own arguments and output, then exit. Add `--yes` immediately after `--git` to install without asking. `--git --help` lists the commands, `--git --readme` renders the guide |
