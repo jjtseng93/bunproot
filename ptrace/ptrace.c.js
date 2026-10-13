@@ -1,14 +1,14 @@
-import { FFIType, ptr } from "bun:ffi";
+import { FFIType, ptr, read } from "bun:ffi";
 import { accessSync, chmodSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { posix } from "node:path";
-import { networkInterfaces, tmpdir } from "node:os";
+import { constants as osConstants, networkInterfaces, tmpdir } from "node:os";
 import { lazySymbols } from "../ffi.js";
 import { shmGet, shmSegment, shmAttached, shmDetached, shmStat, shmRemove, shmCleanup }
   from "../extension/sysvipc/sysvipc_shm.c.js";
 import { getPc, getSp, getSyscallNumber, getX, makeIovec, makeRegisterSet, NT_PRSTATUS, setPc, setX } from "../tracee/reg.c.js";
 import { readCString, writeBytes, writeCString } from "../tracee/mem.c.js";
 import { readElfLoadInfo, relocateElf } from "../execve/elf.c.js";
-import { expandShebang, makeGuestPaths } from "../execve/shebang.c.js";
+import { expandShebangChain, makeGuestPaths } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
 import { guestEnvironment, noSeccomp, strace, straceColor, verbose } from "../env.js";
 import { formatCall, formatResult } from "../syscall/strace.c.js";
@@ -20,13 +20,29 @@ import { ipBytes as endpointIpBytes, mappedEndpoint } from "../extension/port_sw
 const PTRACE_PEEKTEXT=1, PTRACE_PEEKDATA=2, PTRACE_POKETEXT=4, PTRACE_POKEDATA=5;
 const PTRACE_CONT=7, PTRACE_ATTACH=16, PTRACE_SYSCALL=24;
 const PTRACE_GETREGSET=0x4204, PTRACE_SETREGSET=0x4205, PTRACE_SETOPTIONS=0x4200;
-const PTRACE_GET_SYSCALL_INFO=0x420e, PTRACE_GETSIGINFO=0x4202;
+const PTRACE_GET_SYSCALL_INFO=0x420e, PTRACE_GETSIGINFO=0x4202, PTRACE_SETSIGINFO=0x4203;
 const native = lazySymbols("libc", {
+  __errno: { args: [], returns: FFIType.ptr },
   ptrace: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.u64], returns: FFIType.i64 },
   waitpid: { args: [FFIType.i32, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
   process_vm_readv: { args: [FFIType.i32,FFIType.ptr,FFIType.u64,FFIType.ptr,FFIType.u64,FFIType.u64], returns:FFIType.i64 },
 });
-const call = (request, pid, address=0n, data=0n) => native.ptrace(request, pid, address, data);
+class TraceeGoneError extends Error {
+  constructor(request,pid) {
+    super(`ptrace request ${request} lost tracee ${pid}: ESRCH`);
+    this.pid=pid;
+  }
+}
+// SIGKILL/exit_group can win after waitpid reports a ptrace stop. Keep
+// ESRCH distinct from real tracer errors, including writes and restarts.
+const call = (request, pid, address=0n, data=0n) => {
+  const result=native.ptrace(request, pid, address, data);
+  if (result===-1n && request!==PTRACE_PEEKTEXT && request!==PTRACE_PEEKDATA) {
+    const errno=read.i32(native.__errno());
+    if (errno===3) throw new TraceeGoneError(request,pid);
+  }
+  return result;
+};
 const memory = {
   peek: (pid, address) => call(PTRACE_PEEKDATA, pid, address),
   poke(pid, address, word) {
@@ -91,7 +107,10 @@ const syscallInfoResult=()=>BigInt.asIntN(64,SYSCALL_INFO_VIEW.getBigInt64(24,tr
 const exitResult=(phase,state)=>phase===2?syscallInfoResult():BigInt.asIntN(64,getX(state.regs,0));
 function getRegisters(pid) {
   const regs = makeRegisterSet(), iovec = makeIovec(regs);
-  if (call(PTRACE_GETREGSET, pid, BigInt(NT_PRSTATUS), BigInt(iovec.pointer)) < 0n) throw new Error("PTRACE_GETREGSET failed");
+  if (call(PTRACE_GETREGSET, pid, BigInt(NT_PRSTATUS), BigInt(iovec.pointer)) < 0n) {
+    const errno=read.i32(native.__errno());
+    throw Object.assign(new Error(`PTRACE_GETREGSET failed: pid=${pid} errno=${errno}`), { errno, pid });
+  }
   return { regs, iovec };
 }
 function putRegisters(pid, state) {
@@ -139,6 +158,10 @@ function stoppedSignal(status) {
   return (status & 0xff) === 0x7f ? (status >> 8) & 0xff : null;
 }
 
+// Like upstream chain.suppressed_signal, defer delivery until injected work
+// has restored guest registers. Preserve siginfo as well as the signal number.
+const remoteSignals=new Map();
+
 function remoteSyscallAt(pid, address, syscall, args = []) {
   const state = getRegisters(pid);
   const savedRegisters = state.regs.bytes.slice();
@@ -156,7 +179,18 @@ function remoteSyscallAt(pid, address, syscall, args = []) {
     // once the filter is installed the tracer's own remote munmap/chdir/close
     // trip it: those are already host paths, so let them through untranslated
     // and keep waiting for the trampoline's brk.
-    while (stoppedSignal(status) === 19 || (status >>> 16) === PTRACE_EVENT_SECCOMP) {
+    while (stoppedSignal(status)!==null &&
+        (stoppedSignal(status)!==5 || (status >>> 16)===PTRACE_EVENT_SECCOMP)) {
+      const signal=stoppedSignal(status);
+      if (signal!==19 && (status >>> 16)!==PTRACE_EVENT_SECCOMP) {
+        const info=new Uint8Array(128);
+        if (call(PTRACE_GETSIGINFO,pid,0n,BigInt(ptr(info)))<0n)
+          throw new Error("unable to save signal during remote syscall");
+        // Do not turn a genuine trampoline fault into an endless retry.
+        if ([4,7,8,11,31].includes(signal) && new DataView(info.buffer).getInt32(8,true)>0)
+          throw new Error(`remote syscall fault signal ${signal}`);
+        remoteSignals.set(pid,{signal:BigInt(signal),info});
+      }
       if (call(PTRACE_CONT, pid) < 0n) throw new Error("failed to drain remote-syscall stop");
       status = wait(pid);
     }
@@ -402,7 +436,8 @@ function readPointerArray(pid,address,limit=4096) {
   for (let index=0; index<limit; index++) {
     const pointer=BigInt.asUintN(64,memory.peek(pid,address+BigInt(index*8)));
     if (pointer===0n) return values;
-    values.push(readCString(memory,pid,pointer));
+    // argv/envp strings are not pathnames (upstream execve/aoxp.c uses ARG_MAX).
+    values.push(readCString(memory,pid,pointer,131072));
   }
   throw new Error("unterminated tracee pointer array");
 }
@@ -411,7 +446,7 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
   const pathname=readCString(memory,pid,getX(state.regs,0));
   let argv=readPointerArray(pid,getX(state.regs,1));
   const env=readPointerArray(pid,getX(state.regs,2));
-  const input=pathname.startsWith("/")?posix.normalize(pathname):posix.resolve(task.cwd,pathname);
+  const input=pathname.startsWith("/")?posix.normalize(pathname):posix.resolve(task.fs.cwd,pathname);
   const name=posix.basename(input);
   // Two names for one file: the guest-visible pathname, which goes into argv
   // and /proc/<PID>/exe, and the host pathname the loader actually reads.  They
@@ -468,7 +503,7 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
   // argv, including its final symlink spelling.  Programs such as Debian's
   // adduser/addgroup intentionally dispatch on that spelling, so the loader's
   // canonical path must not leak into the script argument.
-  const script=expandShebang(executable,invokedPath,argv,makeGuestPaths(mounts,searchPath,task.cwd));
+  const script=expandShebangChain(executable,invokedPath,argv,makeGuestPaths(mounts,searchPath,task.fs.cwd));
   if (script!==null) {
     guestPath=canonicalizeGuestPath(mounts,script.guestPath,{preserveInternalFinal:true});
     executable=mounts.toHost(canonicalizeGuestPath(mounts,guestPath));
@@ -481,14 +516,21 @@ function prepareExecGuest(pid,mounts,task,state,tasks) {
   // up in the empty tmpfs placeholder rather than the /usr runtime binding.
   const loader=interpreter===null?null:
     mounts.toHost(canonicalizeGuestPath(mounts,interpreter));
-  // Refuse the exec here, while the caller can still let the real execve run
-  // and report the error itself.  Once the commit stage has torn down the
+  // Refuse the exec here, while the caller can still return the guest errno
+  // without replacing its address space.  Once the commit stage has torn down the
   // address space there is nothing left to return an errno to -- and a guest
   // that probes binaries it cannot run is ordinary: npm installs both the
   // glibc and the musl build of a package and tries one of them.
   if (loader!==null && !existsSync(loader))
     throw Object.assign(new Error(`ELF interpreter not found: ${interpreter}`),{code:"ENOENT"});
-  return { executable, guestPath, name, interpreter, loader, argv:argv.length?argv:[pathname], env };
+  const guest={ executable, guestPath, name, interpreter, loader, argv:argv.length?argv:[pathname], env };
+  const stack=findGuestStack(pid,getSp(state.regs));
+  const capacity=guestStackCapacity(guest,readAuxv(pid).length);
+  // Reject before closing descriptors/unmapping the caller. Oversized argv or
+  // env must return an exec error, never crash the tracer after commit.
+  if (stack===null || BigInt(capacity)>stack.remoteTop-stack.stackBase)
+    throw Object.assign(new Error("argument/environment payload exceeds mapped guest stack"),{code:"E2BIG"});
+  return guest;
 }
 
 // The stack the next image runs on.  Prefer the kernel's own [stack] VMA -- the
@@ -524,6 +566,16 @@ function findGuestStack(pid,stackPointer) {
     }));
 }
 
+// Account for UTF-8 strings, pointers, auxv additions and both alignments.
+// A fixed 64 KiB scratch overflows on ordinary large exec environments.
+function guestStackCapacity(guest,auxCount) {
+  const env=guest.env??guestEnvironment();
+  const strings=[...guest.argv,...env,guest.argv[0],"aarch64"];
+  const stringBytes=strings.reduce((size,value)=>size+Buffer.byteLength(value)+1,16);
+  const words=guest.argv.length+env.length+3+2*(auxCount+9+1);
+  return Math.max(65536,Math.ceil((stringBytes+words*8+32)/4096)*4096);
+}
+
 function buildGuestStack(pid, images, guest) {
   const stackPointer=getSp(getRegisters(pid).regs);
   const stack=findGuestStack(pid,stackPointer);
@@ -532,7 +584,8 @@ function buildGuestStack(pid, images, guest) {
   // The payload is written flush against remoteTop with a remote write, and a
   // remote write below the VMA base does not expand a MAP_GROWSDOWN stack the
   // way a fault from the tracee would, so the scratch must fit as mapped.
-  const capacity=65536, local=new Uint8Array(capacity), view=new DataView(local.buffer);
+  const originalAux=readAuxv(pid);
+  const capacity=guestStackCapacity(guest,originalAux.length), local=new Uint8Array(capacity), view=new DataView(local.buffer);
   if (remoteTop-stackBase<BigInt(capacity)) throw new Error("guest stack mapping is too small");
   let cursor=capacity;
   const putString=(value)=>{
@@ -572,7 +625,7 @@ function buildGuestStack(pid, images, guest) {
   const replacements=new Map([[3n,images.main.phoff+images.main.mappings[0].address],[4n,BigInt(images.main.phentsize)],
     [5n,BigInt(images.main.phnum)],[7n,images.interpreter?.mappings[0].address??0n],[9n,images.main.entry],
     [15n,platform],[24n,platform],[25n,random],[31n,execfn]]);
-  const aux=readAuxv(pid).map(([type,value])=>[type,replacements.get(type)??value]);
+  const aux=originalAux.map(([type,value])=>[type,replacements.get(type)??value]);
   for (const [type,value] of replacements) if (!aux.some(([current])=>current===type)) aux.push([type,value]);
   const words=[BigInt(argvPointers.length),...argvPointers,0n,...envPointers,0n,...aux.flat(),0n,0n];
   cursor-=words.length*8; cursor&=~15;
@@ -886,7 +939,7 @@ function installSyscallFilter(pid,trampoline) {
 }
 
 function fdGuestBase(pid,mounts,task,fd) {
-  if (fd===-100) return task.cwd;
+  if (fd===-100) return task.fs.cwd;
   const host=readlinkSync(`/proc/${pid}/fd/${fd}`);
   const guest=mounts.toGuest(host);
   // Descriptors for the pass-through kernel trees deliberately point outside
@@ -899,7 +952,7 @@ function fdGuestBase(pid,mounts,task,fd) {
 
 function resolveGuestInput(pid,mounts,task,state,path,spec) {
   return path.startsWith("/")?posix.normalize(path):posix.resolve(
-    spec.dirfd===undefined?task.cwd:fdGuestBase(pid,mounts,task,
+    spec.dirfd===undefined?task.fs.cwd:fdGuestBase(pid,mounts,task,
       Number(BigInt.asIntN(32,getX(state.regs,spec.dirfd)))),path);
 }
 function resolveGuestPath(pid,mounts,task,state,path,spec) {
@@ -1011,7 +1064,7 @@ function emulateNamespaceFilesystem(pid,mounts,task,state,syscall) {
         ?oldAbsolute.slice(newRoot.length):oldAbsolute);
     mounts.pivot(newRoot,putOld);
     task.pivoted=true;
-    task.cwd=task.cwd===newRoot?"/":task.cwd.startsWith(`${newRoot}/`)?task.cwd.slice(newRoot.length):task.cwd;
+    task.fs.cwd=task.fs.cwd===newRoot?"/":task.fs.cwd.startsWith(`${newRoot}/`)?task.fs.cwd.slice(newRoot.length):task.fs.cwd;
     if (verbose) console.error(`[ptrace] pid=${pid} emulated pivot_root ${newRoot} -> /`);
     return;
   }
@@ -1209,7 +1262,7 @@ function resolveProcLink(taskPid,tasks,guestPath) {
   const known=tasks.get(owner);
   if (known===undefined) return null;
   if (match[2]==="root") return "/";
-  if (match[2]==="cwd") return known.cwd;
+  if (match[2]==="cwd") return known.fs.cwd;
   return known.exe??null;
 }
 
@@ -1249,7 +1302,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
   let nextScratchSlot=1n;
   const freeScratchSlots=[];
   const tasks=new Map([[pid,{ entering:true, pendingSignal:0n, pendingExec:null,
-    pendingCwd:null, pendingGetcwd:null, cwd, configured:true, seenStop:true,
+    pendingCwd:null, pendingGetcwd:null, fs:{cwd}, configured:true, seenStop:true,
     openedHostFds:new Map(), openedGuestFds:new Map(), mounts,
     fakeNetlink:new Map(),
     socketProtocols:new Map(),
@@ -1258,6 +1311,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
   tasks.get(pid).trampoline=trampoline;
   tasks.get(pid).borrowPc=images.interpreter?.entry??images.main.entry;
   const deleteTask=(taskPid)=>{
+    remoteSignals.delete(taskPid);
     const removed=tasks.get(taskPid);
     if (removed?.scratchSlot!==undefined) freeScratchSlots.push(removed.scratchSlot);
     if (removed?.shmAttachments!==undefined)
@@ -1271,6 +1325,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
   };
   let rootExit=1;
   traceLoop: while (tasks.size>0) {
+    try {
     for (const [taskPid,task] of tasks) {
       // A new tracee is restartable only once both halves have arrived: the
       // parent's fork event, which carries the cwd and scratch page it
@@ -1280,6 +1335,13 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
       // pipeline hung about one run in ten.
       if (!task.configured || !task.seenStop) continue;
       if (!task.running) {
+        const deferred=remoteSignals.get(taskPid);
+        if (deferred) {
+          if (call(PTRACE_SETSIGINFO,taskPid,0n,BigInt(ptr(deferred.info)))<0n)
+            throw new Error("unable to restore deferred remote-syscall signal");
+          task.pendingSignal=deferred.signal;
+          remoteSignals.delete(taskPid);
+        }
         if (call(task.restart??restartRequest,taskPid,0n,task.pendingSignal)<0n) {
           // Match upstream restart_tracee(): a task can die after its last
           // wait status but before the tracer restarts it. This is a normal
@@ -1303,7 +1365,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
       // the tracee on first sight instead (get_tracee(NULL, pid, true),
       // src/tracee/event.c:417); the parent's event fills in the rest.
       task={ entering:true, pendingSignal:0n, pendingExec:null, pendingCwd:null,
-        pendingGetcwd:null, cwd:"/", exe:null, running:false, configured:false, seenStop:false,
+        pendingGetcwd:null, fs:{cwd:"/"}, exe:null, running:false, configured:false, seenStop:false,
         ids:rootCredentials() };
       tasks.set(taskPid,task);
       if (verbose) console.error(`[ptrace] tracee ${taskPid} stopped before its parent's fork event`);
@@ -1348,7 +1410,9 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
         const scratchSlot=freeScratchSlots.pop()??++nextScratchSlot;
         if (scratchSlot*4096n>=TRAMPOLINE_REGION_SIZE) throw new Error("tracee scratch space exhausted");
         const inherited={ pendingExec:null, pendingCwd:null, pendingGetcwd:null,
-          cwd:task.cwd, exe:task.exe, trampoline:task.trampoline, borrowPc:task.borrowPc,
+          // Match upstream inherit_config: CLONE_FS shares cwd across threads;
+          // ordinary fork takes a copy, so child chdir cannot move its parent.
+          fs:task.cloneSharesFs?task.fs:{...task.fs}, exe:task.exe, trampoline:task.trampoline, borrowPc:task.borrowPc,
           scratch:task.trampoline+scratchSlot*4096n+512n, scratchSlot, configured:true,
           namespaceEmulated:task.namespaceEmulated, pivoted:task.pivoted };
         inherited.ids={ ...task.ids??rootCredentials() };
@@ -1377,13 +1441,7 @@ export function traceProcess(pid, mounts, guest = null, { killOnExit = false, po
       // crash handler re-raises, and the process is gone by the time the
       // signal is inspected. Upstream treats that as an ordinary lifecycle
       // race in restart_tracee(); here it must not take the tracer with it.
-      let stopped;
-      try { stopped=getRegisters(taskPid); }
-      catch {
-        deleteTask(taskPid);
-        if (verbose) console.error(`[ptrace] tracee ${taskPid} died before its signal could be read`);
-        continue;
-      }
+      const stopped=getRegisters(taskPid);
       if (verbose)
         console.error(`[ptrace] pid=${taskPid} signal=${signal} pc=0x${getPc(stopped.regs).toString(16)} syscall=${getSyscallNumber(stopped.regs)}${describeFault(taskPid,signal,getPc(stopped.regs),getX(stopped.regs,30))}`);
       if (signal===31 && [39,40,41,97,268].includes(getSyscallNumber(stopped.regs))) {
@@ -1838,7 +1896,7 @@ const exited=registers(), result=exitResult(phase,exited);
       if (task.pendingCwd!==null || task.pendingGetcwd!==null) {
 const exited=registers(), result=exitResult(phase,exited);
         if (task.pendingCwd!==null) {
-          if (result===0n) task.cwd=task.pendingCwd;
+          if (result===0n) task.fs.cwd=task.pendingCwd;
           task.pendingCwd=null;
         }
         if (task.pendingGetcwd!==null) {
@@ -1856,6 +1914,7 @@ const exited=registers(), result=exitResult(phase,exited);
       }
       if (task.pendingExec!==null) {
         const next=task.pendingExec; task.pendingExec=null;
+        task.fs={...task.fs}; // exec unshares the caller's filesystem context
         if (verbose) console.error(`[ptrace] pid=${taskPid} emulating execve ${next.argv.join(" ")}`);
         if (!isMapped(taskPid,task.trampoline)) {
           task.trampoline=allocateRemoteSyscalls(taskPid,task.borrowPc);
@@ -1924,6 +1983,7 @@ const exited=registers(), result=exitResult(phase,exited);
         task.forcedResult=BigInt.asUintN(64,-1n);
         continue;
       }
+      if (syscall===97 && (getX(state.regs,0)&0x200n)!==0n) task.fs={...task.fs};
       if (syscall===97 && (getX(state.regs,0)&0x20000n)!==0n) {
         task.mounts=task.mounts.clone();
         mounts=task.mounts;
@@ -2079,7 +2139,7 @@ const exited=registers(), result=exitResult(phase,exited);
           let end=2;
           while (end<bytes.length && bytes[end]!==0) end++;
           const pathname=new TextDecoder().decode(bytes.subarray(2,end));
-          const guestPath=pathname.startsWith("/")?posix.normalize(pathname):posix.resolve(task.cwd,pathname);
+          const guestPath=pathname.startsWith("/")?posix.normalize(pathname):posix.resolve(task.fs.cwd,pathname);
           const host=mounts.toHost(guestPath);
           const encoded=new TextEncoder().encode(host);
           if (encoded.length>107) {
@@ -2156,7 +2216,16 @@ const exited=registers(), result=exitResult(phase,exited);
         console.error(`[ptrace] pid=${taskPid} execve path=0x${getX(state.regs,0).toString(16)} argv=0x${getX(state.regs,1).toString(16)}`);
       try { task.pendingExec=prepareExecGuest(taskPid,mounts,task,state,tasks); }
       catch (error) {
+        if (error instanceof TraceeGoneError) throw error;
         if (verbose) console.error(`[ptrace] pid=${taskPid} exec capture failed phase=${phase}: ${error.message}`);
+        // A failed guest lookup must never execute the untranslated pathname
+        // in the host namespace. Return the loader's errno to execvp/spawn so
+        // PATH search and ENOEXEC shell fallback remain ordinary guest work.
+        const errno=error.code==="EISDIR" ? 13 :
+          Math.abs(error.errno ?? osConstants.errno[error.code] ?? 8);
+        task.pendingExec=null;
+        setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+        task.forcedResult=BigInt.asUintN(64,-BigInt(errno));
         continue;
       }
       // Substitute a harmless, universally available syscall. Using -1 as a
@@ -2166,6 +2235,7 @@ const exited=registers(), result=exitResult(phase,exited);
     }
     if (syscall===220) {
       const flags=getX(state.regs,0), unsafe=0x4100n; // CLONE_VM | CLONE_VFORK
+      task.cloneSharesFs=(flags&0x200n)!==0n; // CLONE_FS
       if ((flags&0x20000n)!==0n) task.pendingChildMountNamespace=true;
       let translated=flags&~CLONE_NS_MASK;
       if ((flags&0x4000n)!==0n) { // only vfork; CLONE_VM alone is a real thread
@@ -2184,6 +2254,7 @@ const exited=registers(), result=exitResult(phase,exited);
       const args=getX(state.regs,0);
       if (args!==0n) {
         const flags=BigInt.asUintN(64,memory.peek(taskPid,args));
+        task.cloneSharesFs=(flags&0x200n)!==0n;
         let translated=flags&~CLONE_NS_MASK;
         if ((flags&0x4000n)!==0n) translated&=~0x4100n; // VFORK -> private fork
         if (translated!==flags) {
@@ -2350,7 +2421,7 @@ const exited=registers(), result=exitResult(phase,exited);
         }
       }
     }
-    let scratch=task.scratch, changed=false, hostPaths=[], guestPaths=[];
+    let scratch=task.scratch, changed=false, hostPaths=[], guestPaths=[], pathErrno=null;
     for (const spec of arguments_) {
       const address=getX(state.regs,spec.path);
       if (syscall===37 && spec.path===1 && (getX(state.regs,4)&0x1000n)!==0n) {
@@ -2429,7 +2500,18 @@ const exited=registers(), result=exitResult(phase,exited);
         inputGuest=timed("canon",()=>resolveGuestInput(taskPid,mounts,task,state,guestPath,spec));
         absoluteGuest=timed("canon",()=>resolveGuestPath(taskPid,mounts,task,state,guestPath,spec));
       }
-      catch (error) { throw new Error(`pid ${taskPid} syscall ${syscall}: ${error.message}`); }
+      catch (error) {
+        if (error instanceof TraceeGoneError) throw error;
+        const errno=osConstants.errno[error.code];
+        if (!Number.isInteger(errno) || errno<=0)
+          throw new Error(`pid ${taskPid} syscall ${syscall}: ${error.message}`,{cause:error});
+        // Canonicalization errors belong to this guest syscall, as in
+        // upstream translate_path's negative errno. Never run a partially
+        // translated multi-path call or terminate the whole trace on ELOOP.
+        pathErrno=errno;
+        guestPaths.push(guestPath);
+        break;
+      }
       if (/^\/proc\/(?:self|thread-self|\d+)\/mountinfo$/.test(absoluteGuest)) {
         const escape=(value)=>value.replace(/\\/g,"\\134").replace(/ /g,"\\040")
           .replace(/\t/g,"\\011").replace(/\n/g,"\\012");
@@ -2491,6 +2573,11 @@ const exited=registers(), result=exitResult(phase,exited);
     task.pendingPaths=guestPaths;
     task.pendingHostPaths=hostPaths;
     task.pendingGuestPaths=guestPaths;
+    if (pathErrno!==null) {
+      setKernelSyscallNumber(taskPid,state,SYS_GETPID);
+      task.forcedResult=BigInt.asUintN(64,-BigInt(pathErrno));
+      continue;
+    }
     if (syscall===SYS_FACCESSAT) task.pendingAccessMode=Number(getX(state.regs,2));
     if (syscall===SYS_FACCESSAT2 && hostPaths.length===1) {
       const flags=getX(state.regs,3);
@@ -2525,6 +2612,16 @@ const exited=registers(), result=exitResult(phase,exited);
       }
     }
     if (changed) putRegisters(taskPid,state);
+    } catch (error) {
+      if (!(error instanceof TraceeGoneError) || !tasks.has(error.pid)) throw error;
+      // Do not delete the task: its terminal wait status still determines
+      // rootExit and releases bookkeeping. Never restart it without a new stop.
+      const dying=tasks.get(error.pid);
+      dying.running=true;
+      dying.pendingSignal=0n;
+      dying.restart=undefined;
+      if (verbose) console.error(`[ptrace] tracee ${error.pid} disappeared during stop handling; awaiting exit`);
+    }
   }
   report(performance.now()-started);
   for (const mountinfoPath of mountinfoPaths) try { unlinkSync(mountinfoPath); } catch {}

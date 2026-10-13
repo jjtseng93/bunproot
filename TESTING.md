@@ -445,3 +445,45 @@ anything but empty boxes.
   inside double quotes into `event not found` and aborts the whole compound
   command, so earlier checks in the same line silently do not run. Write the
   script to a file first.
+
+### Tracee exit races and failed exec isolation
+
+With a guest `/bin/bun`, bind this repository to `/audit-bunproot` and run:
+
+```sh
+bun proot.js -koe -r ROOTFS -b .:/audit-bunproot /bin/bun /audit-bunproot/test/tracee-lifecycle.js
+PROOT_NO_SECCOMP=1 bun proot.js -koe -r ROOTFS -b .:/audit-bunproot /bin/bun /audit-bunproot/test/tracee-lifecycle.js
+```
+
+Each run must reap 100 normally exiting and 240 SIGKILL-terminated Bun children.
+The tracer must survive races between a reported stop and register access or
+syscall cancellation, without discarding the terminal exit status.
+
+Compile `test/exec-errors.c` with the guest compiler. Pass a pathname that exists
+only on Android (for example `/system/bin/true` in an isolated Linux rootfs).
+It must print `execve errno=2` and exit zero, never execute the host binary or
+die with SIGTRAP. An optional second argument supplies another expected errno:
+use 8 for invalid executable text and 13 for a directory. A shebang referencing
+a missing guest interpreter must return 2. All compilation stays in the guest.
+
+`test/exec-long-args.js` is another guest-Bun probe: it execs Bun with a 16 KiB
+argument and environment value and checks both in the child. Run it inside the
+same isolated rootfs, binding the repository at `/audit-bunproot`, with
+`/bin/bun /audit-bunproot/test/exec-long-args.js`. It catches accidental use of
+PATH_MAX for argv/envp strings; bootstrap Makefile recipes exceed that limit.
+The long-args probe also checks five 16 KiB environment entries plus the
+16 KiB argument (over the old 64 KiB stack scratch). Compile
+`test/exec-stack-overflow.c` with the guest compiler and run it inside bunproot
+to check that an oversized payload returns E2BIG and its caller survives.
+
+Compile `test/path-errors.c` with the guest compiler and run the result under
+both normal seccomp mode and `PROOT_NO_SECCOMP=1`. It expects ELOOP from access,
+stat, open, chdir, rename and link through a cyclic symlink; lstat/readlink still
+work without dereferencing the final link. A failed destination lookup must
+leave the rename/link source intact and must not terminate the tracer.
+
+Run `test/shared-cwd.js` with guest Bun in both seccomp modes. Warm async file
+workers must observe subsequent main-thread chdir calls, while a forked child
+must keep an independent cwd. `test/tracee-signals.js` kills 160 starting Bun
+children with SIGTERM; every exit must remain 143 without aborting the tracer
+when delivery overlaps injected syscalls. Both probes passed in both modes.

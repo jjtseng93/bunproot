@@ -484,3 +484,63 @@ exists:
   inspecting `/proc/PID/fdinfo` and closing those descriptors before loading
   the next guest image. This prevents Git helpers from retaining pipe ends and
   deadlocking.
+
+### Tracee death and rejected execs
+
+A tracee can disappear after waitpid reports its stop but before the tracer
+reads or writes registers. Ptrace ESRCH is now handled across stop processing,
+including syscall cancellation and restart; other errors still propagate. The
+task remains tracked until its terminal wait status arrives, preserving root
+exit status and resource cleanup. Both seccomp modes pass the guest lifecycle
+probe (100 normal exits and 240 SIGKILL exits).
+
+Failed exec preparation now cancels the kernel exec and returns the guest errno.
+Previously an untranslated pathname could reach the host kernel after a guest
+lookup failed. Missing binaries/interpreters return ENOENT; invalid executable
+formats return ENOEXEC and directory targets return EACCES. Guest PATH search
+and shell fallback receive those errors without executing a host namesake.
+
+These fixes also allow the unmodified GNU make 4.4.1 configure script and its
+config.status to finish in a musl Bun/TCC rootfs with bunmsh and its JavaScript
+awk/sed/grep. The resulting files were checked for unresolved substitutions;
+The completed bootstrap subsequently built GNU make, binutils, GMP/MPFR/MPC,
+m4, flex and GCC 4.7.4. The new GCC passed O0/O2 C execution checks with the
+musl loader and 128-bit libgcc arithmetic.
+
+Script interpreters may themselves be scripts. Both the initial command and
+nested execve now expand the whole shebang chain, preserve argument order and
+script spelling, and reject cycles/overlong chains with ELOOP. This supports
+config.status -> /bin/sh -> Bun when the shell is a JavaScript launcher.
+
+The bootstrap's binutils Makefile passes shell recipes longer than PATH_MAX.
+Exec argv/envp capture now reads each string up to 128 KiB, following the
+ARG_MAX buffer in upstream `execve/aoxp.c`, while pathname reads retain 4096.
+Previously these recipes incorrectly failed with ENOEXEC before reaching Bun.
+`test/exec-long-args.js` exercises a 16 KiB argument and environment value.
+
+Initial exec stack staging is now sized from UTF-8 argument/environment bytes,
+pointer vectors, auxiliary-vector entries and alignment, rather than a fixed
+64 KiB. A 96 KiB combined argv/env payload previously overflowed local.set
+while starting a configure background child; it now works. Payloads larger
+than the currently mapped main stack return E2BIG during exec preparation,
+before descriptors close or the caller's address space is replaced. Expanding
+that stack mapping to the full kernel ARG_MAX is not implemented here.
+Shebang probing now uses a bounded 4096-byte read, rather than reading an entire
+executable and then slicing its header. This preserves the parsing limit while
+avoiding a full Bun-binary allocation for each interpreter/ELF exec probe.
+
+Filesystem errno failures during ordinary path canonicalization now cancel the
+guest syscall and return its negative errno, matching upstream translate_path.
+A symlink loop in access/stat must report ELOOP rather than terminate tracing.
+For calls with multiple paths, no partially translated operation reaches the
+kernel. Unexpected exceptions still propagate, and tracee disappearance keeps
+its existing typed lifecycle handling.
+
+Clone/clone3 now share the emulated cwd object for CLONE_FS, as upstream
+inherit_config does, and copy it for ordinary fork, exec and unshare(CLONE_FS).
+This fixes async Bun file workers using a stale cwd after process.chdir().
+Signals arriving during a remote syscall are deferred until guest registers
+are restored, following upstream chain.suppressed_signal; the original siginfo
+is saved and restored for delivery. Asynchronous SIGTERM no longer aborts the
+tracer. Synchronous trampoline faults still report errors instead of retrying
+the fault forever. This does not alter guest-shell background registries.

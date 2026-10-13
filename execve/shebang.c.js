@@ -1,9 +1,16 @@
-import { readFileSync, statSync } from "node:fs";
+import { openSync, readSync, closeSync, statSync } from "node:fs";
 import { posix } from "node:path";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
 
 export function readShebang(filename) {
-  const bytes=readFileSync(filename).subarray(0,4096);
+  // Executables such as Bun are large; inspect only the bounded header instead
+  // of loading the whole binary for every exec (including nested interpreters).
+  const fd=openSync(filename,"r");
+  const header=new Uint8Array(4096);
+  let length;
+  try { length=readSync(fd,header,0,header.length,0); }
+  finally { closeSync(fd); }
+  const bytes=header.subarray(0,length);
   if (bytes[0]!==0x23||bytes[1]!==0x21) return null;
   const line=new TextDecoder().decode(bytes).split(/\r?\n/,1)[0].slice(2).trim();
   if (!line) throw Object.assign(new Error(`${filename}: empty shebang`),{code:"ENOEXEC"});
@@ -20,6 +27,7 @@ export function readShebang(filename) {
 export function makeGuestPaths(mounts,searchPath,cwd="/") {
   const host=(guestPath)=>mounts.toHost(canonicalizeGuestPath(mounts,guestPath));
   return {
+    hostPath: host,
     exists(guestPath) {
       try { statSync(host(guestPath)); return true; } catch { return false; }
     },
@@ -71,4 +79,21 @@ export function expandShebang(hostPath,guestPath,argv,guest=null) {
     guestPath:shebang.interpreter,
     argv:[shebang.interpreter,...(shebang.argument?[shebang.argument]:[]),guestPath,...argv.slice(1)],
   };
+}
+
+// Like upstream execve/shebang.c, keep expanding script interpreters until an
+// ELF is reached. A shell implemented as a Bun script is itself an interpreter.
+export function expandShebangChain(hostPath,guestPath,argv,guest) {
+  let expanded=null;
+  const seen=new Set();
+  for (let depth=0;depth<40;depth++) {
+    if (seen.has(hostPath)) throw Object.assign(new Error("recursive shebang interpreter"),{code:"ELOOP"});
+    seen.add(hostPath);
+    const next=expandShebang(hostPath,guestPath,argv,guest);
+    if (next===null) return expanded;
+    expanded=next;
+    guestPath=next.guestPath; argv=next.argv;
+    hostPath=guest.hostPath(guestPath);
+  }
+  throw Object.assign(new Error("too many shebang interpreters"),{code:"ELOOP"});
 }

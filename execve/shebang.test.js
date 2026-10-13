@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createBindings } from "../path/binding.c.js";
-import { expandShebang, makeGuestPaths, readShebang } from "./shebang.c.js";
+import { expandShebangChain, expandShebang, makeGuestPaths, readShebang } from "./shebang.c.js";
 
 function rootfs(files) {
   const root = mkdtempSync(join(tmpdir(), "prbun-shebang-"));
@@ -101,4 +101,19 @@ test("the search follows bindings, not the tracer's own filesystem", () => {
   expect(script.guestPath).toBe("/opt/tools/node");
   rmSync(root, { recursive: true, force: true });
   rmSync(elsewhere, { recursive: true, force: true });
+});
+
+test("nested script interpreters retain argument order and detect cycles", () => {
+  const root=rootfs({
+    "script":{content:"#!/bin/sh -e\n"},
+    "bin/sh":{content:"#!/bin/bun\n"},
+    "bin/bun":{content:"\x7fELF",mode:0o755},
+    "cycle":{content:"#!/cycle\n"},
+  });
+  try {
+    const guest=makeGuestPaths(createBindings(root),"/bin");
+    const result=expandShebangChain(join(root,"script"),"/script",["custom-name","arg"],guest);
+    expect(result).toEqual({guestPath:"/bin/bun",argv:["/bin/bun","/bin/sh","-e","/script","arg"]});
+    expect(()=>expandShebangChain(join(root,"cycle"),"/cycle",["/cycle"],guest)).toThrow("recursive shebang");
+  } finally {rmSync(root,{recursive:true,force:true});}
 });

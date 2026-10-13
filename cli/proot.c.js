@@ -4,7 +4,7 @@ import { hostname, machine, release as hostRelease, tmpdir, type as hostType, ve
 import { FFIType, ptr } from "bun:ffi";
 import { cString, lazySymbols } from "../ffi.js";
 import { readElfInterpreter } from "../execve/elf.c.js";
-import { expandShebang, makeGuestPaths } from "../execve/shebang.c.js";
+import { expandShebangChain, makeGuestPaths } from "../execve/shebang.c.js";
 import { canonicalizeGuestPath } from "../path/canon.c.js";
 import { createBindings } from "../path/binding.c.js";
 import { storeIsPinned } from "../extension/link2symlink/link2symlink.c.js";
@@ -589,7 +589,7 @@ export function run(argv) {
   let guestArgv=command;
   const guestPaths=makeGuestPaths(mounts,
     environment.find((entry)=>entry.startsWith("PATH="))?.slice(5));
-  const script=expandShebang(executable,guestExecutable,guestArgv,guestPaths);
+  const script=expandShebangChain(executable,guestExecutable,guestArgv,guestPaths);
   if (script!==null) {
     guestExecutable=canonicalizeGuestPath(mounts,script.guestPath,{preserveInternalFinal:true});
     executable=mounts.toHost(canonicalizeGuestPath(mounts,guestExecutable));
