@@ -487,3 +487,11 @@ workers must observe subsequent main-thread chdir calls, while a forked child
 must keep an independent cwd. `test/tracee-signals.js` kills 160 starting Bun
 children with SIGTERM; every exit must remain 143 without aborting the tracer
 when delivery overlaps injected syscalls. Both probes passed in both modes.
+
+### Final dot path components
+
+`test/rmdir-dot.c` checks final-dot pathname preservation. Compile it with the
+guest compiler, then run it under both normal tracing and `PROOT_NO_SECCOMP=1`.
+It checks relative and dirfd paths, directory symlinks, missing/non-directory
+parents, and that rejected removals leave the directory intact. This covers
+the GNU m4 configure probe that exposed `rmdir("dir/./")` removing `dir`.

@@ -960,7 +960,7 @@ function resolveGuestPath(pid,mounts,task,state,path,spec) {
   const flagSaysNoFollow=spec.nofollow!==undefined &&
     (getX(state.regs,spec.nofollow.arg)&spec.nofollow.mask)!==0n;
   return canonicalizeGuestPath(mounts,absolute,
-    {derefFinal:spec.deref!==false&&!flagSaysNoFollow,preserveInternalFinal:spec.preserveL2s===true});
+    {derefFinal:/(?:^|\/)\.(?:\/)*$/.test(path)||spec.deref!==false&&!flagSaysNoFollow,preserveInternalFinal:spec.preserveL2s===true});
 }
 
 function emulateNamespaceFilesystem(pid,mounts,task,state,syscall) {
@@ -2539,7 +2539,10 @@ const exited=registers(), result=exitResult(phase,exited);
           (absoluteGuest.startsWith(L2S_OBJS) ||
            canonicalHost.startsWith(`${mounts.rootfs}${L2S_OBJS}`)))
         task.pendingOpenAlias=canonicalizeGuestPath(mounts,inputGuest,{preserveInternalFinal:true});
-      const host=canonicalHost;
+      // A final dot is a real pathname component. In particular, unlinkat
+      // with AT_REMOVEDIR must reject "dir/./" instead of removing "dir".
+      // Keep the component for the kernel after resolving its directory.
+      const host=/(?:^|\/)\.(?:\/)*$/.test(guestPath)?`${canonicalHost}/.`:canonicalHost;
       if (task.ids.euid===0 && host.startsWith(`${mounts.rootfs}/`)) {
         // The final component keeps its mode when the syscall never needs
         // DAC on it: the stat family (upstream leaves those alone too, so the

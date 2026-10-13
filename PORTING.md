@@ -544,3 +544,10 @@ are restored, following upstream chain.suppressed_signal; the original siginfo
 is saved and restored for delivery. Asynchronous SIGTERM no longer aborts the
 tracer. Synchronous trampoline faults still report errors instead of retrying
 the fault forever. This does not alter guest-shell background registries.
+
+### Final dot components
+
+Path translation preserves a terminal `/.` after canonicalizing its directory.
+The kernel must still see the dot: normalizing it away lets unlinkat with
+AT_REMOVEDIR remove a directory that Linux would reject with EINVAL. The
+`test/rmdir-dot.c` regression passes with seccomp and syscall tracing.
