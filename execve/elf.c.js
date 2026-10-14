@@ -73,10 +73,15 @@ export function readElfLoadInfo(filename) {
         const value = readAt(fd, Number(filesz), Number(offset));
         interpreter = new TextDecoder().decode(value.subarray(0, -1));
       } else if (kind === 1) {
+        if (memsz === 0n) continue;
         const start = alignDown(vaddr), fileEnd = alignUp(vaddr + filesz);
-        mappings.push({ anonymous:false, address:start, length:fileEnd-start,
+        // A page-aligned, pure-BSS segment has no file-backed pages.
+        // mmap(length=0) fails with EINVAL; map its anonymous pages below.
+        // Retain the partial file page for an unaligned segment, as in
+        // upstream src/execve/enter.c:add_mapping, then clear its BSS tail.
+        if (fileEnd > start) mappings.push({ anonymous:false, address:start, length:fileEnd-start,
           protection:(flags&4?1:0)|(flags&2?2:0)|(flags&1?4:0), offset:alignDown(offset),
-          clearLength:fileEnd-vaddr-filesz });
+          clearLength:memsz > filesz ? fileEnd-vaddr-filesz : 0n });
         const memoryEnd = alignUp(vaddr + memsz);
         if (memoryEnd > fileEnd) mappings.push({ anonymous:true, address:fileEnd,
           length:memoryEnd-fileEnd, protection:(flags&4?1:0)|(flags&2?2:0)|(flags&1?4:0), offset:0n, clearLength:0n });
