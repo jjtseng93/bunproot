@@ -39,6 +39,21 @@ library back to the children, so the `LD_PRELOAD= bun test` above still covers
 it. The 2026-09-17 native run passed all 11 cases both ways against Git
 2.54.0 and Bun 1.4.2.
 
+## xattr pathname regression
+
+Compile `test/xattr-paths.c` for the ARM64 guest (for example with
+`aarch64-linux-gnu-gcc -static -O2 test/xattr-paths.c -o xattr-paths`) and copy
+it into the rootfs. Run it through bunproot, then repeat with
+`PROOT_NO_SECCOMP=1`. It checks absolute/relative paths, symlink follow versus
+no-follow, missing-file errors and user-attribute round trips when the host
+filesystem permits them. A filesystem denying attributes must retain its
+real errno rather than turn an existing guest file into `ENOENT`.
+
+Also copy a fresh directory with GNU `cp -a`: its ACL preservation calls
+`llistxattr` even when plain `chmod` succeeds. This caught missing pathname
+translation for the eight path-based xattr calls; descriptor-based calls
+already address the correct open file.
+
 ## Integration checks
 
 Each line names what breaks when it fails, so a red one points somewhere.

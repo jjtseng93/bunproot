@@ -784,6 +784,12 @@ function writeNetlinkAddress(pid,address,lengthAddress,length) {
 // Linux arm64 syscall -> pathname registers. Symlink targets are intentionally
 // not translated; only the directory entry being created is a host pathname.
 const PATH_ARGUMENTS = new Map([
+  // src/syscall/enter.c: xattr path calls use REGULAR; l* variants use
+  // SYMLINK. Descriptor-based f* variants need no pathname translation.
+  [5,[{path:0}]], [6,[{path:0,deref:false}]],
+  [8,[{path:0}]], [9,[{path:0,deref:false}]],
+  [11,[{path:0}]], [12,[{path:0,deref:false}]],
+  [14,[{path:0}]], [15,[{path:0,deref:false}]],
   [33,[{path:1,dirfd:0,deref:false}]], [34,[{path:1,dirfd:0,deref:false}]], [35,[{path:1,dirfd:0,deref:false,preserveL2s:true}]],
   [36,[{path:2,dirfd:1,deref:false,preserveL2s:true}]], [37,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]],
   [38,[{path:1,dirfd:0,deref:false,preserveL2s:true},{path:3,dirfd:2,deref:false,preserveL2s:true}]], [43,[{path:0}]], [45,[{path:0}]],
