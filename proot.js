@@ -19,6 +19,12 @@
 // and someone who reached bunproot through `bunx` has no checkout to run
 // tools/download-alpine.mjs from. It needs nothing the tracer sets up, so it
 // runs before the re-exec below and takes the process with it.
+// Path discovery needs neither the tracer nor a --no-orphans re-exec.
+if (process.argv[2] === "--print-path") {
+  console.log(import.meta.path);
+  process.exit(0);
+}
+
 if (process.argv[2] === "--setup.pulse") {
   process.stdout.write(await Bun.file(`${import.meta.dir}/tools/setup.pulse.sh`).text());
   process.exit(0);

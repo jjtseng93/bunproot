@@ -72,6 +72,14 @@ Licensed **GPL-2.0-or-later**, inherited as a derivative work of PRoot.
 - bunproot needs a Bun built for Android/bionic, and how you get one depends on
 where you are. Any build will do; prefer 1.4.1 or newer.
 
+To locate the installed entry point (including an install managed by `bunx`),
+`bunx bunproot --print-path` prints only the absolute path to `proot.js` and
+exits. For example, js-udocker can use it directly:
+
+```sh
+export JS_UDOCKER_BUNPROOT="$(bunx bunproot --print-path)"
+```
+
 ### Route 1: Termux, from the TUR repository
 
 Termux packages Bun in [TUR](https://github.com/termux-user-repository/tur),

@@ -156,6 +156,9 @@ These run without entering a rootfs, then exit:
   --readme
       render README.md in the terminal, with hyperlinks where it has links
 
+  --print-path
+      print the absolute path to proot.js and exit
+
   -h, --help
       show this message
 
@@ -224,6 +227,7 @@ export function parseArguments(argv) {
       bindings.push({ dns: parseDnsMode(argument.slice(6)) }); sawDns = true;
       continue;
     }
+    if (argument === "--print-path") return { printPath: true };
     if (argument === "-h" || argument === "--help") return { help: true };
     if (argument === "--x11-demo") {
       if (argv.length!==1) throw new Error(`--x11-demo is a command of its own and takes no arguments`);
@@ -521,6 +525,7 @@ function describeUpstream(rootfs, upstream) {
 export function run(argv) {
   const parsed = parseArguments(argv);
   // Only a --help before the command is ours; after it, it belongs to the guest.
+  if (parsed.printPath) { console.log(resolve(import.meta.dir,"../proot.js")); return 0; }
   if (parsed.help) { console.log(HELP); return 0; }
   if (parsed.version) { console.log(`${pkg.name} ${pkg.version}`); return 0; }
   if (parsed.x11Demo) return import("../test/x11-demo.js").then(()=>0);
